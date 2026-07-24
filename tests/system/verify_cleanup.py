@@ -29,6 +29,7 @@ def _docker_ids(kind: str, project: str) -> list[str]:
         arguments = [
             "docker",
             "ps",
+            "--no-trunc",
             "-aq",
             "--filter",
             f"label=com.docker.compose.project={project}",
@@ -38,6 +39,7 @@ def _docker_ids(kind: str, project: str) -> list[str]:
             "docker",
             "network",
             "ls",
+            "--no-trunc",
             "-q",
             "--filter",
             f"label=com.docker.compose.project={project}",

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import copy
 import unittest
 
 from python_udf_jit.diagnostics.environment_evidence import (
+    seal_environment_proof,
     validate_cleanup_evidence,
 )
 from tests.system.capture_host_state import _canonical_routes
+from tests.system.run_blue98_acceptance import _project_ids
 from tests.system.verify_cleanup import build_cleanup_proof
 
 
@@ -53,6 +56,29 @@ class CleanupProbeTests(unittest.TestCase):
         self.assertEqual(left, right)
 
     def test_real_resource_identifiers_and_equal_host_state_seal_proof(self) -> None:
+        class ProjectCommands:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            def run(self, arguments: list[str]) -> str:
+                self.calls.append(arguments)
+                if arguments[1] == "ps":
+                    return f"{'c' * 64}\n{'d' * 64}\n{'e' * 64}\n"
+                return f"{'f' * 64}\n{'1' * 64}\n"
+
+        commands = ProjectCommands()
+        self.assertEqual(
+            _project_ids(commands, kind="container", project="u13-project"),
+            ["c" * 64, "d" * 64, "e" * 64],
+        )
+        self.assertEqual(
+            _project_ids(commands, kind="network", project="u13-project"),
+            ["1" * 64, "f" * 64],
+        )
+        self.assertTrue(
+            all("--no-trunc" in arguments for arguments in commands.calls)
+        )
+
         state = _state()
         proof = build_cleanup_proof(
             run_id="u13-run",
@@ -75,6 +101,27 @@ class CleanupProbeTests(unittest.TestCase):
                 cluster_epoch="u13-epoch",
             ),
             "pass",
+        )
+
+        short_document = copy.deepcopy(
+            {
+                key: value
+                for key, value in proof.items()
+                if key != "proof_sha256"
+            }
+        )
+        short_document["cleanup"]["removed_network_ids"] = [
+            identifier[:12]
+            for identifier in proof["cleanup"]["removed_network_ids"]
+        ]
+        short_ids = seal_environment_proof(short_document)
+        self.assertEqual(
+            validate_cleanup_evidence(
+                short_ids,
+                run_id="u13-run",
+                cluster_epoch="u13-epoch",
+            ),
+            "fail",
         )
 
     def test_any_remaining_resource_is_preserved_as_failure_evidence(self) -> None:

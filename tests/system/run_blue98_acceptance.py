@@ -357,6 +357,7 @@ def _project_ids(commands: Commands, *, kind: str, project: str) -> list[str]:
         arguments = [
             "docker",
             "ps",
+            "--no-trunc",
             "-aq",
             "--filter",
             f"label=com.docker.compose.project={project}",
@@ -366,6 +367,7 @@ def _project_ids(commands: Commands, *, kind: str, project: str) -> list[str]:
             "docker",
             "network",
             "ls",
+            "--no-trunc",
             "-q",
             "--filter",
             f"label=com.docker.compose.project={project}",
@@ -1658,6 +1660,8 @@ def run(arguments: argparse.Namespace) -> Path:
             token_exists=token_file.exists(),
             bridge_accommodation=bridge_accommodation,
         )
+        cleanup_path = layout.evidence / "cleanup-proof.json"
+        _write_private_json(cleanup_path, cleanup)
         if (
             validate_cleanup_evidence(
                 cleanup,
@@ -1667,8 +1671,6 @@ def run(arguments: argparse.Namespace) -> Path:
             != "pass"
         ):
             raise AcceptanceRunError("cleanup_proof_failed")
-        cleanup_path = layout.evidence / "cleanup-proof.json"
-        _write_private_json(cleanup_path, cleanup)
         _announce("containers/networks/token removed; routes/firewall restored")
 
         raw_files = [

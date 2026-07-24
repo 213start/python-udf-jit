@@ -240,14 +240,16 @@ def validate_cleanup_evidence(
         and len(cleanup["removed_container_ids"]) == 3
         and len(set(cleanup["removed_container_ids"])) == 3
         and all(
-            isinstance(identifier, str) and len(identifier) >= 12
+            isinstance(identifier, str)
+            and _SHA256.fullmatch(identifier) is not None
             for identifier in cleanup["removed_container_ids"]
         )
         and isinstance(cleanup["removed_network_ids"], list)
         and len(cleanup["removed_network_ids"]) == 2
         and len(set(cleanup["removed_network_ids"])) == 2
         and all(
-            isinstance(identifier, str) and len(identifier) >= 12
+            isinstance(identifier, str)
+            and _SHA256.fullmatch(identifier) is not None
             for identifier in cleanup["removed_network_ids"]
         )
         and cleanup["remaining_project_containers"] == []
