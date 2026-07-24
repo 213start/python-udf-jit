@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "scalar-piercing-environment-contract",
+  "profile": "baseline",
+  "plugin_mode": "off",
+  "locked_versions": {
+    "python": "3.14.3",
+    "daft": "0.7.2",
+    "ray": "2.55.0",
+    "pyarrow": "22.0.0"
+  },
+  "non_blocking_versions": {
+    "lance": "7.0.0"
+  },
+  "required_fingerprints": [
+    "container_image_digest",
+    "python_version",
+    "cinderx_commit",
+    "cinderx_soabi",
+    "daft_version",
+    "ray_version",
+    "pyarrow_version",
+    "udf_jit_wheel_sha256"
+  ],
+  "compatibility_policy": {
+    "ray_daft_mismatch": "stop",
+    "local_ray_fallback_allowed": false
+  }
+}

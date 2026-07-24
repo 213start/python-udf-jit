@@ -1,0 +1,6 @@
+# Locked scalar-piercing experiment versions. Daft is installed without its
+# optional `ray` extra, then the experiment version is installed explicitly;
+# any runtime incompatibility is a STOP.
+daft==0.7.2
+ray[client,data,default]==2.55.0
+pyarrow==22.0.0

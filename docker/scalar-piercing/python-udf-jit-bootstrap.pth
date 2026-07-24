@@ -1,0 +1,1 @@
+import python_udf_jit.bootstrap as _python_udf_jit_bootstrap; _python_udf_jit_bootstrap.bootstrap_from_environment()

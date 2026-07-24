@@ -1,0 +1,62 @@
+ARG CINDERX_BASE_IMAGE
+FROM ${CINDERX_BASE_IMAGE}
+
+ARG CINDERX_WHEEL_SHA256
+ARG DAFT_WHEEL_SHA256
+ARG PYARROW_WHEEL_SHA256
+ARG RAY_WHEEL_SHA256
+ARG UDFJIT_WHEEL_SHA256
+
+LABEL org.opencontainers.image.title="python-udf-jit scalar piercing candidate" \
+      org.python-udf-jit.cinderx-wheel-sha256="${CINDERX_WHEEL_SHA256}" \
+      org.python-udf-jit.daft-wheel-sha256="${DAFT_WHEEL_SHA256}" \
+      org.python-udf-jit.pyarrow-wheel-sha256="${PYARROW_WHEEL_SHA256}" \
+      org.python-udf-jit.ray-wheel-sha256="${RAY_WHEEL_SHA256}" \
+      org.python-udf-jit.wheel-sha256="${UDFJIT_WHEEL_SHA256}"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UDFJIT_MODE=off
+
+WORKDIR /opt/python-udf-jit
+COPY vendor /tmp/python-udf-jit-wheels
+
+# The candidate boundary is immutable local wheels. Fail the build before
+# installation if any wheel differs from the hashes recorded in the run
+# manifest; no CinderX source tree or native handle is carried into the image.
+RUN unset PYTHONJITAUTO PYTHONJITDISABLE; \
+    CINDERX_WHEEL_SHA256="${CINDERX_WHEEL_SHA256}" \
+    DAFT_WHEEL_SHA256="${DAFT_WHEEL_SHA256}" \
+    PYARROW_WHEEL_SHA256="${PYARROW_WHEEL_SHA256}" \
+    RAY_WHEEL_SHA256="${RAY_WHEEL_SHA256}" \
+    UDFJIT_WHEEL_SHA256="${UDFJIT_WHEEL_SHA256}" \
+    python -c "import glob,hashlib,os,pathlib; pairs=((glob.glob('/tmp/python-udf-jit-wheels/cinderx-*.whl'),os.environ['CINDERX_WHEEL_SHA256']), (glob.glob('/tmp/python-udf-jit-wheels/daft-*.whl'),os.environ['DAFT_WHEEL_SHA256']), (glob.glob('/tmp/python-udf-jit-wheels/pyarrow-*.whl'),os.environ['PYARROW_WHEEL_SHA256']), (glob.glob('/tmp/python-udf-jit-wheels/ray-*.whl'),os.environ['RAY_WHEEL_SHA256']), (glob.glob('/tmp/python-udf-jit-wheels/python_udf_jit-*.whl'),os.environ['UDFJIT_WHEEL_SHA256'])); [(lambda paths,expected: (len(paths)==1 and hashlib.sha256(pathlib.Path(paths[0]).read_bytes()).hexdigest()==expected) or (_ for _ in ()).throw(SystemExit('candidate wheel hash mismatch')))(paths,expected) for paths,expected in pairs]"
+
+RUN unset PYTHONJITAUTO PYTHONJITDISABLE; \
+    python -m pip install --no-cache-dir --no-deps --force-reinstall \
+        /tmp/python-udf-jit-wheels/cinderx-*.whl \
+    && python -m pip install --no-cache-dir \
+        --index-url https://repo.huaweicloud.com/repository/pypi/simple \
+        /tmp/python-udf-jit-wheels/daft-*.whl \
+        /tmp/python-udf-jit-wheels/pyarrow-*.whl \
+    && python -m pip install --no-cache-dir --no-deps \
+        /tmp/python-udf-jit-wheels/ray-*.whl \
+    && python -m pip install --no-cache-dir \
+        --index-url https://repo.huaweicloud.com/repository/pypi/simple \
+        'ray[client,data,default]==2.55.0' \
+    && python -m pip install --no-cache-dir --no-deps \
+        /tmp/python-udf-jit-wheels/python_udf_jit-*.whl \
+    && rm -rf /tmp/python-udf-jit-wheels
+
+COPY config config
+COPY docker/scalar-piercing docker/scalar-piercing
+COPY tests tests
+COPY benchmarks benchmarks
+COPY docker/scalar-piercing/python-udf-jit-bootstrap.pth /tmp/python-udf-jit-bootstrap.pth
+RUN unset PYTHONJITAUTO PYTHONJITDISABLE; \
+    python -c "import shutil,sysconfig; shutil.copyfile('/tmp/python-udf-jit-bootstrap.pth', sysconfig.get_path('purelib') + '/python-udf-jit-bootstrap.pth')"
+
+COPY docker/scalar-piercing/entrypoint.sh /usr/local/bin/scalar-piercing-entrypoint
+RUN chmod 0555 /usr/local/bin/scalar-piercing-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/scalar-piercing-entrypoint"]

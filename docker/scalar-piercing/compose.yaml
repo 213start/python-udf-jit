@@ -1,0 +1,70 @@
+version: "3.7"
+
+x-ray-common: &ray-common
+  build:
+    context: ../..
+    dockerfile: docker/scalar-piercing/Dockerfile
+    args:
+      CINDERX_BASE_IMAGE: ${CINDERX_BASE_IMAGE:?set an immutable CinderX image digest}
+  image: ${SCALAR_PIERCING_IMAGE:-python-udf-jit:scalar-piercing-baseline}
+  restart: "no"
+  environment:
+    UDFJIT_MODE: "${UDFJIT_MODE:-off}"
+    UDFJIT_CLUSTER_EPOCH: "${UDFJIT_CLUSTER_EPOCH:?set a unique cluster epoch}"
+    UDFJIT_RUN_ID: "${UDFJIT_RUN_ID:?set a unique run id}"
+    UDFJIT_MANIFEST_PATH: /opt/python-udf-jit/config/scalar-piercing-manifest.json
+    RAY_HEAD_DATA_PLANE_HOST: ray-head-data-plane
+    RAY_AUTH_MODE: token
+    RAY_AUTH_TOKEN_PATH: /run/secrets/ray-auth-token
+  secrets:
+    - source: ray-auth-token
+      target: ray-auth-token
+      mode: 0400
+  networks:
+    - scalar-piercing
+
+services:
+  ray-head-driver:
+    <<: *ray-common
+    hostname: ray-head-driver
+    command: ["head"]
+    ports:
+      - "127.0.0.1:8265:8265"
+    # Docker 18 does not materialize a published host port when a container is
+    # attached only to an `internal` bridge.  Keep Ray's data plane on the
+    # isolated bridge, and give only the Head a gateway bridge so the explicit
+    # loopback Dashboard/Jobs binding is actually created.
+    networks:
+      scalar-piercing:
+        aliases:
+          - ray-head-data-plane
+      dashboard-loopback: {}
+
+  ray-worker-1:
+    <<: *ray-common
+    hostname: ray-worker-1
+    command: ["worker", "ray-worker-1"]
+    depends_on:
+      - ray-head-driver
+
+  ray-worker-2:
+    <<: *ray-common
+    hostname: ray-worker-2
+    command: ["worker", "ray-worker-2"]
+    depends_on:
+      - ray-head-driver
+
+networks:
+  scalar-piercing:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${SCALAR_PIERCING_DATA_PLANE_SUBNET:-172.23.240.0/24}
+  dashboard-loopback:
+    ipam:
+      config:
+        - subnet: ${SCALAR_PIERCING_DASHBOARD_SUBNET:-172.23.241.0/24}
+
+secrets:
+  ray-auth-token:
+    file: ${RAY_AUTH_TOKEN_FILE:?set a per-run 0600 token file}

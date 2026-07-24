@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "cluster_shape": "fixed-topology-simulation",
+  "driver_location": "ray-head-driver",
+  "nodes": [
+    {
+      "service": "ray-head-driver",
+      "role": "head-driver",
+      "num_cpus": 0
+    },
+    {
+      "service": "ray-worker-1",
+      "role": "worker",
+      "num_cpus": 2
+    },
+    {
+      "service": "ray-worker-2",
+      "role": "worker",
+      "num_cpus": 2
+    }
+  ],
+  "execution_carrier_source_contract": {
+    "locked_version": "daft-v0.7.2",
+    "source": "daft/runners/flotilla.py::start_ray_workers",
+    "eligible_node_resource": "Resources.CPU > 0",
+    "actor_class": "RaySwordfishActor",
+    "scheduling_strategy": "NodeAffinitySchedulingStrategy",
+    "soft": false
+  },
+  "host_exposure": {
+    "dashboard_jobs": "127.0.0.1:8265",
+    "other_ray_ports_published": false
+  }
+}
