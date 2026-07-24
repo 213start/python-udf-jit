@@ -301,6 +301,16 @@ def _install_hooks() -> None:
         raise AssertionError(f"Daft hook unavailable: {result}")
 
 
+def _assert_hooks_installed() -> None:
+    func_type, dataframe_type = _hook_types()
+    marker = "__python_udf_jit_u2_hook__"
+    if not (
+        getattr(func_type.__call__, marker, False)
+        and getattr(dataframe_type.with_columns, marker, False)
+    ):
+        raise AssertionError("Daft hooks were not installed by process bootstrap")
+
+
 def _input_frame(path: str, *, empty: bool = False):
     import daft
 
@@ -381,7 +391,7 @@ def _diagnostic_job(path: str, function: Callable[[float], float]):
     import daft
 
     started_ns = time.time_ns()
-    _install_hooks()
+    _assert_hooks_installed()
     frame = _input_frame(path)
     udf = daft.func(function)
     frame = frame.with_column("result", udf(daft.col("measurement")))

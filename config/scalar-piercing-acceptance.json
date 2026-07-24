@@ -5,12 +5,12 @@
     "provenance.clean_source": {
       "tier": "system",
       "description": "The candidate is built from one clean, committed source tree.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_base_inconclusive_and_dirty_source_are_preserved"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_base_inconclusive_and_dirty_source_are_preserved", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_source_run_and_report_identity_are_locked"]
     },
     "provenance.image_identity": {
       "tier": "system",
       "description": "The final image and wheel hashes match the preserved base report.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_source_run_and_report_identity_are_locked"]
     },
     "tests.unit_suite": {
       "tier": "unit",
@@ -25,7 +25,7 @@
     "tests.live_suite": {
       "tier": "system",
       "description": "All live-only tests execute without an unexpected skip.",
-      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.LiveScalarMainlinePiercingTests.test_live_evidence_is_supplied_by_the_external_harness"]
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.LiveScalarMainlinePiercingTests.test_live_evidence_is_supplied_by_the_external_harness", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "environment.locked_manifest": {
       "tier": "integration",
@@ -35,22 +35,22 @@
     "environment.three_node_topology": {
       "tier": "system",
       "description": "Exactly one zero-CPU Head/Driver and two Worker nodes are alive.",
-      "test_targets": ["tests.integration.test_ray_three_node_topology.ThreeNodeTopologyTests.test_exact_live_topology_is_accepted"]
+      "test_targets": ["tests.integration.test_ray_three_node_topology.ThreeNodeTopologyTests.test_exact_live_topology_is_accepted", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "environment.auth_loopback": {
       "tier": "system",
       "description": "Dashboard/Jobs is loopback-only and enforces the per-run token.",
-      "test_targets": ["tests.integration.test_driver_worker_isolation.DriverWorkerIsolationTests.test_compose_exposes_only_loopback_dashboard_jobs_port"]
+      "test_targets": ["tests.integration.test_driver_worker_isolation.DriverWorkerIsolationTests.test_compose_exposes_only_loopback_dashboard_jobs_port", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "environment.secret_hygiene": {
       "tier": "system",
       "description": "Authentication material is absent from image metadata, logs, events, and reports.",
-      "test_targets": ["tests.integration.test_environment_contract.EnvironmentContractTests.test_manifest_contains_no_runtime_secret_value"]
+      "test_targets": ["tests.integration.test_environment_contract.EnvironmentContractTests.test_manifest_contains_no_runtime_secret_value", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "environment.cleanup": {
       "tier": "system",
       "description": "Containers, networks, routes, firewall changes, ports, and tokens are cleaned.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_missing_or_false_external_proof_cannot_silently_pass"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_missing_or_false_external_proof_cannot_silently_pass", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "integration.object_store_data_plane": {
       "tier": "integration",
@@ -70,57 +70,57 @@
     "system.transparent_bootstrap": {
       "tier": "system",
       "description": "An unchanged user script receives automatic off/auto behavior without plugin imports.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.supported_jit": {
       "tier": "system",
       "description": "A supported Projection produces real Compile, Hit, and semantic execution evidence.",
-      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate"]
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.with_column_semantics": {
       "tier": "system",
       "description": "with_column ordered output and schema are identical in off and auto.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.with_columns_semantics": {
       "tier": "system",
       "description": "with_columns ordered output and schema are identical in off and auto.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.ordered_results": {
       "tier": "system",
       "description": "The comparison preserves row order instead of sorting before hashing.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.guard_miss_semantics": {
       "tier": "system",
       "description": "A pre-semantics Guard Miss falls back exactly once with no semantic execute.",
-      "test_targets": ["tests.unit.integration.daft_ray.test_worker_runtime.WorkerRuntimeTest.test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute"]
+      "test_targets": ["tests.unit.integration.daft_ray.test_worker_runtime.WorkerRuntimeTest.test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.unsupported_semantics": {
       "tier": "system",
       "description": "An unsupported UDF preserves ordered results and exact side-effect count.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.fail_open": {
       "tier": "system",
       "description": "Mode off, fingerprint mismatch, and corrupt artifacts complete through the original callable.",
-      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate"]
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.exception_semantics": {
       "tier": "system",
       "description": "The user-visible exception type and exactly-once side effect are equal in off and auto.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "system.zero_row_semantics": {
       "tier": "system",
       "description": "Empty input preserves schema and produces no callable, descriptor, compile, or hit activity.",
-      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate"]
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "evidence.base_verdict": {
       "tier": "system",
       "description": "The underlying scalar piercing report itself is a clean pass.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_base_inconclusive_and_dirty_source_are_preserved"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_base_inconclusive_and_dirty_source_are_preserved", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "evidence.compile_hit_chain": {
       "tier": "integration",
@@ -130,7 +130,7 @@
     "evidence.attempt_identity": {
       "tier": "system",
       "description": "Every remote partition task joins uniquely to FINISHED attempt zero.",
-      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ray_state_join_accepts_only_unique_finished_attempt_zero"]
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ray_state_join_accepts_only_unique_finished_attempt_zero", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "evidence.phase_identity": {
       "tier": "integration",
@@ -140,17 +140,17 @@
     "evidence.no_head_data_plane": {
       "tier": "system",
       "description": "No artifact, layout, JIT, or execute event occurs on the Head.",
-      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_head_data_plane_event_is_failure"]
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_head_data_plane_event_is_failure", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "evidence.permissions_cleanup": {
       "tier": "system",
       "description": "Raw events are ephemeral and all retained reports are value-free mode 0600.",
-      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_raw_event_permissions_whitelist_canary_and_cleanup_on_all_verdicts"]
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_raw_event_permissions_whitelist_canary_and_cleanup_on_all_verdicts", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "measurement.non_gating": {
       "tier": "system",
       "description": "Measurement records equivalence without applying a speedup release gate.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report"]
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     }
   },
   "requirements": {

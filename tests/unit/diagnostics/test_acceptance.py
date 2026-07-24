@@ -166,6 +166,14 @@ class AcceptanceContractTests(unittest.TestCase):
 
     def test_every_gate_references_an_existing_test_method(self) -> None:
         for gate_id, gate in self.contract.gates.items():
+            if gate.tier == "system":
+                self.assertTrue(
+                    any(
+                        target.startswith("tests.system.")
+                        for target in gate.test_targets
+                    ),
+                    f"{gate_id} lacks a black-box system-test target",
+                )
             for target in gate.test_targets:
                 with self.subTest(gate=gate_id, target=target):
                     module_name, class_name, method_name = target.rsplit(".", 2)
