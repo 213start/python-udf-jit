@@ -250,7 +250,7 @@ def _wheel(path: Path, prefix: str) -> Path:
     resolved = path.resolve()
     if not resolved.is_file() or not resolved.name.startswith(prefix):
         raise AcceptanceRunError(f"wheel_invalid:{prefix}:{resolved}")
-    if resolved.suffix != ".whl":
+    if re.fullmatch(r"[A-Za-z0-9_.+-]+\.whl", resolved.name) is None:
         raise AcceptanceRunError(f"wheel_extension_invalid:{resolved}")
     return resolved
 
@@ -447,6 +447,7 @@ def _build_context(
     repository: Path,
     layout: RunLayout,
     base_image: str,
+    build_backend_wheel: Path,
     third_party_wheels: tuple[Path, ...],
 ) -> tuple[Path, Path]:
     context = layout.work / "build-context"
@@ -483,20 +484,24 @@ def _build_context(
             "none",
             "--volume",
             f"{context}:/workspace",
+            "--volume",
+            (
+                f"{build_backend_wheel}:/tmp/"
+                f"{build_backend_wheel.name}:ro"
+            ),
             "--workdir",
             "/workspace",
             "--entrypoint",
-            "python",
+            "/bin/sh",
             base_image,
-            "-m",
-            "pip",
-            "wheel",
-            "--disable-pip-version-check",
-            "--no-deps",
-            "--no-build-isolation",
-            "--wheel-dir",
-            "/workspace/vendor",
-            ".",
+            "-c",
+            (
+                "python -m pip install --disable-pip-version-check "
+                f"--no-index --no-deps /tmp/{build_backend_wheel.name}"
+                " && python -m pip wheel --disable-pip-version-check "
+                "--no-deps --no-build-isolation "
+                "--wheel-dir /workspace/vendor ."
+            ),
         ],
         wheel_build_log,
         timeout=300,
@@ -682,6 +687,15 @@ def _parser() -> argparse.ArgumentParser:
             "ray-2.55.0-cp314-cp314-manylinux2014_aarch64.whl"
         ),
     )
+    parser.add_argument(
+        "--setuptools-wheel",
+        type=Path,
+        default=Path(
+            "/root/python-udf-jit/runs/"
+            "u13-formal-20260723-cinderx-local-static-1/"
+            "tool-wheelhouse/setuptools-83.0.0-py3-none-any.whl"
+        ),
+    )
     cinderx_root = Path(
         "/root/python-udf-jit/runs/"
         "u13-formal-20260723-cinderx-local-static-2"
@@ -825,6 +839,10 @@ def run(arguments: argparse.Namespace) -> Path:
     daft_wheel = _wheel(arguments.daft_wheel, "daft-0.7.2")
     pyarrow_wheel = _wheel(arguments.pyarrow_wheel, "pyarrow-22.0.0")
     ray_wheel = _wheel(arguments.ray_wheel, "ray-2.55.0")
+    setuptools_wheel = _wheel(
+        arguments.setuptools_wheel,
+        "setuptools-83.0.0",
+    )
     cinderx_inputs = CinderXInputs(
         fingerprint=arguments.cinderx_fingerprint.resolve(),
         runtime_log=arguments.cinderx_runtime_log.resolve(),
@@ -899,6 +917,7 @@ def run(arguments: argparse.Namespace) -> Path:
             repository=repository,
             layout=layout,
             base_image=arguments.cinderx_base_image,
+            build_backend_wheel=setuptools_wheel,
             third_party_wheels=(
                 cinderx_wheel,
                 daft_wheel,
