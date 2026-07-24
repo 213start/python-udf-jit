@@ -58,10 +58,18 @@ def _cleanup() -> dict[str, object]:
             "before": {
                 "routes_sha256": "a" * 64,
                 "firewall_sha256": "b" * 64,
+                "firewalld_runtime_sha256": "c" * 64,
+                "firewalld_permanent_sha256": "d" * 64,
+                "firewall_backend": "nftables-stateless",
+                "firewalld_state": "running",
             },
             "after": {
                 "routes_sha256": "a" * 64,
                 "firewall_sha256": "b" * 64,
+                "firewalld_runtime_sha256": "c" * 64,
+                "firewalld_permanent_sha256": "d" * 64,
+                "firewall_backend": "nftables-stateless",
+                "firewalld_state": "running",
             },
             "cleanup": {
                 "removed_container_ids": ["c" * 64, "d" * 64, "e" * 64],
@@ -70,6 +78,24 @@ def _cleanup() -> dict[str, object]:
                 "remaining_project_networks": [],
                 "dashboard_port_open": False,
                 "token_exists": False,
+                "bridge_accommodation": {
+                    "action": "runtime-trusted",
+                    "network_id": "f" * 64,
+                    "bridge_interface": f"br-{'f' * 12}",
+                    "zone": "trusted",
+                    "scope": "runtime",
+                    "connectivity_before": {
+                        "ray-worker-1": False,
+                        "ray-worker-2": False,
+                    },
+                    "connectivity_after": {
+                        "ray-worker-1": True,
+                        "ray-worker-2": True,
+                    },
+                    "binding_added": True,
+                    "binding_removed": True,
+                    "bridge_interface_exists_after_cleanup": False,
+                },
             },
         }
     )
@@ -137,6 +163,30 @@ class EnvironmentEvidenceTests(unittest.TestCase):
         self.assertEqual(
             validate_cleanup_evidence(
                 drift,
+                run_id="u13-run",
+                cluster_epoch="u13-epoch",
+            ),
+            "fail",
+        )
+
+        permanent_drift = copy.deepcopy(proof)
+        permanent_drift["after"]["firewalld_permanent_sha256"] = "9" * 64
+        self.assertEqual(
+            validate_cleanup_evidence(
+                permanent_drift,
+                run_id="u13-run",
+                cluster_epoch="u13-epoch",
+            ),
+            "fail",
+        )
+
+        binding_left_behind = copy.deepcopy(proof)
+        binding_left_behind["cleanup"]["bridge_accommodation"][
+            "binding_removed"
+        ] = False
+        self.assertEqual(
+            validate_cleanup_evidence(
+                binding_left_behind,
                 run_id="u13-run",
                 cluster_epoch="u13-epoch",
             ),

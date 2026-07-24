@@ -36,6 +36,8 @@ UNIT_REQUIRED_TESTS = (
     "test_exact_static_runtime_and_python_gates_produce_proof",
     "test_fixture_never_imports_or_calls_plugin_internals",
     "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
+    "test_rejects_non_internal_data_plane",
+    "test_runtime_binding_is_exact_and_reversible",
 )
 INTEGRATION_REQUIRED_TESTS = (
     "test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip",
@@ -522,7 +524,7 @@ def _python_test_statuses(
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
         required_tests=UNIT_REQUIRED_TESTS,
-        minimum_test_count=114,
+        minimum_test_count=117,
         allow_skips=False,
     )
     integration = validate_unittest_evidence(

@@ -79,7 +79,16 @@ def build_cleanup_proof(
     remaining_project_networks: list[str],
     dashboard_port_open: bool,
     token_exists: bool,
+    bridge_accommodation: Mapping[str, Any],
 ) -> dict[str, object]:
+    state_fields = (
+        "routes_sha256",
+        "firewall_sha256",
+        "firewalld_runtime_sha256",
+        "firewalld_permanent_sha256",
+        "firewall_backend",
+        "firewalld_state",
+    )
     return seal_environment_proof(
         {
             "schema_version": 1,
@@ -87,12 +96,10 @@ def build_cleanup_proof(
             "run_id": run_id,
             "cluster_epoch": cluster_epoch,
             "before": {
-                "routes_sha256": before.get("routes_sha256"),
-                "firewall_sha256": before.get("firewall_sha256"),
+                field: before.get(field) for field in state_fields
             },
             "after": {
-                "routes_sha256": after.get("routes_sha256"),
-                "firewall_sha256": after.get("firewall_sha256"),
+                field: after.get(field) for field in state_fields
             },
             "cleanup": {
                 "removed_container_ids": sorted(removed_container_ids),
@@ -105,6 +112,7 @@ def build_cleanup_proof(
                 ),
                 "dashboard_port_open": dashboard_port_open,
                 "token_exists": token_exists,
+                "bridge_accommodation": dict(bridge_accommodation),
             },
         }
     )
@@ -119,9 +127,13 @@ def main() -> None:
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--removed-container-id", action="append", required=True)
     parser.add_argument("--removed-network-id", action="append", required=True)
+    parser.add_argument("--bridge-accommodation", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     before = _private_document(arguments.before)
+    bridge_accommodation = _private_document(
+        arguments.bridge_accommodation
+    )
     after = capture()
     proof = build_cleanup_proof(
         run_id=arguments.run_id,
@@ -138,6 +150,7 @@ def main() -> None:
         ),
         dashboard_port_open=_port_open("127.0.0.1", 8265),
         token_exists=arguments.token_file.exists(),
+        bridge_accommodation=bridge_accommodation,
     )
     write_output(arguments.output, proof)
     print(proof["proof_sha256"])

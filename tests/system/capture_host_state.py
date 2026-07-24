@@ -33,17 +33,37 @@ def _canonical_routes(payload: bytes) -> bytes:
 
 def capture() -> dict[str, object]:
     ip = shutil.which("ip")
-    iptables_save = shutil.which("iptables-save")
-    if ip is None or iptables_save is None:
-        raise RuntimeError("ip and iptables-save are required for host-state proof")
+    nft = shutil.which("nft")
+    firewall_cmd = shutil.which("firewall-cmd")
+    if ip is None or nft is None or firewall_cmd is None:
+        raise RuntimeError(
+            "ip, nft, and firewall-cmd are required for host-state proof"
+        )
     routes = _canonical_routes(
         _run([ip, "-j", "-4", "route", "show", "table", "main"])
     )
-    firewall = _run([iptables_save])
+    firewalld_state = _run([firewall_cmd, "--state"]).decode(
+        "ascii"
+    ).strip()
+    if firewalld_state != "running":
+        raise RuntimeError("firewalld must be running for host-state proof")
+    firewall = _run([nft, "--stateless", "list", "ruleset"])
+    firewalld_runtime = _run([firewall_cmd, "--list-all-zones"])
+    firewalld_permanent = _run(
+        [firewall_cmd, "--permanent", "--list-all-zones"]
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "routes_sha256": hashlib.sha256(routes).hexdigest(),
         "firewall_sha256": hashlib.sha256(firewall).hexdigest(),
+        "firewalld_runtime_sha256": hashlib.sha256(
+            firewalld_runtime
+        ).hexdigest(),
+        "firewalld_permanent_sha256": hashlib.sha256(
+            firewalld_permanent
+        ).hexdigest(),
+        "firewall_backend": "nftables-stateless",
+        "firewalld_state": firewalld_state,
     }
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from python_udf_jit.diagnostics.acceptance import (
     AcceptanceContractError,
+    UNIT_REQUIRED_TESTS,
     aggregate_formal_acceptance,
     load_acceptance_contract,
 )
@@ -111,10 +112,18 @@ def _cleanup_proof() -> dict[str, object]:
             "before": {
                 "routes_sha256": "4" * 64,
                 "firewall_sha256": "5" * 64,
+                "firewalld_runtime_sha256": "a" * 64,
+                "firewalld_permanent_sha256": "b" * 64,
+                "firewall_backend": "nftables-stateless",
+                "firewalld_state": "running",
             },
             "after": {
                 "routes_sha256": "4" * 64,
                 "firewall_sha256": "5" * 64,
+                "firewalld_runtime_sha256": "a" * 64,
+                "firewalld_permanent_sha256": "b" * 64,
+                "firewall_backend": "nftables-stateless",
+                "firewalld_state": "running",
             },
             "cleanup": {
                 "removed_container_ids": [
@@ -127,6 +136,24 @@ def _cleanup_proof() -> dict[str, object]:
                 "remaining_project_networks": [],
                 "dashboard_port_open": False,
                 "token_exists": False,
+                "bridge_accommodation": {
+                    "action": "runtime-trusted",
+                    "network_id": "9" * 64,
+                    "bridge_interface": f"br-{'9' * 12}",
+                    "zone": "trusted",
+                    "scope": "runtime",
+                    "connectivity_before": {
+                        "ray-worker-1": False,
+                        "ray-worker-2": False,
+                    },
+                    "connectivity_after": {
+                        "ray-worker-1": True,
+                        "ray-worker-2": True,
+                    },
+                    "binding_added": True,
+                    "binding_removed": True,
+                    "bridge_interface_exists_after_cleanup": False,
+                },
             },
         }
     )
@@ -360,13 +387,8 @@ def _evidence() -> dict[str, object]:
                 "unit": _test_proof(
                     gate_id="python.unit",
                     tier="unit",
-                    required_tests=[
-                        "test_contract_traces_every_requirement_and_acceptance_example",
-                        "test_exact_static_runtime_and_python_gates_produce_proof",
-                        "test_fixture_never_imports_or_calls_plugin_internals",
-                        "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
-                    ],
-                    test_count=114,
+                    required_tests=list(UNIT_REQUIRED_TESTS),
+                    test_count=117,
                 ),
                 "integration": _test_proof(
                     gate_id="python.integration",

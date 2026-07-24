@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DOCKER_BRIDGE = re.compile(r"^br-[0-9a-f]{12}$")
+_WORKER_ROLES = ("ray-worker-1", "ray-worker-2")
 
 
 def _proof_hash(document: Mapping[str, Any]) -> str:
@@ -135,7 +137,14 @@ def validate_cleanup_evidence(
         or not isinstance(cleanup, Mapping)
     ):
         return "incomplete"
-    state_fields = ("routes_sha256", "firewall_sha256")
+    digest_fields = (
+        "routes_sha256",
+        "firewall_sha256",
+        "firewalld_runtime_sha256",
+        "firewalld_permanent_sha256",
+    )
+    metadata_fields = ("firewall_backend", "firewalld_state")
+    state_fields = (*digest_fields, *metadata_fields)
     cleanup_fields = (
         "removed_container_ids",
         "removed_network_ids",
@@ -143,6 +152,7 @@ def validate_cleanup_evidence(
         "remaining_project_networks",
         "dashboard_port_open",
         "token_exists",
+        "bridge_accommodation",
     )
     if (
         any(field not in before or field not in after for field in state_fields)
@@ -153,11 +163,78 @@ def validate_cleanup_evidence(
         isinstance(state[field], str)
         and _SHA256.fullmatch(str(state[field])) is not None
         for state in (before, after)
-        for field in state_fields
+        for field in digest_fields
     )
+    bridge = cleanup.get("bridge_accommodation")
+    bridge_complete = isinstance(bridge, Mapping) and all(
+        field in bridge
+        for field in (
+            "action",
+            "network_id",
+            "bridge_interface",
+            "zone",
+            "scope",
+            "connectivity_before",
+            "connectivity_after",
+            "binding_added",
+            "binding_removed",
+            "bridge_interface_exists_after_cleanup",
+        )
+    )
+    bridge_valid = False
+    if bridge_complete and isinstance(bridge, Mapping):
+        network_id = bridge["network_id"]
+        interface = bridge["bridge_interface"]
+        before_connectivity = bridge["connectivity_before"]
+        after_connectivity = bridge["connectivity_after"]
+        common_valid = (
+            isinstance(network_id, str)
+            and _SHA256.fullmatch(network_id) is not None
+            and isinstance(interface, str)
+            and _DOCKER_BRIDGE.fullmatch(interface) is not None
+            and interface == f"br-{network_id[:12]}"
+            and isinstance(before_connectivity, Mapping)
+            and set(before_connectivity) == set(_WORKER_ROLES)
+            and all(
+                isinstance(before_connectivity[role], bool)
+                for role in _WORKER_ROLES
+            )
+            and isinstance(after_connectivity, Mapping)
+            and set(after_connectivity) == set(_WORKER_ROLES)
+            and all(
+                after_connectivity[role] is True for role in _WORKER_ROLES
+            )
+            and bridge["bridge_interface_exists_after_cleanup"] is False
+        )
+        if bridge["action"] == "runtime-trusted":
+            bridge_valid = (
+                common_valid
+                and not all(
+                    before_connectivity[role] for role in _WORKER_ROLES
+                )
+                and bridge["zone"] == "trusted"
+                and bridge["scope"] == "runtime"
+                and bridge["binding_added"] is True
+                and bridge["binding_removed"] is True
+            )
+        elif bridge["action"] == "not-required":
+            bridge_valid = (
+                common_valid
+                and all(
+                    before_connectivity[role] for role in _WORKER_ROLES
+                )
+                and bridge["zone"] is None
+                and bridge["scope"] is None
+                and bridge["binding_added"] is False
+                and bridge["binding_removed"] is False
+            )
     valid = (
         _identity(proof, run_id=run_id, cluster_epoch=cluster_epoch)
         and digests_valid
+        and before["firewall_backend"] == "nftables-stateless"
+        and after["firewall_backend"] == "nftables-stateless"
+        and before["firewalld_state"] == "running"
+        and after["firewalld_state"] == "running"
         and all(before[field] == after[field] for field in state_fields)
         and isinstance(cleanup["removed_container_ids"], list)
         and len(cleanup["removed_container_ids"]) == 3
@@ -177,6 +254,9 @@ def validate_cleanup_evidence(
         and cleanup["remaining_project_networks"] == []
         and cleanup["dashboard_port_open"] is False
         and cleanup["token_exists"] is False
+        and isinstance(bridge, Mapping)
+        and bridge.get("network_id") in cleanup["removed_network_ids"]
+        and bridge_valid
     )
     return "pass" if valid else "fail"
 

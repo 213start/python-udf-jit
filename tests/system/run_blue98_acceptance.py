@@ -62,6 +62,13 @@ from tests.system.assemble_infrastructure_evidence import (
 from tests.system.build_hygiene_evidence import build_hygiene_proof
 from tests.system.capture_host_state import capture as capture_host_state
 from tests.system.capture_source_identity import capture as capture_source_identity
+from tests.system.firewalld_bridge import (
+    DockerBridge,
+    RuntimeZoneBinding,
+    bind_runtime_trusted,
+    resolve_project_bridge,
+    unbind_runtime_trusted,
+)
 from tests.system.probe_environment import probe as probe_environment
 from tests.system.verify_cleanup import build_cleanup_proof
 
@@ -70,7 +77,7 @@ _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ROLES = ("ray-head-driver", "ray-worker-1", "ray-worker-2")
-_EXPECTED_UNIT_COUNT = 114
+_EXPECTED_UNIT_COUNT = 117
 _EXPECTED_INTEGRATION_COUNT = 29
 _EXPECTED_LIVE_COUNT = 12
 
@@ -278,6 +285,73 @@ def _port_open(host: str, port: int) -> bool:
     return True
 
 
+def _container_tcp_probe(
+    commands: Commands,
+    *,
+    container: str,
+    host: str,
+    port: int,
+) -> tuple[bool, str]:
+    source = (
+        "import socket,sys;"
+        "connection=socket.create_connection((sys.argv[1],int(sys.argv[2])),3);"
+        "connection.close();"
+        "print('connected')"
+    )
+    try:
+        output = commands.run(
+            _container_exec(
+                container,
+                ["python", "-c", source, host, str(port)],
+            ),
+            timeout=10,
+        )
+    except (AcceptanceRunError, subprocess.TimeoutExpired) as error:
+        return False, str(error)[-1000:]
+    return output.strip().endswith("connected"), output[-1000:]
+
+
+def _await_container_tcp(
+    commands: Commands,
+    *,
+    container: str,
+    host: str,
+    port: int,
+    timeout_seconds: int = 60,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_detail = ""
+    while time.monotonic() < deadline:
+        connected, last_detail = _container_tcp_probe(
+            commands,
+            container=container,
+            host=host,
+            port=port,
+        )
+        if connected:
+            return
+        time.sleep(1)
+    raise AcceptanceRunError(
+        f"container_tcp_not_ready:{container}:{host}:{port}:{last_detail}"
+    )
+
+
+def _interface_exists(interface: str) -> bool:
+    completed = subprocess.run(
+        ["ip", "link", "show", "dev", interface],
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    raise AcceptanceRunError(
+        f"interface_probe_failed:{interface}:{completed.returncode}"
+    )
+
+
 def _project_ids(commands: Commands, *, kind: str, project: str) -> list[str]:
     if kind == "container":
         arguments = [
@@ -372,6 +446,7 @@ def _await_cluster(
         except (
             AcceptanceRunError,
             json.JSONDecodeError,
+            subprocess.TimeoutExpired,
             TypeError,
             ValueError,
         ) as error:
@@ -771,6 +846,15 @@ def _parser() -> argparse.ArgumentParser:
         "--dashboard-subnet",
         default=DEFAULT_DASHBOARD_SUBNET,
     )
+    parser.add_argument(
+        "--allow-runtime-firewalld-trusted",
+        action="store_true",
+        help=(
+            "allow a blocked per-run data-plane bridge to be bound to the "
+            "firewalld trusted zone at runtime; the binding is removed and "
+            "host-state restoration is mandatory"
+        ),
+    )
     parser.add_argument("--non-loopback-host", default="192.168.41.98")
     parser.add_argument("--jobs-address", default="http://127.0.0.1:8265")
     return parser
@@ -788,7 +872,7 @@ def run(arguments: argparse.Namespace) -> Path:
     compose_executable = shutil.which("docker-compose")
     if compose_executable is None:
         raise AcceptanceRunError("docker-compose is required")
-    for executable in ("ip", "iptables-save", "tar"):
+    for executable in ("firewall-cmd", "ip", "nft", "tar"):
         if shutil.which(executable) is None:
             raise AcceptanceRunError(f"required_executable_missing:{executable}")
     if _port_open("127.0.0.1", 8265):
@@ -812,6 +896,10 @@ def run(arguments: argparse.Namespace) -> Path:
     layout = RunLayout.create(run_root)
     token_file = layout.private / "ray-auth-token"
     compose_active = False
+    data_plane_bridge: DockerBridge | None = None
+    runtime_zone_binding: RuntimeZoneBinding | None = None
+    runtime_zone_binding_active = False
+    bridge_accommodation: dict[str, Any] | None = None
 
     compose_file = repository / "docker/scalar-piercing/compose.yaml"
     patch_manifest_path = (
@@ -1008,6 +1096,75 @@ def run(arguments: argparse.Namespace) -> Path:
             commands,
             compose,
             compose_environment,
+        )
+        data_plane_bridge = resolve_project_bridge(
+            commands,
+            project=project,
+            logical_network="scalar-piercing",
+        )
+        _await_container_tcp(
+            commands,
+            container=containers["ray-head-driver"],
+            host="ray-head-data-plane",
+            port=6379,
+            timeout_seconds=90,
+        )
+        connectivity_before = {
+            role: _container_tcp_probe(
+                commands,
+                container=containers[role],
+                host="ray-head-data-plane",
+                port=6379,
+            )[0]
+            for role in ("ray-worker-1", "ray-worker-2")
+        }
+        if not all(connectivity_before.values()):
+            if not arguments.allow_runtime_firewalld_trusted:
+                raise AcceptanceRunError(
+                    "data_plane_bridge_blocked:"
+                    "rerun_with_--allow-runtime-firewalld-trusted"
+                )
+            runtime_zone_binding = bind_runtime_trusted(
+                commands,
+                data_plane_bridge,
+            )
+            runtime_zone_binding_active = True
+            action = "runtime-trusted"
+            zone: str | None = runtime_zone_binding.zone
+            scope: str | None = "runtime"
+        else:
+            action = "not-required"
+            zone = None
+            scope = None
+        for role in ("ray-worker-1", "ray-worker-2"):
+            _await_container_tcp(
+                commands,
+                container=containers[role],
+                host="ray-head-data-plane",
+                port=6379,
+                timeout_seconds=90,
+            )
+        bridge_accommodation = {
+            "action": action,
+            "network_id": data_plane_bridge.network_id,
+            "bridge_interface": data_plane_bridge.interface,
+            "zone": zone,
+            "scope": scope,
+            "connectivity_before": connectivity_before,
+            "connectivity_after": {
+                role: True for role in ("ray-worker-1", "ray-worker-2")
+            },
+            "binding_added": runtime_zone_binding is not None,
+            "binding_removed": False,
+            "bridge_interface_exists_after_cleanup": True,
+        }
+        _announce(
+            "data-plane bridge connectivity verified"
+            + (
+                " with a run-scoped firewalld runtime binding"
+                if runtime_zone_binding is not None
+                else " without host accommodation"
+            )
         )
         _await_cluster(
             commands,
@@ -1451,6 +1608,14 @@ def run(arguments: argparse.Namespace) -> Path:
             raise AcceptanceRunError(
                 "project_resource_count_drift_before_cleanup"
             )
+        if runtime_zone_binding is not None:
+            unbind_runtime_trusted(commands, runtime_zone_binding)
+            runtime_zone_binding_active = False
+            if bridge_accommodation is None:
+                raise AcceptanceRunError(
+                    "bridge_accommodation_missing_before_cleanup"
+                )
+            bridge_accommodation["binding_removed"] = True
         _down(
             commands,
             compose=compose,
@@ -1460,6 +1625,11 @@ def run(arguments: argparse.Namespace) -> Path:
         )
         compose_active = False
         token_file.unlink()
+        if data_plane_bridge is None or bridge_accommodation is None:
+            raise AcceptanceRunError("bridge_cleanup_evidence_missing")
+        bridge_accommodation[
+            "bridge_interface_exists_after_cleanup"
+        ] = _interface_exists(data_plane_bridge.interface)
         after_state = capture_host_state()
         _write_private_json(
             layout.evidence / "host-state-after.json",
@@ -1484,6 +1654,7 @@ def run(arguments: argparse.Namespace) -> Path:
             ),
             dashboard_port_open=_port_open("127.0.0.1", 8265),
             token_exists=token_file.exists(),
+            bridge_accommodation=bridge_accommodation,
         )
         if (
             validate_cleanup_evidence(
@@ -1659,6 +1830,7 @@ def run(arguments: argparse.Namespace) -> Path:
         )
         return formal_path
     except BaseException as error:
+        cleanup_errors: list[str] = []
         if containers:
             for role, container in containers.items():
                 path = layout.logs / f"failure-{role}.log"
@@ -1672,6 +1844,20 @@ def run(arguments: argparse.Namespace) -> Path:
                     )
                 except Exception:
                     pass
+        if (
+            runtime_zone_binding is not None
+            and runtime_zone_binding_active
+        ):
+            try:
+                unbind_runtime_trusted(commands, runtime_zone_binding)
+                runtime_zone_binding_active = False
+                if bridge_accommodation is not None:
+                    bridge_accommodation["binding_removed"] = True
+            except Exception as cleanup_error:
+                cleanup_errors.append(
+                    "firewalld_unbind_before_down:"
+                    f"{type(cleanup_error).__name__}:{cleanup_error}"
+                )
         if compose_active:
             try:
                 _down(
@@ -1681,9 +1867,43 @@ def run(arguments: argparse.Namespace) -> Path:
                     project=project,
                     log_path=None,
                 )
-            except Exception:
-                pass
+                compose_active = False
+            except Exception as cleanup_error:
+                cleanup_errors.append(
+                    "compose_down:"
+                    f"{type(cleanup_error).__name__}:{cleanup_error}"
+                )
+        if (
+            runtime_zone_binding is not None
+            and runtime_zone_binding_active
+        ):
+            try:
+                unbind_runtime_trusted(commands, runtime_zone_binding)
+                runtime_zone_binding_active = False
+                if bridge_accommodation is not None:
+                    bridge_accommodation["binding_removed"] = True
+            except Exception as cleanup_error:
+                cleanup_errors.append(
+                    "firewalld_unbind_after_down:"
+                    f"{type(cleanup_error).__name__}:{cleanup_error}"
+                )
         token_file.unlink(missing_ok=True)
+        failure_host_state_restored: bool | None = None
+        if before_state is not None:
+            try:
+                failure_after_state = capture_host_state()
+                failure_host_state_restored = (
+                    failure_after_state == before_state
+                )
+                _write_private_json(
+                    layout.evidence / "host-state-failure-after.json",
+                    failure_after_state,
+                )
+            except Exception as cleanup_error:
+                cleanup_errors.append(
+                    "failure_host_state_capture:"
+                    f"{type(cleanup_error).__name__}:{cleanup_error}"
+                )
         failure_path = layout.root / "FAILURE.json"
         if not failure_path.exists():
             _write_private_json(
@@ -1696,6 +1916,8 @@ def run(arguments: argparse.Namespace) -> Path:
                     "git_commit": commit,
                     "error_type": type(error).__name__,
                     "error": str(error),
+                    "cleanup_errors": cleanup_errors,
+                    "host_state_restored": failure_host_state_restored,
                     "traceback": traceback.format_exc()[-8000:],
                 },
             )

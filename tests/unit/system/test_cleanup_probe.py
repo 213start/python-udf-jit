@@ -9,6 +9,39 @@ from tests.system.capture_host_state import _canonical_routes
 from tests.system.verify_cleanup import build_cleanup_proof
 
 
+def _state() -> dict[str, object]:
+    return {
+        "routes_sha256": "a" * 64,
+        "firewall_sha256": "b" * 64,
+        "firewalld_runtime_sha256": "c" * 64,
+        "firewalld_permanent_sha256": "d" * 64,
+        "firewall_backend": "nftables-stateless",
+        "firewalld_state": "running",
+    }
+
+
+def _bridge() -> dict[str, object]:
+    network_id = "f" * 64
+    return {
+        "action": "runtime-trusted",
+        "network_id": network_id,
+        "bridge_interface": f"br-{network_id[:12]}",
+        "zone": "trusted",
+        "scope": "runtime",
+        "connectivity_before": {
+            "ray-worker-1": False,
+            "ray-worker-2": False,
+        },
+        "connectivity_after": {
+            "ray-worker-1": True,
+            "ray-worker-2": True,
+        },
+        "binding_added": True,
+        "binding_removed": True,
+        "bridge_interface_exists_after_cleanup": False,
+    }
+
+
 class CleanupProbeTests(unittest.TestCase):
     def test_route_hash_input_is_canonical_json(self) -> None:
         left = _canonical_routes(
@@ -20,10 +53,7 @@ class CleanupProbeTests(unittest.TestCase):
         self.assertEqual(left, right)
 
     def test_real_resource_identifiers_and_equal_host_state_seal_proof(self) -> None:
-        state = {
-            "routes_sha256": "a" * 64,
-            "firewall_sha256": "b" * 64,
-        }
+        state = _state()
         proof = build_cleanup_proof(
             run_id="u13-run",
             cluster_epoch="u13-epoch",
@@ -35,6 +65,7 @@ class CleanupProbeTests(unittest.TestCase):
             remaining_project_networks=[],
             dashboard_port_open=False,
             token_exists=False,
+            bridge_accommodation=_bridge(),
         )
 
         self.assertEqual(
@@ -47,10 +78,7 @@ class CleanupProbeTests(unittest.TestCase):
         )
 
     def test_any_remaining_resource_is_preserved_as_failure_evidence(self) -> None:
-        state = {
-            "routes_sha256": "a" * 64,
-            "firewall_sha256": "b" * 64,
-        }
+        state = _state()
         proof = build_cleanup_proof(
             run_id="u13-run",
             cluster_epoch="u13-epoch",
@@ -62,6 +90,7 @@ class CleanupProbeTests(unittest.TestCase):
             remaining_project_networks=[],
             dashboard_port_open=False,
             token_exists=False,
+            bridge_accommodation=_bridge(),
         )
 
         self.assertEqual(
