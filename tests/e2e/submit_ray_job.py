@@ -60,7 +60,12 @@ def submit_and_wait(
         document={
             "entrypoint": entrypoint,
             "submission_id": submission_id,
-            "runtime_env": {"env_vars": {"UDFJIT_MODE": mode}},
+            "runtime_env": {
+                "env_vars": {
+                    "UDFJIT_LIVE_RAY": "1",
+                    "UDFJIT_MODE": mode,
+                }
+            },
         },
     )
     started = time.monotonic()

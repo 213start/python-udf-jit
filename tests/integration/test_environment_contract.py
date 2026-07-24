@@ -37,6 +37,10 @@ class EnvironmentContractTests(unittest.TestCase):
         self.assertEqual("stop", contract.ray_daft_mismatch_policy)
         self.assertIn("container_image_digest", contract.required_fingerprints)
         self.assertIn("udf_jit_wheel_sha256", contract.required_fingerprints)
+        submitter = (
+            ROOT / "tests/e2e/submit_ray_job.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"UDFJIT_LIVE_RAY": "1"', submitter)
 
     def test_missing_docker_returns_needs_bootstrap_without_ray_fallback(self) -> None:
         result = preflight_docker(executable="udfjit-docker-does-not-exist")
