@@ -259,10 +259,13 @@ class EvidenceAggregationTests(unittest.TestCase):
             state="FINISHED",
             actor_id=event["actor_id"],
             node_id=event["node_id"],
+            worker_id=event["worker_id"],
             worker_pid=event["pid"],
         )
+        running = SimpleNamespace(**vars(record))
+        running.state = "RUNNING"
         state_module = ModuleType("ray.util.state")
-        state_module.list_tasks = lambda **_kwargs: [record]
+        state_module.list_tasks = mock.Mock(side_effect=([running], [record]))
         util_module = ModuleType("ray.util")
         util_module.state = state_module
         ray_module = ModuleType("ray")
@@ -272,10 +275,20 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            joined = _join_ray_task_attempts([event])
+            joined = _join_ray_task_attempts(
+                [event],
+                wait_seconds=0.1,
+                poll_seconds=0,
+            )
         self.assertEqual(joined[0]["task_attempt"], "attempt-0")
+        self.assertEqual(state_module.list_tasks.call_count, 2)
+        self.assertEqual(
+            joined[0]["ray_state_exact_records"][0]["state"],
+            "FINISHED",
+        )
 
         record.attempt_number = 1
+        state_module.list_tasks = lambda **_kwargs: [record]
         with mock.patch.dict(
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
@@ -306,7 +319,7 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            joined = _join_ray_task_attempts([event])
+            joined = _join_ray_task_attempts([event], wait_seconds=0)
         self.assertEqual(joined[0]["task_attempt"], "")
 
     def test_ae1_to_ae8_pass_and_keep_natural_coverage_separate(self) -> None:

@@ -555,25 +555,85 @@ def _state_int(record: Any, name: str, default: int = -1) -> int:
         return default
 
 
-def _join_ray_task_attempts(events: list[dict[str, object]]) -> list[dict[str, object]]:
+def _task_state_document(record: Any) -> dict[str, object]:
+    return {
+        "task_id": _state_text(record, "task_id"),
+        "attempt_number": _state_int(record, "attempt_number"),
+        "state": _state_text(record, "state"),
+        "type": _state_text(record, "type"),
+        "actor_id": _state_text(record, "actor_id"),
+        "node_id": _state_text(record, "node_id"),
+        "worker_id": _state_text(record, "worker_id"),
+        "worker_pid": _state_int(record, "worker_pid"),
+    }
+
+
+def _join_ray_task_attempts(
+    events: list[dict[str, object]],
+    *,
+    wait_seconds: float = 20.0,
+    poll_seconds: float = 0.25,
+) -> list[dict[str, object]]:
     """Join Worker task IDs to the authoritative Ray State attempt records."""
 
     from ray.util.state import list_tasks
 
-    records = list(list_tasks(detail=True, limit=10000, timeout=30))
+    task_ids = {
+        str(event.get("partition_id", ""))
+        for event in events
+        if event.get("partition_id")
+    }
+    state_records: list[Any] = []
     records_by_id: dict[str, list[Any]] = {}
-    for record in records:
-        task_id = _state_text(record, "task_id")
-        if task_id:
-            records_by_id.setdefault(task_id, []).append(record)
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while task_ids:
+        state_records = list(list_tasks(detail=True, limit=10000, timeout=30))
+        records_by_id = {}
+        for record in state_records:
+            task_id = _state_text(record, "task_id")
+            if task_id:
+                records_by_id.setdefault(task_id, []).append(record)
+        pending = False
+        for task_id in task_ids:
+            matches = records_by_id.get(task_id, [])
+            if not matches or (
+                len(matches) == 1
+                and _state_text(matches[0], "state")
+                not in {"FINISHED", "FAILED"}
+            ):
+                pending = True
+                break
+        remaining = deadline - time.monotonic()
+        if not pending or remaining <= 0:
+            break
+        time.sleep(min(max(0.0, poll_seconds), remaining))
 
     joined = []
     for event in events:
         item = dict(event)
         task_id = str(item.get("partition_id", ""))
-        records = records_by_id.get(task_id, [])
-        if len(records) == 1:
-            record = records[0]
+        exact_records = records_by_id.get(task_id, [])
+        item["ray_state_exact_records"] = [
+            _task_state_document(record) for record in exact_records
+        ]
+        if not exact_records:
+            actor_id = str(item.get("actor_id", ""))
+            node_id = str(item.get("node_id", ""))
+            try:
+                worker_pid = int(item.get("pid", -1))
+            except (TypeError, ValueError):
+                worker_pid = -1
+            item["ray_state_identity_candidates"] = [
+                _task_state_document(record)
+                for record in state_records
+                if (
+                    _state_text(record, "actor_id") == actor_id
+                    and _state_text(record, "node_id") == node_id
+                    and _state_int(record, "worker_pid") == worker_pid
+                )
+            ][-10:]
+        if len(exact_records) == 1:
+            record = exact_records[0]
             identity_matches = (
                 _state_text(record, "state") == "FINISHED"
                 and _state_text(record, "node_id") == str(item.get("node_id"))
@@ -583,6 +643,10 @@ def _join_ray_task_attempts(events: list[dict[str, object]]) -> list[dict[str, o
             event_actor = str(item.get("actor_id", ""))
             if record_actor and event_actor:
                 identity_matches = identity_matches and record_actor == event_actor
+            record_worker = _state_text(record, "worker_id")
+            event_worker = str(item.get("worker_id", ""))
+            if record_worker and event_worker:
+                identity_matches = identity_matches and record_worker == event_worker
             attempt_number = _state_int(record, "attempt_number")
             if identity_matches and attempt_number == 0:
                 item["task_attempt"] = "attempt-0"
