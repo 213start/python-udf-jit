@@ -60,6 +60,7 @@ COPY config config
 COPY docker/scalar-piercing docker/scalar-piercing
 COPY tests tests
 COPY benchmarks benchmarks
+COPY vendor/cinderx/patches vendor/cinderx/patches
 COPY docker/scalar-piercing/python-udf-jit-bootstrap.pth /tmp/python-udf-jit-bootstrap.pth
 RUN unset PYTHONJITAUTO PYTHONJITDISABLE; \
     python -c "import shutil,sysconfig; shutil.copyfile('/tmp/python-udf-jit-bootstrap.pth', sysconfig.get_path('purelib') + '/python-udf-jit-bootstrap.pth')"

@@ -1326,6 +1326,8 @@ def run(arguments: argparse.Namespace) -> Path:
                 "discover",
                 "-s",
                 "tests/integration",
+                "-t",
+                ".",
                 "-v",
             ],
             environment=live_environment,

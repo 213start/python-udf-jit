@@ -104,6 +104,10 @@ class EnvironmentContractTests(unittest.TestCase):
         self.assertIn("ray-*.whl", dockerfile)
         self.assertIn("python_udf_jit-*.whl", dockerfile)
         self.assertIn("COPY benchmarks benchmarks", dockerfile)
+        self.assertIn(
+            "COPY vendor/cinderx/patches vendor/cinderx/patches",
+            dockerfile,
+        )
         self.assertNotIn("getdaft", dockerfile)
 
     def test_cinderx_runtime_overlay_is_committed_and_hash_locked(self) -> None:

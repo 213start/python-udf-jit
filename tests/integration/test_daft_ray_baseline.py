@@ -50,21 +50,27 @@ class DaftRayBaselineContractTests(unittest.TestCase):
 class DaftRayLiveBaselineTests(unittest.TestCase):
     def test_partitioned_float_projection_runs_only_on_worker_nodes(self) -> None:
         import daft
+        import ray
 
-        daft.set_runner_ray(address="auto", noop_if_initialized=True)
-        projection = daft.func(_live_calibrate_measurement)
-        values = [0.0, 1.25, -2.5, 9.0]
-        result = (
-            daft.from_pydict({"x": values})
-            .repartition(2)
-            .with_column("y", projection(daft.col("x")))
-            .select("x", "y")
-            .to_pydict()
-        )
+        try:
+            daft.set_runner_ray(address="auto", noop_if_initialized=True)
+            projection = daft.func(_live_calibrate_measurement)
+            values = [0.0, 1.25, -2.5, 9.0]
+            result = (
+                daft.from_pydict({"x": values})
+                .repartition(2)
+                .with_column("y", projection(daft.col("x")))
+                .select("x", "y")
+                .to_pydict()
+            )
 
-        actual = sorted(zip(result["x"], result["y"], strict=True))
-        expected = sorted((value, value * 2.0 + 3.0) for value in values)
-        self.assertEqual(actual, expected)
+            actual = sorted(zip(result["x"], result["y"], strict=True))
+            expected = sorted(
+                (value, value * 2.0 + 3.0) for value in values
+            )
+            self.assertEqual(actual, expected)
+        finally:
+            ray.shutdown()
 
 
 if __name__ == "__main__":
