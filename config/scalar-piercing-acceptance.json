@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "profile": "u13-formal-scalar-mainline-acceptance",
+  "gates": {
+    "provenance.clean_source": {
+      "tier": "system",
+      "description": "The candidate is built from one clean, committed source tree.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_base_inconclusive_and_dirty_source_are_preserved"]
+    },
+    "provenance.image_identity": {
+      "tier": "system",
+      "description": "The final image and wheel hashes match the preserved base report.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report"]
+    },
+    "tests.unit_suite": {
+      "tier": "unit",
+      "description": "The complete Python unit suite passes in the candidate image.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_contract_traces_every_requirement_and_acceptance_example"]
+    },
+    "tests.integration_suite": {
+      "tier": "integration",
+      "description": "Cross-process and three-node integration gates pass.",
+      "test_targets": ["tests.integration.test_driver_worker_artifact_roundtrip.DriverWorkerArtifactRoundtripTest.test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip"]
+    },
+    "tests.live_suite": {
+      "tier": "system",
+      "description": "All live-only tests execute without an unexpected skip.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.LiveScalarMainlinePiercingTests.test_live_evidence_is_supplied_by_the_external_harness"]
+    },
+    "environment.locked_manifest": {
+      "tier": "integration",
+      "description": "All three roles use the locked candidate manifest and runtime versions.",
+      "test_targets": ["tests.integration.test_environment_contract.EnvironmentContractTests.test_runtime_fingerprints_must_match_all_three_roles"]
+    },
+    "environment.three_node_topology": {
+      "tier": "system",
+      "description": "Exactly one zero-CPU Head/Driver and two Worker nodes are alive.",
+      "test_targets": ["tests.integration.test_ray_three_node_topology.ThreeNodeTopologyTests.test_exact_live_topology_is_accepted"]
+    },
+    "environment.auth_loopback": {
+      "tier": "system",
+      "description": "Dashboard/Jobs is loopback-only and enforces the per-run token.",
+      "test_targets": ["tests.integration.test_driver_worker_isolation.DriverWorkerIsolationTests.test_compose_exposes_only_loopback_dashboard_jobs_port"]
+    },
+    "environment.secret_hygiene": {
+      "tier": "system",
+      "description": "Authentication material is absent from image metadata, logs, events, and reports.",
+      "test_targets": ["tests.integration.test_environment_contract.EnvironmentContractTests.test_manifest_contains_no_runtime_secret_value"]
+    },
+    "environment.cleanup": {
+      "tier": "system",
+      "description": "Containers, networks, routes, firewall changes, ports, and tokens are cleaned.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_missing_or_false_external_proof_cannot_silently_pass"]
+    },
+    "integration.object_store_data_plane": {
+      "tier": "integration",
+      "description": "A Head-owned multi-megabyte ObjectRef reaches both Workers.",
+      "test_targets": ["tests.integration.test_ray_object_store_data_plane.RayObjectStoreDataPlaneTests.test_head_owned_object_ref_reaches_both_workers"]
+    },
+    "integration.cinderx_runtime": {
+      "tier": "integration",
+      "description": "CinderX runtime and Python intrinsic tests pass for the pinned commit.",
+      "test_targets": ["tests.integration.test_ray_cinderx_scalar_slot_smoke.RayCinderXScalarSlotSmokeTests.test_both_workers_execute_region_driven_cinderx_scalar_load"]
+    },
+    "integration.worker_pool_qualification": {
+      "tier": "integration",
+      "description": "The production Daft carrier compiles and executes the same artifact on both Workers.",
+      "test_targets": ["tests.integration.test_per_worker_artifact_qualification.PerWorkerArtifactQualificationTests.test_same_production_plan_compiles_and_executes_on_each_worker"]
+    },
+    "system.transparent_bootstrap": {
+      "tier": "system",
+      "description": "An unchanged user script receives automatic off/auto behavior without plugin imports.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+    },
+    "system.supported_jit": {
+      "tier": "system",
+      "description": "A supported Projection produces real Compile, Hit, and semantic execution evidence.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate"]
+    },
+    "system.with_column_semantics": {
+      "tier": "system",
+      "description": "with_column ordered output and schema are identical in off and auto.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+    },
+    "system.with_columns_semantics": {
+      "tier": "system",
+      "description": "with_columns ordered output and schema are identical in off and auto.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+    },
+    "system.ordered_results": {
+      "tier": "system",
+      "description": "The comparison preserves row order instead of sorting before hashing.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+    },
+    "system.guard_miss_semantics": {
+      "tier": "system",
+      "description": "A pre-semantics Guard Miss falls back exactly once with no semantic execute.",
+      "test_targets": ["tests.unit.integration.daft_ray.test_worker_runtime.WorkerRuntimeTest.test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute"]
+    },
+    "system.unsupported_semantics": {
+      "tier": "system",
+      "description": "An unsupported UDF preserves ordered results and exact side-effect count.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report"]
+    },
+    "system.fail_open": {
+      "tier": "system",
+      "description": "Mode off, fingerprint mismatch, and corrupt artifacts complete through the original callable.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate"]
+    },
+    "system.exception_semantics": {
+      "tier": "system",
+      "description": "The user-visible exception type and exactly-once side effect are equal in off and auto.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_black_box_drift_or_test_only_import_fails_transparency"]
+    },
+    "system.zero_row_semantics": {
+      "tier": "system",
+      "description": "Empty input preserves schema and produces no callable, descriptor, compile, or hit activity.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ae1_to_ae8_pass_and_keep_natural_coverage_separate"]
+    },
+    "evidence.base_verdict": {
+      "tier": "system",
+      "description": "The underlying scalar piercing report itself is a clean pass.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_base_inconclusive_and_dirty_source_are_preserved"]
+    },
+    "evidence.compile_hit_chain": {
+      "tier": "integration",
+      "description": "Compile precedes Hit for the same process generation and Variant key.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_hit_before_compile_or_from_another_generation_fails"]
+    },
+    "evidence.attempt_identity": {
+      "tier": "system",
+      "description": "Every remote partition task joins uniquely to FINISHED attempt zero.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_ray_state_join_accepts_only_unique_finished_attempt_zero"]
+    },
+    "evidence.phase_identity": {
+      "tier": "integration",
+      "description": "Readiness, qualification, and E2E share one epoch, manifest, topology, and boot identity.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_cross_phase_boot_drift_is_inconclusive"]
+    },
+    "evidence.no_head_data_plane": {
+      "tier": "system",
+      "description": "No artifact, layout, JIT, or execute event occurs on the Head.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_head_data_plane_event_is_failure"]
+    },
+    "evidence.permissions_cleanup": {
+      "tier": "system",
+      "description": "Raw events are ephemeral and all retained reports are value-free mode 0600.",
+      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_raw_event_permissions_whitelist_canary_and_cleanup_on_all_verdicts"]
+    },
+    "measurement.non_gating": {
+      "tier": "system",
+      "description": "Measurement records equivalence without applying a speedup release gate.",
+      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report"]
+    }
+  },
+  "requirements": {
+    "R1": ["provenance.clean_source", "provenance.image_identity", "environment.locked_manifest", "tests.unit_suite", "tests.integration_suite"],
+    "R2": ["system.transparent_bootstrap", "system.with_column_semantics", "environment.three_node_topology"],
+    "R3": ["system.transparent_bootstrap", "system.with_column_semantics", "system.with_columns_semantics"],
+    "R4": ["tests.unit_suite", "system.with_column_semantics", "system.with_columns_semantics", "system.unsupported_semantics"],
+    "R5": ["tests.unit_suite", "system.supported_jit", "system.unsupported_semantics"],
+    "R6": ["tests.unit_suite", "tests.integration_suite", "system.fail_open"],
+    "R7": ["tests.unit_suite", "integration.cinderx_runtime", "integration.worker_pool_qualification"],
+    "R8": ["integration.cinderx_runtime", "system.supported_jit", "evidence.compile_hit_chain"],
+    "R9": ["tests.unit_suite", "system.guard_miss_semantics", "system.exception_semantics"],
+    "R10": ["tests.unit_suite", "system.guard_miss_semantics", "system.unsupported_semantics", "system.fail_open", "system.exception_semantics"],
+    "R11": ["system.supported_jit", "evidence.compile_hit_chain", "evidence.attempt_identity", "evidence.no_head_data_plane"],
+    "R12": ["integration.cinderx_runtime", "evidence.compile_hit_chain"],
+    "R13": ["measurement.non_gating"],
+    "R14": ["environment.three_node_topology", "integration.object_store_data_plane", "evidence.no_head_data_plane"],
+    "R15": ["integration.cinderx_runtime", "integration.worker_pool_qualification"],
+    "R16": ["evidence.phase_identity", "evidence.attempt_identity"],
+    "R17": ["environment.auth_loopback", "environment.secret_hygiene"],
+    "R18": ["evidence.permissions_cleanup", "environment.cleanup"],
+    "R19": ["integration.worker_pool_qualification"],
+    "R20": ["provenance.clean_source", "provenance.image_identity", "tests.unit_suite", "tests.integration_suite", "tests.live_suite", "environment.cleanup"]
+  },
+  "acceptance_examples": {
+    "AE1": ["system.transparent_bootstrap", "system.supported_jit", "system.with_column_semantics", "system.ordered_results", "evidence.compile_hit_chain"],
+    "AE2": ["system.guard_miss_semantics", "system.exception_semantics"],
+    "AE3": ["system.unsupported_semantics"],
+    "AE4": ["system.transparent_bootstrap", "system.fail_open"],
+    "AE5": ["system.zero_row_semantics"],
+    "AE6": ["environment.three_node_topology", "integration.cinderx_runtime", "evidence.no_head_data_plane"],
+    "AE7": ["evidence.base_verdict", "evidence.phase_identity", "evidence.attempt_identity"],
+    "AE8": ["integration.worker_pool_qualification", "tests.live_suite"]
+  }
+}
