@@ -108,7 +108,7 @@ def build_unittest_evidence(
         raise TestEvidenceError("unittest_unexpected_skip")
     for test in required:
         if re.search(
-            rf"^{re.escape(test)}(?:\s+\([^\r\n]*\))?\s+\.\.\.",
+            rf"^{re.escape(test)}(?=\s|$)",
             text,
             flags=re.MULTILINE,
         ) is None:
