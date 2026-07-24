@@ -31,13 +31,13 @@ _STATUSES = frozenset({"pass", "fail", "inconclusive", "incomplete", "stop"})
 _TIERS = frozenset({"unit", "integration", "system"})
 _EXPECTED_REQUIREMENTS = frozenset(f"R{index}" for index in range(1, 21))
 _EXPECTED_ACCEPTANCE_EXAMPLES = frozenset(f"AE{index}" for index in range(1, 9))
-_UNIT_REQUIRED_TESTS = (
+UNIT_REQUIRED_TESTS = (
     "test_contract_traces_every_requirement_and_acceptance_example",
     "test_exact_static_runtime_and_python_gates_produce_proof",
     "test_fixture_never_imports_or_calls_plugin_internals",
     "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
 )
-_INTEGRATION_REQUIRED_TESTS = (
+INTEGRATION_REQUIRED_TESTS = (
     "test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip",
     "test_exact_live_topology_is_accepted",
     "test_partitioned_float_projection_runs_only_on_worker_nodes",
@@ -45,7 +45,7 @@ _INTEGRATION_REQUIRED_TESTS = (
     "test_both_workers_execute_region_driven_cinderx_scalar_load",
     "test_same_production_plan_compiles_and_executes_on_each_worker",
 )
-_LIVE_REQUIRED_TESTS = (
+LIVE_REQUIRED_TESTS = (
     "test_ae1_to_ae8_pass_and_keep_natural_coverage_separate",
     "test_live_evidence_is_supplied_by_the_external_harness",
 )
@@ -521,7 +521,7 @@ def _python_test_statuses(
         run_id=run_id,
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
-        required_tests=_UNIT_REQUIRED_TESTS,
+        required_tests=UNIT_REQUIRED_TESTS,
         minimum_test_count=114,
         allow_skips=False,
     )
@@ -532,7 +532,7 @@ def _python_test_statuses(
         run_id=run_id,
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
-        required_tests=_INTEGRATION_REQUIRED_TESTS,
+        required_tests=INTEGRATION_REQUIRED_TESTS,
         minimum_test_count=29,
         allow_skips=False,
     )
@@ -543,7 +543,7 @@ def _python_test_statuses(
         run_id=run_id,
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
-        required_tests=_LIVE_REQUIRED_TESTS,
+        required_tests=LIVE_REQUIRED_TESTS,
         minimum_test_count=12,
         allow_skips=False,
     )
