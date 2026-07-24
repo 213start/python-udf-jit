@@ -32,12 +32,17 @@ def _private_log(path: Path) -> tuple[str, str]:
     return text, hashlib.sha256(payload).hexdigest()
 
 
-def _canonical_strings(values: Iterable[str], field: str) -> tuple[str, ...]:
+def _canonical_strings(
+    values: Iterable[str],
+    field: str,
+    *,
+    require_unique: bool,
+) -> tuple[str, ...]:
     result = tuple(values)
     if (
         not result
         or any(not isinstance(value, str) or not value for value in result)
-        or len(set(result)) != len(result)
+        or (require_unique and len(set(result)) != len(result))
     ):
         raise TestEvidenceError(f"{field}_invalid")
     return result
@@ -72,8 +77,12 @@ def build_unittest_evidence(
         or minimum_test_count < 1
     ):
         raise TestEvidenceError("minimum_test_count_invalid")
-    command = _canonical_strings(argv, "argv")
-    required = _canonical_strings(required_tests, "required_tests")
+    command = _canonical_strings(argv, "argv", require_unique=False)
+    required = _canonical_strings(
+        required_tests,
+        "required_tests",
+        require_unique=True,
+    )
     text, log_digest = _private_log(log_path)
 
     summaries = tuple(
