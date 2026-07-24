@@ -8,7 +8,6 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from python_udf_jit.diagnostics.cinderx_evidence import (
-    EXPECTED_UDF_RUNTIME_CASES,
     validate_cinderx_evidence,
 )
 from python_udf_jit.diagnostics.environment_evidence import (
@@ -32,12 +31,23 @@ _TIERS = frozenset({"unit", "integration", "system"})
 _EXPECTED_REQUIREMENTS = frozenset(f"R{index}" for index in range(1, 21))
 _EXPECTED_ACCEPTANCE_EXAMPLES = frozenset(f"AE{index}" for index in range(1, 9))
 UNIT_REQUIRED_TESTS = (
+    "test_black_box_observes_framework_order_without_sorting",
     "test_contract_traces_every_requirement_and_acceptance_example",
+    "test_down_attempts_network_cleanup_after_container_removal_failure",
+    "test_each_invoke_freezes_one_ray_task_identity_for_all_events",
+    "test_existing_parent_permissions_are_not_changed",
     "test_exact_static_runtime_and_python_gates_produce_proof",
+    "test_failure_scrub_removes_all_payloads_but_preserves_run_root",
     "test_fixture_never_imports_or_calls_plugin_internals",
+    "test_manifest_binds_installed_cinderx_wheel_and_base_image",
+    "test_only_numeric_loopback_hosts_are_accepted",
     "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
     "test_rejects_non_internal_data_plane",
+    "test_request_disables_proxies_and_installs_redirect_rejection",
+    "test_restart_baseline_is_captured_after_live_suite",
+    "test_root_environment_discards_inherited_execution_controls",
     "test_runtime_binding_is_exact_and_reversible",
+    "test_successful_compose_down_still_verifies_no_resources_remain",
 )
 INTEGRATION_REQUIRED_TESTS = (
     "test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip",
@@ -50,7 +60,12 @@ INTEGRATION_REQUIRED_TESTS = (
 LIVE_REQUIRED_TESTS = (
     "test_ae1_to_ae8_pass_and_keep_natural_coverage_separate",
     "test_live_evidence_is_supplied_by_the_external_harness",
+    "test_ray_state_join_never_starts_a_query_after_budget_expires",
+    "test_zero_row_counts_are_derived_from_observed_runtime_events",
 )
+UNIT_TEST_COUNT = 134
+INTEGRATION_TEST_COUNT = 29
+LIVE_TEST_COUNT = 14
 
 
 class AcceptanceContractError(ValueError):
@@ -354,13 +369,26 @@ def _source_gates(
         return clean_source, "incomplete"
     source_image = source.get("image_digest")
     source_wheel = source.get("udf_jit_wheel_sha256")
+    source_cinderx_wheel = source.get("cinderx_wheel_sha256")
+    source_cinderx_base = source.get("cinderx_base_image_digest")
     image_identity = (
         "pass"
         if isinstance(source_image, str)
         and re.fullmatch(r"sha256:[0-9a-f]{64}", source_image) is not None
         and _valid_sha256(source_wheel)
+        and _valid_sha256(source_cinderx_wheel)
+        and isinstance(source_cinderx_base, str)
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            source_cinderx_base,
+        )
+        is not None
         and source_image == manifest.get("image_digest")
         and source_wheel == manifest.get("udf_jit_wheel_sha256")
+        and source_cinderx_wheel
+        == manifest.get("cinderx_wheel_sha256")
+        and source_cinderx_base
+        == manifest.get("cinderx_base_image_digest")
         else "fail"
     )
     return clean_source, image_identity
@@ -380,11 +408,14 @@ def _cinderx_source_identity(
         "cinderx_commit",
         "cinderx_source_tree_sha256",
         "cinderx_patch_sha256",
+        "cinderx_wheel_sha256",
+        "cinderx_base_image_digest",
     )
     required_identity = (
         "cinderx_commit",
         "source_tree_sha256",
         "patch_sha256",
+        "cinderx_wheel_sha256",
         "image_digest",
         "python_version",
         "soabi",
@@ -401,12 +432,21 @@ def _cinderx_source_identity(
     cinderx_commit = source["cinderx_commit"]
     source_tree = source["cinderx_source_tree_sha256"]
     patch = source["cinderx_patch_sha256"]
+    cinderx_wheel = source["cinderx_wheel_sha256"]
+    cinderx_base_image = source["cinderx_base_image_digest"]
     valid = (
         validate_cinderx_evidence(raw_proof) == "pass"
         and isinstance(cinderx_commit, str)
         and _GIT_COMMIT.fullmatch(cinderx_commit) is not None
         and _valid_sha256(source_tree)
         and _valid_sha256(patch)
+        and _valid_sha256(cinderx_wheel)
+        and isinstance(cinderx_base_image, str)
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            cinderx_base_image,
+        )
+        is not None
         and raw_proof.get("schema_version") == 1
         and raw_proof.get("status") == "pass"
         and _valid_sha256(raw_proof.get("proof_sha256"))
@@ -415,6 +455,12 @@ def _cinderx_source_identity(
         == cinderx_commit
         and identity.get("source_tree_sha256") == source_tree
         and identity.get("patch_sha256") == patch
+        and identity.get("cinderx_wheel_sha256")
+        == manifest.get("cinderx_wheel_sha256")
+        == cinderx_wheel
+        and identity.get("image_digest")
+        == manifest.get("cinderx_base_image_digest")
+        == cinderx_base_image
         and isinstance(identity.get("image_digest"), str)
         and re.fullmatch(
             r"sha256:[0-9a-f]{64}", str(identity["image_digest"])
@@ -433,72 +479,7 @@ def _cinderx_test_status(infrastructure: Mapping[str, Any]) -> str:
     raw_proof = infrastructure.get("cinderx")
     if not isinstance(raw_proof, Mapping):
         return "incomplete"
-    runtime = raw_proof.get("runtime_tests")
-    python_tests = raw_proof.get("python_tests")
-    artifacts = raw_proof.get("artifacts")
-    if (
-        not isinstance(runtime, Mapping)
-        or not isinstance(python_tests, Mapping)
-        or not isinstance(artifacts, Mapping)
-    ):
-        return "incomplete"
-    required_runtime = (
-        "normal",
-        "lightweight_frames_deopt",
-        "osr",
-        "udf_cases",
-    )
-    required_python = (
-        "release_pytest",
-        "adaptive_libtest",
-        "official_skip_libtest",
-        "udf_data_intrinsic",
-    )
-    if (
-        any(field not in runtime for field in required_runtime)
-        or any(field not in python_tests for field in required_python)
-        or len(artifacts) != 8
-    ):
-        return "incomplete"
-
-    expected_counts = {
-        "normal": 1176,
-        "lightweight_frames_deopt": 66,
-        "osr": 130,
-    }
-    runtime_valid = all(
-        isinstance(runtime.get(name), Mapping)
-        and runtime[name].get("passed") == count
-        and runtime[name].get("failed") == 0
-        for name, count in expected_counts.items()
-    )
-    release = python_tests["release_pytest"]
-    adaptive = python_tests["adaptive_libtest"]
-    official = python_tests["official_skip_libtest"]
-    targeted = python_tests["udf_data_intrinsic"]
-    python_valid = (
-        isinstance(release, Mapping)
-        and release.get("passed") == 1331
-        and release.get("failed") == 0
-        and release.get("errors") == 0
-        and isinstance(adaptive, Mapping)
-        and adaptive.get("module_count") == 456
-        and adaptive.get("returncode") == 0
-        and isinstance(official, Mapping)
-        and official.get("module_count") == 26
-        and official.get("returncode") == 0
-        and isinstance(targeted, Mapping)
-        and targeted.get("passed") == 5
-        and targeted.get("failed") == 0
-    )
-    valid = (
-        validate_cinderx_evidence(raw_proof) == "pass"
-        and runtime_valid
-        and runtime.get("udf_cases") == list(EXPECTED_UDF_RUNTIME_CASES)
-        and python_valid
-        and all(_valid_sha256(value) for value in artifacts.values())
-    )
-    return "pass" if valid else "fail"
+    return validate_cinderx_evidence(raw_proof)
 
 
 def _python_test_statuses(
@@ -524,7 +505,7 @@ def _python_test_statuses(
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
         required_tests=UNIT_REQUIRED_TESTS,
-        minimum_test_count=117,
+        minimum_test_count=UNIT_TEST_COUNT,
         allow_skips=False,
     )
     integration = validate_unittest_evidence(
@@ -535,7 +516,7 @@ def _python_test_statuses(
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
         required_tests=INTEGRATION_REQUIRED_TESTS,
-        minimum_test_count=29,
+        minimum_test_count=INTEGRATION_TEST_COUNT,
         allow_skips=False,
     )
     live = validate_unittest_evidence(
@@ -546,7 +527,7 @@ def _python_test_statuses(
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
         required_tests=LIVE_REQUIRED_TESTS,
-        minimum_test_count=12,
+        minimum_test_count=LIVE_TEST_COUNT,
         allow_skips=False,
     )
     return unit, integration, live
@@ -808,6 +789,12 @@ def aggregate_formal_acceptance(
             ),
             "cinderx_patch_sha256": evidence["source"].get(
                 "cinderx_patch_sha256", ""
+            ),
+            "cinderx_wheel_sha256": evidence["source"].get(
+                "cinderx_wheel_sha256", ""
+            ),
+            "cinderx_base_image_digest": evidence["source"].get(
+                "cinderx_base_image_digest", ""
             ),
             "image_digest": evidence["source"].get("image_digest", ""),
             "udf_jit_wheel_sha256": evidence["source"].get(

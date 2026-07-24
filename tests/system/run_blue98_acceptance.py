@@ -11,15 +11,17 @@ import socket
 import stat
 import subprocess
 import time
-import traceback
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from python_udf_jit.diagnostics.acceptance import (
+    INTEGRATION_TEST_COUNT,
     INTEGRATION_REQUIRED_TESTS,
+    LIVE_TEST_COUNT,
     LIVE_REQUIRED_TESTS,
+    UNIT_TEST_COUNT,
     UNIT_REQUIRED_TESTS,
 )
 from python_udf_jit.diagnostics.cinderx_evidence import (
@@ -70,6 +72,11 @@ from tests.system.firewalld_bridge import (
     unbind_runtime_trusted,
 )
 from tests.system.probe_environment import probe as probe_environment
+from tests.system.private_output import (
+    open_private_output,
+    write_private_bytes,
+    write_private_json,
+)
 from tests.system.verify_cleanup import build_cleanup_proof
 
 
@@ -77,11 +84,23 @@ _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ROLES = ("ray-head-driver", "ray-worker-1", "ray-worker-2")
-_EXPECTED_UNIT_COUNT = 117
-_EXPECTED_INTEGRATION_COUNT = 29
-_EXPECTED_LIVE_COUNT = 12
-
-
+_TRUSTED_TOOL_DIRECTORIES = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+_REQUIRED_ROOT_TOOLS = (
+    "docker",
+    "docker-compose",
+    "firewall-cmd",
+    "git",
+    "ip",
+    "nft",
+    "tar",
+)
 class AcceptanceRunError(RuntimeError):
     """The live run cannot produce a valid formal acceptance report."""
 
@@ -159,13 +178,7 @@ class Commands:
         timeout: int = 900,
     ) -> None:
         argv = [str(value) for value in arguments]
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
+        descriptor = open_private_output(path)
         with os.fdopen(descriptor, "wb") as stream:
             completed = subprocess.run(
                 argv,
@@ -198,27 +211,11 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _write_private_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        0o600,
-    )
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload)
+    write_private_bytes(path, payload)
 
 
 def _write_private_json(path: Path, document: Mapping[str, Any]) -> None:
-    _write_private_bytes(
-        path,
-        json.dumps(
-            document,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("ascii"),
-    )
+    write_private_json(path, document)
 
 
 def _require_private(path: Path) -> None:
@@ -230,6 +227,58 @@ def _validate_id(value: str, field: str) -> str:
     if _SAFE_ID.fullmatch(value) is None:
         raise AcceptanceRunError(f"{field}_invalid:{value!r}")
     return value
+
+
+def _trusted_root_executable(name: str, search_path: str) -> str:
+    candidate = shutil.which(name, path=search_path)
+    if candidate is None:
+        raise AcceptanceRunError(f"required_executable_missing:{name}")
+    resolved = Path(candidate).resolve(strict=True)
+    metadata = resolved.stat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+    ):
+        raise AcceptanceRunError(f"untrusted_root_executable:{name}")
+    return str(resolved)
+
+
+def _install_trusted_root_environment(
+    resolver: Callable[[str, str], str] | None = None,
+) -> dict[str, str]:
+    directories = []
+    for raw_directory in _TRUSTED_TOOL_DIRECTORIES:
+        directory = Path(raw_directory)
+        if not directory.is_dir():
+            continue
+        metadata = directory.stat()
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise AcceptanceRunError(
+                f"untrusted_root_tool_directory:{raw_directory}"
+            )
+        directories.append(raw_directory)
+    search_path = os.pathsep.join(directories)
+    resolve = resolver or _trusted_root_executable
+    tools = {
+        name: resolve(name, search_path)
+        for name in _REQUIRED_ROOT_TOOLS
+    }
+    os.environ.clear()
+    os.environ.update(
+        {
+            "HOME": "/root",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": search_path,
+        }
+    )
+    return tools
+
+
+def _compose_project(cluster_epoch: str) -> str:
+    suffix = cluster_epoch.removeprefix("epoch-")
+    return _validate_id(f"u13-{suffix}", "compose_project")
 
 
 def _git_identity(commands: Commands, repository: Path) -> str:
@@ -352,7 +401,13 @@ def _interface_exists(interface: str) -> bool:
     )
 
 
-def _project_ids(commands: Commands, *, kind: str, project: str) -> list[str]:
+def _project_ids(
+    commands: Commands,
+    *,
+    kind: str,
+    project: str,
+    run_id: str | None = None,
+) -> list[str]:
     if kind == "container":
         arguments = [
             "docker",
@@ -374,6 +429,13 @@ def _project_ids(commands: Commands, *, kind: str, project: str) -> list[str]:
         ]
     else:
         raise ValueError(f"unknown project resource kind: {kind}")
+    if run_id is not None:
+        arguments.extend(
+            (
+                "--filter",
+                f"label=org.python-udf-jit.run-id={run_id}",
+            )
+        )
     return sorted(
         line
         for line in commands.run(arguments).splitlines()
@@ -510,6 +572,33 @@ def _delete_raw_files(paths: Iterable[Path]) -> None:
         path.unlink(missing_ok=True)
 
 
+def _scrub_failure_payloads(layout: RunLayout) -> None:
+    """Remove value-bearing failure artifacts while preserving the run root."""
+
+    for root in (layout.evidence, layout.logs, layout.private, layout.work):
+        paths = sorted(
+            root.rglob("*"),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        )
+        for path in paths:
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+
+
+def _failure_reason(error: BaseException) -> str:
+    if isinstance(error, AcceptanceRunError):
+        reason = str(error).split(":", 1)[0]
+        if re.fullmatch(r"[a-z0-9_]+", reason):
+            return reason
+    return "unexpected_failure"
+
+
 def _assert_absent(paths: Iterable[Path]) -> None:
     remaining = [path for path in paths if path.exists()]
     if remaining:
@@ -611,6 +700,43 @@ def _capture_snapshot(
     return document
 
 
+def _restart_worker_and_capture(
+    commands: Commands,
+    *,
+    worker_container: str,
+    head_container: str,
+    run_id: str,
+    cluster_epoch: str,
+    manifest_sha256: str,
+    containers: Mapping[str, str],
+    output: Path,
+    log_path: Path,
+) -> dict[str, object]:
+    commands.log(
+        [
+            "docker",
+            "restart",
+            "--time",
+            "10",
+            worker_container,
+        ],
+        log_path,
+        timeout=180,
+    )
+    _await_cluster(
+        commands,
+        head_container=head_container,
+    )
+    return _capture_snapshot(
+        phase="e2e",
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
+        manifest_sha256=manifest_sha256,
+        containers=containers,
+        output=output,
+    )
+
+
 def _test_receipt(
     *,
     gate_id: str,
@@ -683,9 +809,11 @@ def _down(
     compose: list[str],
     environment: Mapping[str, str],
     project: str,
+    run_id: str,
     log_path: Path | None,
 ) -> None:
     arguments = [*compose, "down", "--remove-orphans", "--volumes"]
+    cleanup_errors: list[str] = []
     try:
         if log_path is None:
             commands.run(arguments, env=environment, timeout=180)
@@ -696,28 +824,53 @@ def _down(
                 env=environment,
                 timeout=180,
             )
-        return
     except Exception:
-        containers = _project_ids(
-            commands,
-            kind="container",
-            project=project,
-        )
-        if containers:
-            commands.run(
-                ["docker", "rm", "-f", *containers],
-                timeout=120,
+        for kind in ("container", "network"):
+            try:
+                identifiers = _project_ids(
+                    commands,
+                    kind=kind,
+                    project=project,
+                    run_id=run_id,
+                )
+            except Exception as error:
+                cleanup_errors.append(
+                    f"{kind}_enumeration:{type(error).__name__}"
+                )
+                continue
+            if not identifiers:
+                continue
+            operation = (
+                ["docker", "rm", "-f", *identifiers]
+                if kind == "container"
+                else ["docker", "network", "rm", *identifiers]
             )
-        networks = _project_ids(
-            commands,
-            kind="network",
-            project=project,
-        )
-        if networks:
-            commands.run(
-                ["docker", "network", "rm", *networks],
-                timeout=120,
+            try:
+                commands.run(operation, timeout=120)
+            except Exception as error:
+                cleanup_errors.append(
+                    f"{kind}_removal:{type(error).__name__}"
+                )
+
+    for kind in ("container", "network"):
+        try:
+            remaining = _project_ids(
+                commands,
+                kind=kind,
+                project=project,
+                run_id=run_id,
             )
+        except Exception as error:
+            cleanup_errors.append(
+                f"{kind}_verification:{type(error).__name__}"
+            )
+            continue
+        if remaining:
+            cleanup_errors.append(f"{kind}_resources_remain")
+    if cleanup_errors:
+        raise AcceptanceRunError(
+            "compose_down_cleanup_failed:" + ",".join(cleanup_errors)
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -865,18 +1018,14 @@ def _parser() -> argparse.ArgumentParser:
 def run(arguments: argparse.Namespace) -> Path:
     if os.geteuid() != 0:
         raise AcceptanceRunError("blue98_acceptance_requires_root")
+    trusted_tools = _install_trusted_root_environment()
     repository = arguments.repository.resolve()
     commands = Commands()
     commit = _git_identity(commands, repository)
     docker = preflight_docker()
     if docker.status != DockerPreflightStatus.READY:
         raise AcceptanceRunError(docker.reason)
-    compose_executable = shutil.which("docker-compose")
-    if compose_executable is None:
-        raise AcceptanceRunError("docker-compose is required")
-    for executable in ("firewall-cmd", "ip", "nft", "tar"):
-        if shutil.which(executable) is None:
-            raise AcceptanceRunError(f"required_executable_missing:{executable}")
+    compose_executable = trusted_tools["docker-compose"]
     if _port_open("127.0.0.1", 8265):
         raise AcceptanceRunError("dashboard_port_8265_already_in_use")
 
@@ -889,7 +1038,7 @@ def run(arguments: argparse.Namespace) -> Path:
         f"epoch-{secrets.token_hex(12)}",
         "cluster_epoch",
     )
-    project = _validate_id(f"u13{commit[:12]}", "compose_project")
+    project = _compose_project(cluster_epoch)
     run_root = (
         arguments.run_root.resolve()
         if arguments.run_root is not None
@@ -926,6 +1075,7 @@ def run(arguments: argparse.Namespace) -> Path:
         raise AcceptanceRunError("committed_cinderx_manifest_invalid")
 
     cinderx_wheel = _wheel(arguments.cinderx_wheel, "cinderx-")
+    cinderx_wheel_sha256 = _sha256(cinderx_wheel)
     daft_wheel = _wheel(arguments.daft_wheel, "daft-0.7.2")
     pyarrow_wheel = _wheel(arguments.pyarrow_wheel, "pyarrow-22.0.0")
     ray_wheel = _wheel(arguments.ray_wheel, "ray-2.55.0")
@@ -953,8 +1103,19 @@ def run(arguments: argparse.Namespace) -> Path:
     compose_environment: dict[str, str] = {}
     containers: dict[str, str] = {}
     before_state: dict[str, object] | None = None
+    token = ""
 
     try:
+        if _project_ids(
+            commands,
+            kind="container",
+            project=project,
+        ) or _project_ids(
+            commands,
+            kind="network",
+            project=project,
+        ):
+            raise AcceptanceRunError("compose_project_already_exists")
         _announce(f"run={run_id} commit={commit}")
         before_state = capture_host_state()
         _write_private_json(
@@ -975,6 +1136,7 @@ def run(arguments: argparse.Namespace) -> Path:
             cinderx_commit=cinderx_commit,
             source_tree_sha256=cinderx_tree,
             patch_sha256=patch_sha256,
+            cinderx_wheel_sha256=cinderx_wheel_sha256,
             fingerprint_path=cinderx_inputs.fingerprint,
             runtime_log_path=cinderx_inputs.runtime_log,
             release_log_path=cinderx_inputs.release_log,
@@ -1016,7 +1178,7 @@ def run(arguments: argparse.Namespace) -> Path:
             ),
         )
         wheel_hashes = {
-            "CINDERX_WHEEL_SHA256": _sha256(cinderx_wheel),
+            "CINDERX_WHEEL_SHA256": cinderx_wheel_sha256,
             "DAFT_WHEEL_SHA256": _sha256(daft_wheel),
             "PYARROW_WHEEL_SHA256": _sha256(pyarrow_wheel),
             "RAY_WHEEL_SHA256": _sha256(ray_wheel),
@@ -1032,6 +1194,8 @@ def run(arguments: argparse.Namespace) -> Path:
             image,
             "--build-arg",
             f"CINDERX_BASE_IMAGE={arguments.cinderx_base_image}",
+            "--build-arg",
+            f"CINDERX_BASE_IMAGE_DIGEST={base_image_id}",
             "--build-arg",
             f"SOURCE_GIT_COMMIT={commit}",
             "--build-arg",
@@ -1053,6 +1217,8 @@ def run(arguments: argparse.Namespace) -> Path:
             repository=repository,
             image=image,
             udf_jit_wheel=udf_wheel,
+            cinderx_wheel=cinderx_wheel,
+            cinderx_base_image_digest=base_image_id,
             cinderx_proof_path=cinderx_proof_path,
             patch_path=patch_path,
         )
@@ -1180,6 +1346,8 @@ def run(arguments: argparse.Namespace) -> Path:
             cinderx_commit=cinderx_commit,
             cinderx_source_tree_sha256=cinderx_tree,
             cinderx_patch_sha256=patch_sha256,
+            cinderx_wheel_sha256=cinderx_wheel_sha256,
+            cinderx_base_image_digest=base_image_id,
             udf_jit_wheel_sha256=wheel_hashes["UDFJIT_WHEEL_SHA256"],
         )
         manifest_path = layout.evidence / "candidate-manifest.json"
@@ -1279,14 +1447,16 @@ def run(arguments: argparse.Namespace) -> Path:
             destination=qualification_report_path,
         )
 
-        e2e_snapshot_path = layout.evidence / "e2e-snapshot-before.json"
+        pre_live_snapshot_path = (
+            layout.evidence / "e2e-snapshot-pre-live.json"
+        )
         _capture_snapshot(
             phase="e2e",
             run_id=run_id,
             cluster_epoch=cluster_epoch,
             manifest_sha256=manifest_sha256,
             containers=containers,
-            output=e2e_snapshot_path,
+            output=pre_live_snapshot_path,
         )
         _announce("both Workers passed readiness and production qualification")
 
@@ -1314,7 +1484,7 @@ def run(arguments: argparse.Namespace) -> Path:
             git_commit=commit,
             argv=unit_argv,
             required_tests=UNIT_REQUIRED_TESTS,
-            expected_count=_EXPECTED_UNIT_COUNT,
+            expected_count=UNIT_TEST_COUNT,
             log_path=unit_log,
             output=unit_path,
         )
@@ -1351,7 +1521,7 @@ def run(arguments: argparse.Namespace) -> Path:
             git_commit=commit,
             argv=integration_argv,
             required_tests=INTEGRATION_REQUIRED_TESTS,
-            expected_count=_EXPECTED_INTEGRATION_COUNT,
+            expected_count=INTEGRATION_TEST_COUNT,
             log_path=integration_log,
             output=integration_path,
         )
@@ -1383,31 +1553,36 @@ def run(arguments: argparse.Namespace) -> Path:
                 log=layout.logs / f"e2e-{mode}-submission.json",
             )
 
-        phase_path = layout.evidence / "phase-evidence-base.json"
-        phase_document = build_phase_evidence(
+        pre_live_phase_path = (
+            layout.evidence / "phase-evidence-pre-live.json"
+        )
+        pre_live_phase = build_phase_evidence(
             snapshots=[
                 _load_json(readiness_snapshot_path),
                 _load_json(qualification_snapshot_path),
-                _load_json(e2e_snapshot_path),
+                _load_json(pre_live_snapshot_path),
             ],
             readiness=_load_json(readiness_report_path),
             qualification=_load_json(qualification_report_path),
             manifest=manifest_document,
         )
-        _write_private_json(phase_path, phase_document)
-        base_report_path = layout.evidence / "base-report.json"
-        base_report = assemble_e2e_report(
+        _write_private_json(pre_live_phase_path, pre_live_phase)
+        pre_live_report_path = layout.evidence / "base-report-pre-live.json"
+        pre_live_report = assemble_e2e_report(
             _load_json(off_observation_path),
             _load_json(auto_observation_path),
-            phase_document,
-            raw_root=layout.work / "raw-base",
-            output=base_report_path,
+            pre_live_phase,
+            raw_root=layout.work / "raw-base-pre-live",
+            output=pre_live_report_path,
         )
-        if base_report.get("verdict") != "pass":
+        if pre_live_report.get("verdict") != "pass":
             raise AcceptanceRunError(
-                f"base_e2e_failed:{base_report.get('reason_codes')}"
+                "pre_live_e2e_failed:"
+                f"{pre_live_report.get('reason_codes')}"
             )
-        _announce("base E2E report passed with compile/hit/execute evidence")
+        _announce(
+            "pre-live E2E report passed with compile/hit/execute evidence"
+        )
 
         black_box_paths: dict[str, Path] = {}
         for mode in ("off", "auto"):
@@ -1454,7 +1629,7 @@ def run(arguments: argparse.Namespace) -> Path:
         internal_base_report = f"/tmp/{run_id}-base-report.json"
         _copy_to_container(
             commands,
-            source=base_report_path,
+            source=pre_live_report_path,
             container=containers["ray-head-driver"],
             destination=internal_base_report,
         )
@@ -1485,35 +1660,60 @@ def run(arguments: argparse.Namespace) -> Path:
             git_commit=commit,
             argv=live_argv,
             required_tests=LIVE_REQUIRED_TESTS,
-            expected_count=_EXPECTED_LIVE_COUNT,
+            expected_count=LIVE_TEST_COUNT,
             log_path=live_log,
             output=live_path,
         )
-        _announce("12/12 live ST tests passed with zero skips")
+        _announce(f"{LIVE_TEST_COUNT}/{LIVE_TEST_COUNT} live ST tests passed")
 
-        commands.log(
-            [
-                "docker",
-                "restart",
-                "--time",
-                "10",
-                containers["ray-worker-2"],
-            ],
-            layout.logs / "worker-2-restart.log",
-            timeout=180,
-        )
-        _await_cluster(
-            commands,
-            head_container=containers["ray-head-driver"],
-        )
-        e2e_after_path = layout.evidence / "e2e-snapshot-after.json"
+        e2e_snapshot_path = layout.evidence / "e2e-snapshot-before.json"
         _capture_snapshot(
             phase="e2e",
             run_id=run_id,
             cluster_epoch=cluster_epoch,
             manifest_sha256=manifest_sha256,
             containers=containers,
+            output=e2e_snapshot_path,
+        )
+        phase_path = layout.evidence / "phase-evidence-base.json"
+        phase_document = build_phase_evidence(
+            snapshots=[
+                _load_json(readiness_snapshot_path),
+                _load_json(qualification_snapshot_path),
+                _load_json(e2e_snapshot_path),
+            ],
+            readiness=_load_json(readiness_report_path),
+            qualification=_load_json(qualification_report_path),
+            manifest=manifest_document,
+        )
+        _write_private_json(phase_path, phase_document)
+        base_report_path = layout.evidence / "base-report.json"
+        base_report = assemble_e2e_report(
+            _load_json(off_observation_path),
+            _load_json(auto_observation_path),
+            phase_document,
+            raw_root=layout.work / "raw-base",
+            output=base_report_path,
+        )
+        if base_report.get("verdict") != "pass":
+            raise AcceptanceRunError(
+                f"base_e2e_failed:{base_report.get('reason_codes')}"
+            )
+        _announce(
+            "post-workload E2E report passed; restart baseline is fresh"
+        )
+
+        e2e_after_path = layout.evidence / "e2e-snapshot-after.json"
+        _restart_worker_and_capture(
+            commands,
+            worker_container=containers["ray-worker-2"],
+            head_container=containers["ray-head-driver"],
+            run_id=run_id,
+            cluster_epoch=cluster_epoch,
+            manifest_sha256=manifest_sha256,
+            containers=containers,
             output=e2e_after_path,
+            log_path=layout.logs / "worker-2-restart.log",
         )
         invalid_phase_path = (
             layout.evidence / "phase-evidence-invalidated.json"
@@ -1602,11 +1802,13 @@ def run(arguments: argparse.Namespace) -> Path:
             commands,
             kind="container",
             project=project,
+            run_id=run_id,
         )
         removed_network_ids = _project_ids(
             commands,
             kind="network",
             project=project,
+            run_id=run_id,
         )
         if len(removed_container_ids) != 3 or len(removed_network_ids) != 2:
             raise AcceptanceRunError(
@@ -1625,6 +1827,7 @@ def run(arguments: argparse.Namespace) -> Path:
             compose=compose,
             environment=compose_environment,
             project=project,
+            run_id=run_id,
             log_path=layout.logs / "compose-down.log",
         )
         compose_active = False
@@ -1650,11 +1853,13 @@ def run(arguments: argparse.Namespace) -> Path:
                 commands,
                 kind="container",
                 project=project,
+                run_id=run_id,
             ),
             remaining_project_networks=_project_ids(
                 commands,
                 kind="network",
                 project=project,
+                run_id=run_id,
             ),
             dashboard_port_open=_port_open("127.0.0.1", 8265),
             token_exists=token_file.exists(),
@@ -1678,10 +1883,13 @@ def run(arguments: argparse.Namespace) -> Path:
             auto_observation_path,
             readiness_snapshot_path,
             qualification_snapshot_path,
+            pre_live_snapshot_path,
             e2e_snapshot_path,
             e2e_after_path,
             readiness_report_path,
             qualification_report_path,
+            pre_live_phase_path,
+            pre_live_report_path,
             phase_path,
             invalid_phase_path,
         ]
@@ -1793,11 +2001,13 @@ def run(arguments: argparse.Namespace) -> Path:
                 commands,
                 kind="container",
                 project=project,
+                run_id=run_id,
             )
             or _project_ids(
                 commands,
                 kind="network",
                 project=project,
+                run_id=run_id,
             )
             or _port_open("127.0.0.1", 8265)
         ):
@@ -1835,19 +2045,6 @@ def run(arguments: argparse.Namespace) -> Path:
         return formal_path
     except BaseException as error:
         cleanup_errors: list[str] = []
-        if containers:
-            for role, container in containers.items():
-                path = layout.logs / f"failure-{role}.log"
-                if path.exists():
-                    continue
-                try:
-                    commands.log(
-                        ["docker", "logs", container],
-                        path,
-                        timeout=30,
-                    )
-                except Exception:
-                    pass
         if (
             runtime_zone_binding is not None
             and runtime_zone_binding_active
@@ -1860,7 +2057,7 @@ def run(arguments: argparse.Namespace) -> Path:
             except Exception as cleanup_error:
                 cleanup_errors.append(
                     "firewalld_unbind_before_down:"
-                    f"{type(cleanup_error).__name__}:{cleanup_error}"
+                    f"{type(cleanup_error).__name__}"
                 )
         if compose_active:
             try:
@@ -1869,13 +2066,14 @@ def run(arguments: argparse.Namespace) -> Path:
                     compose=compose,
                     environment=compose_environment,
                     project=project,
+                    run_id=run_id,
                     log_path=None,
                 )
                 compose_active = False
             except Exception as cleanup_error:
                 cleanup_errors.append(
                     "compose_down:"
-                    f"{type(cleanup_error).__name__}:{cleanup_error}"
+                    f"{type(cleanup_error).__name__}"
                 )
         if (
             runtime_zone_binding is not None
@@ -1889,9 +2087,15 @@ def run(arguments: argparse.Namespace) -> Path:
             except Exception as cleanup_error:
                 cleanup_errors.append(
                     "firewalld_unbind_after_down:"
-                    f"{type(cleanup_error).__name__}:{cleanup_error}"
+                    f"{type(cleanup_error).__name__}"
                 )
-        token_file.unlink(missing_ok=True)
+        try:
+            token_file.unlink(missing_ok=True)
+        except Exception as cleanup_error:
+            cleanup_errors.append(
+                "token_removal:"
+                f"{type(cleanup_error).__name__}"
+            )
         failure_host_state_restored: bool | None = None
         if before_state is not None:
             try:
@@ -1899,32 +2103,52 @@ def run(arguments: argparse.Namespace) -> Path:
                 failure_host_state_restored = (
                     failure_after_state == before_state
                 )
-                _write_private_json(
-                    layout.evidence / "host-state-failure-after.json",
-                    failure_after_state,
-                )
             except Exception as cleanup_error:
                 cleanup_errors.append(
                     "failure_host_state_capture:"
-                    f"{type(cleanup_error).__name__}:{cleanup_error}"
+                    f"{type(cleanup_error).__name__}"
                 )
+        try:
+            _scrub_failure_payloads(layout)
+        except Exception as cleanup_error:
+            cleanup_errors.append(
+                "failure_artifact_scrub:"
+                f"{type(cleanup_error).__name__}"
+            )
+        raw_payloads_removed = not any(
+            path.is_file()
+            for root in (
+                layout.evidence,
+                layout.logs,
+                layout.private,
+                layout.work,
+            )
+            for path in root.rglob("*")
+        )
+        if not raw_payloads_removed:
+            cleanup_errors.append("failure_artifact_scrub:files_remain")
         failure_path = layout.root / "FAILURE.json"
         if not failure_path.exists():
             _write_private_json(
                 failure_path,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "status": "fail",
                     "run_id": run_id,
                     "cluster_epoch": cluster_epoch,
                     "git_commit": commit,
                     "error_type": type(error).__name__,
-                    "error": str(error),
+                    "reason_code": _failure_reason(error),
                     "cleanup_errors": cleanup_errors,
                     "host_state_restored": failure_host_state_restored,
-                    "traceback": traceback.format_exc()[-8000:],
+                    "raw_payloads_removed": raw_payloads_removed,
                 },
             )
+        if token and token.encode("ascii") in failure_path.read_bytes():
+            failure_path.unlink(missing_ok=True)
+            raise AcceptanceRunError(
+                "failure_receipt_contains_auth_token"
+            ) from error
         raise
 
 

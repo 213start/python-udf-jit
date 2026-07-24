@@ -9,6 +9,10 @@ from pathlib import Path
 
 from python_udf_jit.diagnostics.acceptance import (
     AcceptanceContractError,
+    INTEGRATION_TEST_COUNT,
+    LIVE_REQUIRED_TESTS,
+    LIVE_TEST_COUNT,
+    UNIT_TEST_COUNT,
     UNIT_REQUIRED_TESTS,
     aggregate_formal_acceptance,
     load_acceptance_contract,
@@ -23,6 +27,8 @@ CONTRACT_PATH = ROOT / "config/scalar-piercing-acceptance.json"
 HEX_64 = "a" * 64
 IMAGE_DIGEST = f"sha256:{'b' * 64}"
 CINDERX_COMMIT = "f" * 40
+CINDERX_BASE_IMAGE_DIGEST = f"sha256:{'4' * 64}"
+CINDERX_WHEEL_SHA256 = "5" * 64
 
 
 def _test_proof(
@@ -232,6 +238,8 @@ def _base_report() -> dict[str, object]:
             "image_digest": IMAGE_DIGEST,
             "udf_jit_wheel_sha256": HEX_64,
             "cinderx_commit": CINDERX_COMMIT,
+            "cinderx_base_image_digest": CINDERX_BASE_IMAGE_DIGEST,
+            "cinderx_wheel_sha256": CINDERX_WHEEL_SHA256,
         },
     }
 
@@ -283,7 +291,8 @@ def _evidence() -> dict[str, object]:
             "cinderx_commit": CINDERX_COMMIT,
             "source_tree_sha256": "2" * 64,
             "patch_sha256": "3" * 64,
-            "image_digest": f"sha256:{'4' * 64}",
+            "cinderx_wheel_sha256": CINDERX_WHEEL_SHA256,
+            "image_digest": CINDERX_BASE_IMAGE_DIGEST,
             "python_version": "3.14.3",
             "soabi": "cpython-314-aarch64-linux-gnu",
             "py_enable_shared": 0,
@@ -369,6 +378,8 @@ def _evidence() -> dict[str, object]:
             "cinderx_commit": CINDERX_COMMIT,
             "cinderx_source_tree_sha256": "2" * 64,
             "cinderx_patch_sha256": "3" * 64,
+            "cinderx_wheel_sha256": CINDERX_WHEEL_SHA256,
+            "cinderx_base_image_digest": CINDERX_BASE_IMAGE_DIGEST,
             "image_digest": IMAGE_DIGEST,
             "udf_jit_wheel_sha256": HEX_64,
         },
@@ -388,7 +399,7 @@ def _evidence() -> dict[str, object]:
                     gate_id="python.unit",
                     tier="unit",
                     required_tests=list(UNIT_REQUIRED_TESTS),
-                    test_count=117,
+                    test_count=UNIT_TEST_COUNT,
                 ),
                 "integration": _test_proof(
                     gate_id="python.integration",
@@ -401,16 +412,13 @@ def _evidence() -> dict[str, object]:
                         "test_both_workers_execute_region_driven_cinderx_scalar_load",
                         "test_same_production_plan_compiles_and_executes_on_each_worker",
                     ],
-                    test_count=29,
+                    test_count=INTEGRATION_TEST_COUNT,
                 ),
                 "live": _test_proof(
                     gate_id="python.live",
                     tier="system",
-                    required_tests=[
-                        "test_ae1_to_ae8_pass_and_keep_natural_coverage_separate",
-                        "test_live_evidence_is_supplied_by_the_external_harness",
-                    ],
-                    test_count=12,
+                    required_tests=list(LIVE_REQUIRED_TESTS),
+                    test_count=LIVE_TEST_COUNT,
                 ),
             },
         },
@@ -598,6 +606,26 @@ class AcceptanceContractTests(unittest.TestCase):
 
         evidence = _evidence()
         evidence["source"]["cinderx_patch_sha256"] = "9" * 64
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "fail")
+        self.assertIn(
+            "gate_failed:provenance.cinderx_source_identity",
+            report["reason_codes"],
+        )
+
+        evidence = _evidence()
+        evidence["source"]["cinderx_wheel_sha256"] = "9" * 64
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "fail")
+        self.assertIn(
+            "gate_failed:provenance.cinderx_source_identity",
+            report["reason_codes"],
+        )
+
+        evidence = _evidence()
+        evidence["source"]["cinderx_base_image_digest"] = (
+            f"sha256:{'9' * 64}"
+        )
         report = aggregate_formal_acceptance(self.contract, evidence)
         self.assertEqual(report["verdict"], "fail")
         self.assertIn(

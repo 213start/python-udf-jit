@@ -253,9 +253,14 @@ class WorkerScalarAdapter:
         artifact_hash: str = "",
         code_hash: str = "",
         execution_mode: str = "",
+        attribution: tuple[str, str] | None = None,
     ) -> None:
         try:
-            partition_id, task_attempt = self.context.event_attribution()
+            partition_id, task_attempt = (
+                attribution
+                if attribution is not None
+                else self.context.event_attribution()
+            )
             self._event_sink.emit(
                 RuntimeEvent(
                     stage,
@@ -274,7 +279,11 @@ class WorkerScalarAdapter:
         except Exception:
             pass
 
-    def _load_and_reverify(self) -> tuple[PortableUdfArtifact, VariantKey]:
+    def _load_and_reverify(
+        self,
+        *,
+        attribution: tuple[str, str],
+    ) -> tuple[PortableUdfArtifact, VariantKey]:
         if self._artifact is not None and self._key is not None:
             return self._artifact, self._key
         artifact_bytes = self.carrier.artifact_bytes
@@ -338,6 +347,7 @@ class WorkerScalarAdapter:
             "verified",
             key=key,
             artifact_hash=artifact_hash,
+            attribution=attribution,
         )
         return artifact, key
 
@@ -368,8 +378,15 @@ class WorkerScalarAdapter:
         reason_code: str,
         *,
         key: VariantKey | None = None,
+        attribution: tuple[str, str],
     ) -> Any:
-        self._emit("execute", "fallback", reason_code, key=key)
+        self._emit(
+            "execute",
+            "fallback",
+            reason_code,
+            key=key,
+            attribution=attribution,
+        )
         return self.original_callable(*args, **kwargs)
 
     def invoke(
@@ -379,9 +396,12 @@ class WorkerScalarAdapter:
         *,
         guard_overrides: WorkerGuardOverrides | None = None,
     ) -> Any:
+        attribution = self.context.event_attribution()
         try:
             value = _extract_scalar_value(self.original_callable, args, kwargs)
-            artifact, key = self._load_and_reverify()
+            artifact, key = self._load_and_reverify(
+                attribution=attribution,
+            )
             if self._expectation is None:
                 raise RuntimeError("outer_guard_expectation_missing")
             guard_outer_entry(
@@ -415,6 +435,7 @@ class WorkerScalarAdapter:
                     artifact_hash=self.carrier.handle.content_sha256,
                     code_hash=variant.code_hash,
                     execution_mode=variant.execution_mode,
+                    attribution=attribution,
                 )
             else:
                 is_production_jit = (
@@ -434,21 +455,35 @@ class WorkerScalarAdapter:
                     artifact_hash=self.carrier.handle.content_sha256,
                     code_hash=variant.code_hash,
                     execution_mode=variant.execution_mode,
+                    attribution=attribution,
                 )
         except OuterGuardError as error:
-            return self._fallback(args, kwargs, error.code.value, key=self._key)
+            return self._fallback(
+                args,
+                kwargs,
+                error.code.value,
+                key=self._key,
+                attribution=attribution,
+            )
         except Exception as error:
             return self._fallback(
                 args,
                 kwargs,
                 f"pre_semantics_failure:{type(error).__name__}",
                 key=self._key,
+                attribution=attribution,
             )
 
         try:
             result = variant.execute(value)
         except PreSemanticsExecutionError as error:
-            return self._fallback(args, kwargs, error.reason_code, key=key)
+            return self._fallback(
+                args,
+                kwargs,
+                error.reason_code,
+                key=key,
+                attribution=attribution,
+            )
         except Exception as error:
             self._emit(
                 "execute",
@@ -458,6 +493,7 @@ class WorkerScalarAdapter:
                 artifact_hash=self.carrier.handle.content_sha256,
                 code_hash=variant.code_hash,
                 execution_mode=variant.execution_mode,
+                attribution=attribution,
             )
             raise
         self._emit(
@@ -468,6 +504,7 @@ class WorkerScalarAdapter:
             artifact_hash=self.carrier.handle.content_sha256,
             code_hash=variant.code_hash,
             execution_mode=variant.execution_mode,
+            attribution=attribution,
         )
         return result
 

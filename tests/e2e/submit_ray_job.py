@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import ssl
 import stat
 import time
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlsplit
 
+from tests.system.loopback_http import (
+    loopback_urlopen,
+    require_numeric_loopback,
+)
 
 _TERMINAL = frozenset({"SUCCEEDED", "FAILED", "STOPPED"})
 
@@ -28,9 +30,7 @@ def _request(
     request = urllib.request.Request(
         url, data=payload, headers=headers, method=method
     )
-    with urllib.request.urlopen(
-        request, timeout=10, context=ssl.create_default_context()
-    ) as response:
+    with loopback_urlopen(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -43,9 +43,7 @@ def submit_and_wait(
     mode: str,
     timeout_seconds: int,
 ) -> dict[str, object]:
-    parsed = urlsplit(address)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("Ray Jobs address must be an HTTP loopback endpoint")
+    require_numeric_loopback(address)
     token_mode = stat.S_IMODE(token_file.stat().st_mode)
     if token_mode & 0o077:
         raise PermissionError("Ray authentication token must not be group/world accessible")

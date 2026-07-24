@@ -44,6 +44,14 @@ class DriverWorkerIsolationTests(unittest.TestCase):
         self.assertIn('UDFJIT_MODE: "${UDFJIT_MODE:-off}"', compose)
         self.assertIn("UDFJIT_CLUSTER_EPOCH:", compose)
         self.assertIn("UDFJIT_RUN_ID:", compose)
+        self.assertGreaterEqual(
+            compose.count("org.python-udf-jit.run-id:"),
+            3,
+        )
+        self.assertGreaterEqual(
+            compose.count("org.python-udf-jit.cluster-epoch:"),
+            3,
+        )
         self.assertIn("UDFJIT_MANIFEST_PATH:", compose)
         self.assertNotIn("RAY_AUTH_TOKEN:", compose)
         self.assertIn("mode: 0400", compose)

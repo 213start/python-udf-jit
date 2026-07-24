@@ -8,6 +8,9 @@ x-ray-common: &ray-common
       CINDERX_BASE_IMAGE: ${CINDERX_BASE_IMAGE:?set an immutable CinderX image digest}
   image: ${SCALAR_PIERCING_IMAGE:-python-udf-jit:scalar-piercing-baseline}
   restart: "no"
+  labels:
+    org.python-udf-jit.run-id: "${UDFJIT_RUN_ID:?set a unique run id}"
+    org.python-udf-jit.cluster-epoch: "${UDFJIT_CLUSTER_EPOCH:?set a unique cluster epoch}"
   environment:
     UDFJIT_MODE: "${UDFJIT_MODE:-off}"
     UDFJIT_CLUSTER_EPOCH: "${UDFJIT_CLUSTER_EPOCH:?set a unique cluster epoch}"
@@ -57,10 +60,16 @@ services:
 networks:
   scalar-piercing:
     internal: true
+    labels:
+      org.python-udf-jit.run-id: "${UDFJIT_RUN_ID:?set a unique run id}"
+      org.python-udf-jit.cluster-epoch: "${UDFJIT_CLUSTER_EPOCH:?set a unique cluster epoch}"
     ipam:
       config:
         - subnet: ${SCALAR_PIERCING_DATA_PLANE_SUBNET:-172.23.240.0/24}
   dashboard-loopback:
+    labels:
+      org.python-udf-jit.run-id: "${UDFJIT_RUN_ID:?set a unique run id}"
+      org.python-udf-jit.cluster-epoch: "${UDFJIT_CLUSTER_EPOCH:?set a unique cluster epoch}"
     ipam:
       config:
         - subnet: ${SCALAR_PIERCING_DASHBOARD_SUBNET:-172.23.241.0/24}

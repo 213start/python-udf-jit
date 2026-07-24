@@ -105,6 +105,7 @@ class CinderXEvidenceTests(unittest.TestCase):
             cinderx_commit=COMMIT,
             source_tree_sha256=HEX_64,
             patch_sha256="d" * 64,
+            cinderx_wheel_sha256="e" * 64,
             fingerprint_path=self.paths["fingerprint"],
             runtime_log_path=self.paths["runtime"],
             release_log_path=self.paths["release"],
@@ -121,6 +122,10 @@ class CinderXEvidenceTests(unittest.TestCase):
         self.assertEqual(proof["status"], "pass")
         self.assertEqual(validate_cinderx_evidence(proof), "pass")
         self.assertEqual(proof["identity"]["py_enable_shared"], 0)
+        self.assertEqual(
+            proof["identity"]["cinderx_wheel_sha256"],
+            "e" * 64,
+        )
         self.assertEqual(proof["runtime_tests"]["normal"]["passed"], 1176)
         self.assertEqual(len(proof["runtime_tests"]["udf_cases"]), 6)
         self.assertEqual(
@@ -192,6 +197,11 @@ class CinderXEvidenceTests(unittest.TestCase):
     def test_retained_proof_tampering_is_rejected(self) -> None:
         proof = self._build()
         proof["runtime_tests"]["normal"]["passed"] = 1175
+
+        self.assertEqual(validate_cinderx_evidence(proof), "fail")
+
+        proof = self._build()
+        proof["identity"]["cinderx_wheel_sha256"] = "f" * 64
 
         self.assertEqual(validate_cinderx_evidence(proof), "fail")
 

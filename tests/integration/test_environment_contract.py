@@ -36,6 +36,8 @@ class EnvironmentContractTests(unittest.TestCase):
         self.assertEqual("7.0.0", contract.non_blocking_versions["lance"])
         self.assertEqual("stop", contract.ray_daft_mismatch_policy)
         self.assertIn("container_image_digest", contract.required_fingerprints)
+        self.assertIn("cinderx_base_image_digest", contract.required_fingerprints)
+        self.assertIn("cinderx_wheel_sha256", contract.required_fingerprints)
         self.assertIn("udf_jit_wheel_sha256", contract.required_fingerprints)
         submitter = (
             ROOT / "tests/e2e/submit_ray_job.py"
@@ -57,6 +59,8 @@ class EnvironmentContractTests(unittest.TestCase):
             "container_image_digest": "sha256:" + "1" * 64,
             "python_version": "3.14.3",
             "cinderx_commit": "a" * 40,
+            "cinderx_base_image_digest": "sha256:" + "3" * 64,
+            "cinderx_wheel_sha256": "4" * 64,
             "cinderx_soabi": "cpython-314-x86_64-linux-gnu",
             "daft_version": "0.7.2",
             "ray_version": "2.55.0",
@@ -89,6 +93,7 @@ class EnvironmentContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("ARG CINDERX_WHEEL_SHA256", dockerfile)
+        self.assertIn("ARG CINDERX_BASE_IMAGE_DIGEST", dockerfile)
         self.assertIn("ARG DAFT_WHEEL_SHA256", dockerfile)
         self.assertIn("ARG PYARROW_WHEEL_SHA256", dockerfile)
         self.assertIn("ARG RAY_WHEEL_SHA256", dockerfile)
@@ -100,6 +105,10 @@ class EnvironmentContractTests(unittest.TestCase):
         self.assertIn("org.opencontainers.image.revision", dockerfile)
         self.assertIn("org.python-udf-jit.cinderx-source-tree-sha256", dockerfile)
         self.assertIn("org.python-udf-jit.cinderx-patch-sha256", dockerfile)
+        self.assertIn(
+            "org.python-udf-jit.cinderx-base-image-digest",
+            dockerfile,
+        )
         self.assertIn("candidate wheel hash mismatch", dockerfile)
         self.assertIn("--force-reinstall", dockerfile)
         self.assertIn("cinderx-*.whl", dockerfile)

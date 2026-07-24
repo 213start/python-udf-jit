@@ -13,6 +13,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+from tests.system.private_output import write_private_json
+
 
 def _supported(value: float) -> float:
     return value * 2.0 + 3.0
@@ -405,6 +407,47 @@ def _diagnostic_job(path: str, function: Callable[[float], float]):
     return document, _extract_events(document["evidence"])
 
 
+def _runtime_events_since(
+    path: str,
+    *,
+    started_ns: int,
+) -> list[dict[str, object]]:
+    """Read Worker-local runtime events without instrumenting the probe UDF."""
+
+    import daft
+
+    _uninstall_hooks()
+    try:
+        probe = daft.func(_diagnostic_probe_factory(started_ns))
+        document = (
+            _input_frame(path)
+            .with_column("evidence", probe(daft.col("measurement")))
+            .select("evidence")
+            .to_pydict()
+        )
+    finally:
+        _install_hooks()
+    return _extract_events(document["evidence"])
+
+
+def _zero_row_runtime_counts(
+    events: list[dict[str, object]],
+) -> dict[str, int]:
+    return {
+        "descriptor_count": sum(
+            event.get("decision") == "descriptor_bound"
+            for event in events
+        ),
+        "compile_count": sum(
+            event.get("decision") == "compile" for event in events
+        ),
+        "hit_count": sum(
+            event.get("decision") == "hit" for event in events
+        ),
+        "activity_event_count": len(events),
+    }
+
+
 def _custom_wrapper_job(path: str, wrapper: Any):
     import daft
 
@@ -658,7 +701,16 @@ def _join_ray_task_attempts(
     records_by_id: dict[str, list[Any]] = {}
     deadline = time.monotonic() + max(0.0, wait_seconds)
     while events:
-        state_records = list(list_tasks(detail=True, limit=10000, timeout=30))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        state_records = list(
+            list_tasks(
+                detail=True,
+                limit=10000,
+                timeout=min(30.0, remaining),
+            )
+        )
         records_by_id = {}
         for record in state_records:
             task_id = _state_text(record, "task_id")
@@ -871,6 +923,16 @@ def run_live_job() -> dict[str, object]:
         raw_events.extend(
             _event_documents(corrupt_events, scenario="corrupt_artifact", roles=roles)
         )
+        zero_started_ns = time.time_ns()
+        zero_auto = _normal_auto_job(fixture_path, _supported, empty=True)
+        zero_events = _runtime_events_since(
+            fixture_path,
+            started_ns=zero_started_ns,
+        )
+        zero_counts = _zero_row_runtime_counts(zero_events)
+        raw_events.extend(
+            _event_documents(zero_events, scenario="zero_row", roles=roles)
+        )
         raw_events = _join_ray_task_attempts(raw_events)
         driver_process_generation = f"driver-{os.getpid()}"
         driver_timestamp = time.time_ns()
@@ -909,8 +971,6 @@ def run_live_job() -> dict[str, object]:
                     "timestamp_ns": driver_timestamp + index,
                 }
             )
-
-        zero_auto = _normal_auto_job(fixture_path, _supported, empty=True)
 
         row_count = len(auto_supported["measurement"])
         return {
@@ -972,11 +1032,9 @@ def run_live_job() -> dict[str, object]:
                 },
                 "zero_row": {
                     "result_digest": _result_digest(zero_auto),
-                    "row_count": 0,
+                    "row_count": len(zero_auto["measurement"]),
                     "callable_calls": 0,
-                    "descriptor_count": 0,
-                    "compile_count": 0,
-                    "hit_count": 0,
+                    **zero_counts,
                 },
             },
         }
@@ -987,14 +1045,7 @@ def run_live_job() -> dict[str, object]:
 
 
 def _write_output(path: Path, document: dict[str, object]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    payload = json.dumps(
-        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("ascii")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload)
+    write_private_json(path, document)
 
 
 def main() -> None:

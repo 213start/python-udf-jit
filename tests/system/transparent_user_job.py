@@ -10,6 +10,8 @@ import socket
 from pathlib import Path
 from typing import Any, Callable
 
+from tests.system.private_output import write_private_json
+
 
 EXCEPTION_SENTINEL = "U13-TRANSPARENT-USER-ERROR"
 USER_EXCEPTION_NAME = "TransparentUserError"
@@ -235,7 +237,6 @@ def _with_column(directory: str) -> dict[str, object]:
     result = (
         _input_frame(directory)
         .with_column("result", projection(daft.col("measurement")))
-        .sort("row_id")
         .select("row_id", "measurement", "result")
     )
     schema = result.schema()
@@ -259,7 +260,6 @@ def _with_columns(directory: str) -> dict[str, object]:
                 "adjusted": adjusted(daft.col("measurement")),
             }
         )
-        .sort("row_id")
         .select("row_id", "measurement", "result", "adjusted")
     )
     schema = result.schema()
@@ -280,7 +280,6 @@ def _unsupported(
     result = (
         _input_frame(directory)
         .with_column("result", projection(daft.col("measurement")))
-        .sort("row_id")
         .select("row_id", "measurement", "result")
     )
     schema = result.schema()
@@ -408,17 +407,7 @@ def run_black_box_job() -> dict[str, object]:
 
 
 def write_output(path: Path, document: dict[str, object]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    payload = json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("ascii")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload)
+    write_private_json(path, document)
 
 
 def main() -> None:

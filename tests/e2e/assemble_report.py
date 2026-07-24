@@ -69,6 +69,9 @@ def _merge_scenarios(
             "descriptor_count": auto["zero_row"]["descriptor_count"],
             "compile_count": auto["zero_row"]["compile_count"],
             "hit_count": auto["zero_row"]["hit_count"],
+            "activity_event_count": auto["zero_row"][
+                "activity_event_count"
+            ],
         },
     }
 

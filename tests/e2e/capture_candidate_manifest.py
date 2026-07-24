@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
+
+from tests.system.private_output import write_private_json
 
 
 _ROLES = ("ray-head-driver", "ray-worker-1", "ray-worker-2")
@@ -49,6 +50,8 @@ def capture(
     cinderx_commit: str,
     cinderx_source_tree_sha256: str,
     cinderx_patch_sha256: str,
+    cinderx_wheel_sha256: str,
+    cinderx_base_image_digest: str,
     udf_jit_wheel_sha256: str,
 ) -> dict[str, object]:
     if re.fullmatch(r"[0-9a-f]{40}", source_git_commit) is None:
@@ -58,10 +61,21 @@ def capture(
     for field, value in (
         ("cinderx_source_tree_sha256", cinderx_source_tree_sha256),
         ("cinderx_patch_sha256", cinderx_patch_sha256),
+        ("cinderx_wheel_sha256", cinderx_wheel_sha256),
         ("udf_jit_wheel_sha256", udf_jit_wheel_sha256),
     ):
         if _SHA256.fullmatch(value) is None:
             raise ValueError(f"{field} must be a lowercase SHA-256")
+    if (
+        re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            cinderx_base_image_digest,
+        )
+        is None
+    ):
+        raise ValueError(
+            "cinderx_base_image_digest must be an immutable image digest"
+        )
     runtimes = [_runtime(containers[role]) for role in _ROLES]
     if any(runtime != runtimes[0] for runtime in runtimes[1:]):
         raise RuntimeError("runtime/manifest drift across cluster roles")
@@ -77,6 +91,9 @@ def capture(
         "org.python-udf-jit.cinderx-commit": cinderx_commit,
         "org.python-udf-jit.cinderx-source-tree-sha256": cinderx_source_tree_sha256,
         "org.python-udf-jit.cinderx-patch-sha256": cinderx_patch_sha256,
+        "org.python-udf-jit.cinderx-wheel-sha256": cinderx_wheel_sha256,
+        "org.python-udf-jit.cinderx-base-image-digest":
+            cinderx_base_image_digest,
         "org.python-udf-jit.wheel-sha256": udf_jit_wheel_sha256,
     }
     for document in inspect_documents:
@@ -98,6 +115,8 @@ def capture(
         "image_digest": next(iter(image_digests)),
         "python_version": runtime["python_version"],
         "cinderx_commit": cinderx_commit,
+        "cinderx_base_image_digest": cinderx_base_image_digest,
+        "cinderx_wheel_sha256": cinderx_wheel_sha256,
         "soabi": runtime["soabi"],
         "daft_version": runtime["daft_version"],
         "ray_version": runtime["ray_version"],
@@ -115,6 +134,8 @@ def main() -> None:
     parser.add_argument("--cinderx-commit", required=True)
     parser.add_argument("--cinderx-source-tree-sha256", required=True)
     parser.add_argument("--cinderx-patch-sha256", required=True)
+    parser.add_argument("--cinderx-wheel-sha256", required=True)
+    parser.add_argument("--cinderx-base-image-digest", required=True)
     parser.add_argument("--udf-jit-wheel-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
@@ -128,21 +149,11 @@ def main() -> None:
         cinderx_commit=arguments.cinderx_commit,
         cinderx_source_tree_sha256=arguments.cinderx_source_tree_sha256,
         cinderx_patch_sha256=arguments.cinderx_patch_sha256,
+        cinderx_wheel_sha256=arguments.cinderx_wheel_sha256,
+        cinderx_base_image_digest=arguments.cinderx_base_image_digest,
         udf_jit_wheel_sha256=arguments.udf_jit_wheel_sha256,
     )
-    arguments.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(arguments.output.parent, 0o700)
-    descriptor = os.open(
-        arguments.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-    )
-    with os.fdopen(descriptor, "w", encoding="ascii") as stream:
-        json.dump(
-            document,
-            stream,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
+    write_private_json(arguments.output, document)
 
 
 if __name__ == "__main__":

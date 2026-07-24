@@ -89,6 +89,8 @@ _MANIFEST_FIELDS = (
     "image_digest",
     "python_version",
     "cinderx_commit",
+    "cinderx_base_image_digest",
+    "cinderx_wheel_sha256",
     "soabi",
     "daft_version",
     "ray_version",
@@ -173,13 +175,21 @@ def _manifest(document: object) -> dict[str, object] | None:
     try:
         candidate = str(document["candidate_manifest_sha256"])
         wheel = str(document["udf_jit_wheel_sha256"])
+        cinderx_wheel = str(document["cinderx_wheel_sha256"])
         image = str(document["image_digest"])
-        if _SHA256.fullmatch(candidate) is None or _SHA256.fullmatch(wheel) is None:
+        cinderx_base_image = str(document["cinderx_base_image_digest"])
+        if (
+            _SHA256.fullmatch(candidate) is None
+            or _SHA256.fullmatch(wheel) is None
+            or _SHA256.fullmatch(cinderx_wheel) is None
+        ):
             return None
-        if image != f"sha256:{image.removeprefix('sha256:')}" or _SHA256.fullmatch(
-            image.removeprefix("sha256:")
-        ) is None:
-            return None
+        for digest in (image, cinderx_base_image):
+            if (
+                digest != f"sha256:{digest.removeprefix('sha256:')}"
+                or _SHA256.fullmatch(digest.removeprefix("sha256:")) is None
+            ):
+                return None
         return {field: document[field] for field in _MANIFEST_FIELDS}
     except (TypeError, ValueError):
         return None
@@ -480,6 +490,7 @@ def aggregate_run_evidence(
         and zero.get("descriptor_count") == 0
         and zero.get("compile_count") == 0
         and zero.get("hit_count") == 0
+        and zero.get("activity_event_count") == 0
     ):
         checks["zero_row"] = "fail"
         fail_reasons.add("zero_row_semantics_invalid")
@@ -579,7 +590,6 @@ class EvidenceRun:
         self.run_id = _safe_id(run_id)
         root_path = Path(root)
         root_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(root_path, 0o700)
         self.raw_dir = root_path / self.run_id
         self.raw_dir.mkdir(mode=0o700, exist_ok=False)
         self.raw_file = self.raw_dir / "events.jsonl"
@@ -621,7 +631,6 @@ class EvidenceRun:
     ) -> dict[str, object]:
         output = Path(output_path)
         output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(output.parent, 0o700)
         try:
             report = aggregate_run_evidence(evidence, self._read_events())
             payload = json.dumps(

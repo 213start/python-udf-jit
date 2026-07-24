@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import socket
-import ssl
 import stat
 import subprocess
 import urllib.error
@@ -15,6 +13,8 @@ from typing import Any, Iterable
 from python_udf_jit.diagnostics.environment_evidence import (
     seal_environment_proof,
 )
+from tests.system.loopback_http import loopback_urlopen
+from tests.system.private_output import write_private_json
 
 
 def _run_json(arguments: list[str]) -> object:
@@ -71,11 +71,7 @@ def _http_status(url: str, token: str | None) -> int:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=10,
-            context=ssl.create_default_context(),
-        ) as response:
+        with loopback_urlopen(request, timeout=10) as response:
             response.read()
             return int(response.status)
     except urllib.error.HTTPError as error:
@@ -114,21 +110,7 @@ def _scan_files(paths: Iterable[Path], token: bytes) -> tuple[int, int, bool]:
 
 
 def _write(path: Path, document: dict[str, object]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    payload = json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("ascii")
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        0o600,
-    )
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload)
+    write_private_json(path, document)
 
 
 def probe(

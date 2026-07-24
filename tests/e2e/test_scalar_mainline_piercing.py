@@ -11,7 +11,11 @@ from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 from python_udf_jit.diagnostics.evidence import EvidenceRun, aggregate_run_evidence
-from tests.e2e.live_job import _extract_events, _join_ray_task_attempts
+from tests.e2e.live_job import (
+    _extract_events,
+    _join_ray_task_attempts,
+    _zero_row_runtime_counts,
+)
 
 
 SHA_A = "a" * 64
@@ -59,6 +63,8 @@ def _base_evidence() -> dict[str, object]:
             "image_digest": f"sha256:{SHA_A}",
             "python_version": "3.14.3",
             "cinderx_commit": "abcd1234",
+            "cinderx_base_image_digest": f"sha256:{SHA_B}",
+            "cinderx_wheel_sha256": SHA_A,
             "soabi": "cpython-314-aarch64-linux-gnu",
             "daft_version": "0.7.2",
             "ray_version": "2.55.0",
@@ -160,6 +166,7 @@ def _base_evidence() -> dict[str, object]:
                 "descriptor_count": 0,
                 "compile_count": 0,
                 "hit_count": 0,
+                "activity_event_count": 0,
             },
         },
     }
@@ -282,6 +289,12 @@ class EvidenceAggregationTests(unittest.TestCase):
             )
         self.assertEqual(joined[0]["task_attempt"], "attempt-0")
         self.assertEqual(state_module.list_tasks.call_count, 2)
+        self.assertTrue(
+            all(
+                0 < call.kwargs["timeout"] <= 0.1
+                for call in state_module.list_tasks.call_args_list
+            )
+        )
         self.assertEqual(
             joined[0]["ray_state_exact_records"][0]["state"],
             "FINISHED",
@@ -316,7 +329,7 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            temporal = _join_ray_task_attempts([temporal_event], wait_seconds=0)
+            temporal = _join_ray_task_attempts([temporal_event], wait_seconds=1)
         self.assertEqual(temporal[0]["partition_id"], "physical-actor-task-id")
         self.assertEqual(temporal[0]["task_attempt"], "attempt-0")
         self.assertEqual(
@@ -332,7 +345,7 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            ambiguous = _join_ray_task_attempts([temporal_event], wait_seconds=0)
+            ambiguous = _join_ray_task_attempts([temporal_event], wait_seconds=1)
         self.assertEqual(ambiguous[0]["task_attempt"], "")
         self.assertEqual(len(ambiguous[0]["ray_state_temporal_candidates"]), 2)
 
@@ -359,8 +372,55 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            joined = _join_ray_task_attempts([event], wait_seconds=0)
+            joined = _join_ray_task_attempts([event], wait_seconds=1)
         self.assertEqual(joined[0]["task_attempt"], "")
+
+    def test_ray_state_join_never_starts_a_query_after_budget_expires(self) -> None:
+        event = _passing_events()[0]
+        state_module = ModuleType("ray.util.state")
+        state_module.list_tasks = mock.Mock()
+        util_module = ModuleType("ray.util")
+        util_module.state = state_module
+        ray_module = ModuleType("ray")
+        ray_module.util = util_module
+
+        with mock.patch.dict(
+            sys.modules,
+            {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
+        ):
+            joined = _join_ray_task_attempts([event], wait_seconds=0)
+
+        state_module.list_tasks.assert_not_called()
+        self.assertEqual(joined[0]["ray_state_exact_records"], [])
+
+    def test_zero_row_counts_are_derived_from_observed_runtime_events(
+        self,
+    ) -> None:
+        events = [
+            {"decision": "descriptor_bound"},
+            {"decision": "compile"},
+            {"decision": "hit"},
+            {"decision": "semantic_execute"},
+        ]
+
+        self.assertEqual(
+            _zero_row_runtime_counts(events),
+            {
+                "descriptor_count": 1,
+                "compile_count": 1,
+                "hit_count": 1,
+                "activity_event_count": 4,
+            },
+        )
+        self.assertEqual(
+            _zero_row_runtime_counts([]),
+            {
+                "descriptor_count": 0,
+                "compile_count": 0,
+                "hit_count": 0,
+                "activity_event_count": 0,
+            },
+        )
 
     def test_ae1_to_ae8_pass_and_keep_natural_coverage_separate(self) -> None:
         report = aggregate_run_evidence(_base_evidence(), _passing_events())
@@ -491,8 +551,15 @@ class EvidenceAggregationTests(unittest.TestCase):
                     evidence["phase_snapshots"][-1]["nodes"] = _nodes(
                         worker_2_boot="replacement-boot"
                     )
-                output = Path(root) / f"{expected}.json"
-                run = EvidenceRun(Path(root) / "raw", f"run-{expected}")
+                output_parent = Path(root) / "caller-output"
+                output_parent.mkdir(mode=0o755)
+                os.chmod(output_parent, 0o755)
+                output = output_parent / f"{expected}.json"
+                raw_root = Path(root) / "raw"
+                raw_root.mkdir(mode=0o755)
+                os.chmod(raw_root, 0o755)
+                run = EvidenceRun(raw_root, f"run-{expected}")
+                self.assertEqual(stat.S_IMODE(raw_root.stat().st_mode), 0o755)
                 self.assertEqual(stat.S_IMODE(run.raw_dir.stat().st_mode), 0o700)
                 for event in events:
                     run.append_event(
@@ -512,6 +579,10 @@ class EvidenceAggregationTests(unittest.TestCase):
                 self.assertEqual(report["verdict"], expected)
                 self.assertFalse(run.raw_dir.exists())
                 self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+                self.assertEqual(
+                    stat.S_IMODE(output_parent.stat().st_mode),
+                    0o755,
+                )
                 serialized = output.read_text(encoding="utf-8")
                 self.assertNotIn(canary, serialized)
                 self.assertNotIn("source", serialized)

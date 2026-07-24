@@ -211,6 +211,42 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(fake_ray.get_runtime_context.call_count, 2)
         self.assertEqual(runtime.get_task_id.call_count, 2)
 
+    def test_each_invoke_freezes_one_ray_task_identity_for_all_events(self):
+        provider = _LocalProviderFactory()
+        self.context = WorkerRuntimeContext(
+            "run-a",
+            self.process,
+            "partition-build",
+            "",
+            refresh_partition_from_ray=True,
+        )
+        adapter = self.adapter(provider)
+        runtime = SimpleNamespace(
+            get_task_id=mock.Mock(side_effect=("task-one", "task-two"))
+        )
+        fake_ray = SimpleNamespace(
+            get_runtime_context=mock.Mock(return_value=runtime)
+        )
+
+        with mock.patch.dict(sys.modules, {"ray": fake_ray}):
+            self.assertEqual(adapter.invoke((None, 2.0), {}), 7.0)
+            first_count = len(self.report.snapshot())
+            self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
+
+        events = self.report.snapshot()
+        self.assertEqual(fake_ray.get_runtime_context.call_count, 2)
+        self.assertEqual(runtime.get_task_id.call_count, 2)
+        self.assertTrue(events[:first_count])
+        self.assertTrue(events[first_count:])
+        self.assertEqual(
+            {event.partition_id for event in events[:first_count]},
+            {"task-one"},
+        )
+        self.assertEqual(
+            {event.partition_id for event in events[first_count:]},
+            {"task-two"},
+        )
+
     def test_emit_uses_frozen_attribution_without_ray_context_lookup(self):
         adapter = self.adapter(_LocalProviderFactory())
         fake_ray = SimpleNamespace(

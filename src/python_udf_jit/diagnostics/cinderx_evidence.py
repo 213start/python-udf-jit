@@ -222,6 +222,7 @@ def build_cinderx_evidence(
     cinderx_commit: str,
     source_tree_sha256: str,
     patch_sha256: str,
+    cinderx_wheel_sha256: str,
     fingerprint_path: Path,
     runtime_log_path: Path,
     release_log_path: Path,
@@ -237,6 +238,10 @@ def build_cinderx_evidence(
         raise CinderXEvidenceError("cinderx_commit_invalid")
     source_digest = _sha256(source_tree_sha256, "source_tree_sha256")
     patch_digest = _sha256(patch_sha256, "patch_sha256")
+    wheel_digest = _sha256(
+        cinderx_wheel_sha256,
+        "cinderx_wheel_sha256",
+    )
 
     fingerprint_document, fingerprint_digest = _document(
         fingerprint_path, "fingerprint"
@@ -283,6 +288,7 @@ def build_cinderx_evidence(
         "cinderx_commit": cinderx_commit,
         "source_tree_sha256": source_digest,
         "patch_sha256": patch_digest,
+        "cinderx_wheel_sha256": wheel_digest,
         **fingerprint,
     }
     return {
@@ -382,6 +388,9 @@ def validate_cinderx_evidence(proof: object) -> str:
         and _SHA256.fullmatch(str(identity["source_tree_sha256"])) is not None
         and isinstance(identity.get("patch_sha256"), str)
         and _SHA256.fullmatch(str(identity["patch_sha256"])) is not None
+        and isinstance(identity.get("cinderx_wheel_sha256"), str)
+        and _SHA256.fullmatch(str(identity["cinderx_wheel_sha256"]))
+        is not None
         and isinstance(identity.get("image_digest"), str)
         and _IMAGE_DIGEST.fullmatch(str(identity["image_digest"])) is not None
         and identity.get("python_version") == "3.14.3"

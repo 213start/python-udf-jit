@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from pathlib import Path
+
+from tests.system.private_output import write_private_json
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -41,9 +42,19 @@ def build(
         raise ValueError("candidate image drift across phase snapshots")
     if readiness.get("manifest_sha256") != manifest.get("candidate_manifest_sha256"):
         raise ValueError("readiness manifest drift")
-    required_hashes = ("candidate_manifest_sha256", "udf_jit_wheel_sha256")
+    required_hashes = (
+        "candidate_manifest_sha256",
+        "cinderx_wheel_sha256",
+        "udf_jit_wheel_sha256",
+    )
     if any(_SHA256.fullmatch(str(manifest.get(field, ""))) is None for field in required_hashes):
         raise ValueError("manifest hashes are invalid")
+    base_image = str(manifest.get("cinderx_base_image_digest", ""))
+    if (
+        not base_image.startswith("sha256:")
+        or _SHA256.fullmatch(base_image.removeprefix("sha256:")) is None
+    ):
+        raise ValueError("CinderX base image digest is invalid")
     run_id, cluster_epoch = next(iter(identities))
     return {
         "schema_version": 1,
@@ -89,19 +100,7 @@ def main() -> None:
             qualification=_load(arguments.qualification_report),
             manifest=_load(arguments.manifest),
         )
-        arguments.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(arguments.output.parent, 0o700)
-        descriptor = os.open(
-            arguments.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
-        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
-            json.dump(
-                document,
-                stream,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-            )
+        write_private_json(arguments.output, document)
     finally:
         for path in inputs:
             path.unlink(missing_ok=True)

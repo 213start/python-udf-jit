@@ -16,6 +16,8 @@ TREE = "c" * 64
 PATCH = "d" * 64
 WHEEL = "e" * 64
 IMAGE = f"sha256:{'f' * 64}"
+CINDERX_WHEEL = "0" * 64
+CINDERX_BASE_IMAGE = f"sha256:{'1' * 64}"
 
 
 def _proof() -> dict[str, object]:
@@ -26,7 +28,8 @@ def _proof() -> dict[str, object]:
             "cinderx_commit": CINDERX_COMMIT,
             "source_tree_sha256": TREE,
             "patch_sha256": PATCH,
-            "image_digest": IMAGE,
+            "cinderx_wheel_sha256": CINDERX_WHEEL,
+            "image_digest": CINDERX_BASE_IMAGE,
             "python_version": "3.14.3",
             "soabi": "cpython-314-aarch64-linux-gnu",
             "py_enable_shared": 0,
@@ -105,6 +108,9 @@ def _labels() -> dict[str, str]:
         "org.python-udf-jit.cinderx-commit": CINDERX_COMMIT,
         "org.python-udf-jit.cinderx-source-tree-sha256": TREE,
         "org.python-udf-jit.cinderx-patch-sha256": PATCH,
+        "org.python-udf-jit.cinderx-wheel-sha256": CINDERX_WHEEL,
+        "org.python-udf-jit.cinderx-base-image-digest":
+            CINDERX_BASE_IMAGE,
         "org.python-udf-jit.wheel-sha256": WHEEL,
     }
 
@@ -117,6 +123,8 @@ class SourceIdentityTests(unittest.TestCase):
             image_digest=IMAGE,
             image_labels=_labels(),
             udf_jit_wheel_sha256=WHEEL,
+            cinderx_wheel_sha256=CINDERX_WHEEL,
+            cinderx_base_image_digest=CINDERX_BASE_IMAGE,
             cinderx_proof=_proof(),
             patch_sha256=PATCH,
         )
@@ -124,6 +132,11 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertFalse(document["dirty"])
         self.assertEqual(document["cinderx_source_tree_sha256"], TREE)
         self.assertEqual(document["cinderx_patch_sha256"], PATCH)
+        self.assertEqual(document["cinderx_wheel_sha256"], CINDERX_WHEEL)
+        self.assertEqual(
+            document["cinderx_base_image_digest"],
+            CINDERX_BASE_IMAGE,
+        )
 
     def test_dirty_source_or_any_label_drift_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "do not match"):
@@ -133,6 +146,8 @@ class SourceIdentityTests(unittest.TestCase):
                 image_digest=IMAGE,
                 image_labels=_labels(),
                 udf_jit_wheel_sha256=WHEEL,
+                cinderx_wheel_sha256=CINDERX_WHEEL,
+                cinderx_base_image_digest=CINDERX_BASE_IMAGE,
                 cinderx_proof=_proof(),
                 patch_sha256=PATCH,
             )
@@ -146,6 +161,23 @@ class SourceIdentityTests(unittest.TestCase):
                 image_digest=IMAGE,
                 image_labels=labels,
                 udf_jit_wheel_sha256=WHEEL,
+                cinderx_wheel_sha256=CINDERX_WHEEL,
+                cinderx_base_image_digest=CINDERX_BASE_IMAGE,
+                cinderx_proof=_proof(),
+                patch_sha256=PATCH,
+            )
+
+        labels = _labels()
+        labels["org.python-udf-jit.cinderx-wheel-sha256"] = "9" * 64
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            source_document(
+                git_commit=COMMIT,
+                dirty=False,
+                image_digest=IMAGE,
+                image_labels=labels,
+                udf_jit_wheel_sha256=WHEEL,
+                cinderx_wheel_sha256=CINDERX_WHEEL,
+                cinderx_base_image_digest=CINDERX_BASE_IMAGE,
                 cinderx_proof=_proof(),
                 patch_sha256=PATCH,
             )

@@ -58,6 +58,34 @@ class TransparentUserJobContractTests(unittest.TestCase):
         self.assertNotEqual(original, reordered)
         self.assertEqual(original, transparent_user_job.ordered_result_sha256(rows))
 
+    def test_black_box_observes_framework_order_without_sorting(self) -> None:
+        tree = ast.parse(
+            FIXTURE_PATH.read_text(encoding="utf-8"),
+            filename=str(FIXTURE_PATH),
+        )
+        observed_functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_with_column", "_with_columns", "_unsupported"}
+        }
+
+        self.assertEqual(
+            set(observed_functions),
+            {"_with_column", "_with_columns", "_unsupported"},
+        )
+        for name, function in observed_functions.items():
+            with self.subTest(function=name):
+                self.assertFalse(
+                    any(
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "sort"
+                        for node in ast.walk(function)
+                    ),
+                    "ordered-result evidence must observe, not rewrite, row order",
+                )
+
     def test_supported_diagnostic_path_does_not_install_hooks_before_use(self) -> None:
         tree = ast.parse(
             DIAGNOSTIC_JOB_PATH.read_text(encoding="utf-8"),

@@ -16,6 +16,8 @@
     "container_image_digest",
     "python_version",
     "cinderx_commit",
+    "cinderx_base_image_digest",
+    "cinderx_wheel_sha256",
     "cinderx_soabi",
     "daft_version",
     "ray_version",
