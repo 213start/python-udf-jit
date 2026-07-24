@@ -66,6 +66,7 @@ class WorkerRuntimeContext:
     process: WorkerProcessKey
     partition_id: str = ""
     task_attempt: str = ""
+    refresh_partition_from_ray: bool = False
 
     @classmethod
     def from_environment(cls) -> "WorkerRuntimeContext":
@@ -74,6 +75,7 @@ class WorkerRuntimeContext:
         node_id = os.environ.get("UDFJIT_NODE_ID", "")
         actor_worker_id = os.environ.get("UDFJIT_ACTOR_WORKER_ID", "")
         partition_id = os.environ.get("UDFJIT_PARTITION_ID", "")
+        refresh_partition_from_ray = not partition_id
         task_attempt = os.environ.get("UDFJIT_TASK_ATTEMPT", "")
         if not node_id or not actor_worker_id or not partition_id:
             try:
@@ -100,7 +102,32 @@ class WorkerRuntimeContext:
             os.getpid(),
             os.environ.get("UDFJIT_PROCESS_GENERATION", _PROCESS_GENERATION),
         )
-        return cls(run_id, process, partition_id, task_attempt)
+        return cls(
+            run_id,
+            process,
+            partition_id,
+            task_attempt,
+            refresh_partition_from_ray,
+        )
+
+    def event_attribution(self) -> tuple[str, str]:
+        """Return the current task identity for a long-lived Ray Worker process."""
+
+        partition_id = self.partition_id
+        if self.refresh_partition_from_ray:
+            try:
+                import ray
+
+                partition_id = (
+                    _runtime_context_value(
+                        ray.get_runtime_context(),
+                        "get_task_id",
+                    )
+                    or partition_id
+                )
+            except Exception:
+                pass
+        return partition_id, self.task_attempt
 
 
 @dataclass(frozen=True)
@@ -228,6 +255,7 @@ class WorkerScalarAdapter:
         execution_mode: str = "",
     ) -> None:
         try:
+            partition_id, task_attempt = self.context.event_attribution()
             self._event_sink.emit(
                 RuntimeEvent(
                     stage,
@@ -238,8 +266,8 @@ class WorkerScalarAdapter:
                     "" if key is None else key.sha256,
                     artifact_hash,
                     code_hash,
-                    self.context.partition_id,
-                    self.context.task_attempt,
+                    partition_id,
+                    task_attempt,
                     execution_mode,
                 )
             )

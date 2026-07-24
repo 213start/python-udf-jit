@@ -185,8 +185,10 @@ class WorkerRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(len({event.variant_key for event in events if event.variant_key}), 1)
 
-    def test_from_environment_captures_ray_task_id_once_when_partition_is_unset(self):
-        runtime = SimpleNamespace(get_task_id=mock.Mock(return_value="task-a"))
+    def test_from_environment_refreshes_ray_task_id_when_partition_is_unset(self):
+        runtime = SimpleNamespace(
+            get_task_id=mock.Mock(side_effect=("task-build", "task-live"))
+        )
         fake_ray = SimpleNamespace(
             get_runtime_context=mock.Mock(return_value=runtime)
         )
@@ -200,11 +202,14 @@ class WorkerRuntimeTest(unittest.TestCase):
         with mock.patch.dict(os.environ, environment, clear=True):
             with mock.patch.dict(sys.modules, {"ray": fake_ray}):
                 context = WorkerRuntimeContext.from_environment()
+                attribution = context.event_attribution()
 
-        self.assertEqual(context.partition_id, "task-a")
+        self.assertEqual(context.partition_id, "task-build")
         self.assertEqual(context.task_attempt, "")
-        fake_ray.get_runtime_context.assert_called_once_with()
-        runtime.get_task_id.assert_called_once_with()
+        self.assertTrue(context.refresh_partition_from_ray)
+        self.assertEqual(attribution, ("task-live", ""))
+        self.assertEqual(fake_ray.get_runtime_context.call_count, 2)
+        self.assertEqual(runtime.get_task_id.call_count, 2)
 
     def test_emit_uses_frozen_attribution_without_ray_context_lookup(self):
         adapter = self.adapter(_LocalProviderFactory())

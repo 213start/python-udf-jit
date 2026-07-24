@@ -11,7 +11,7 @@ from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 from python_udf_jit.diagnostics.evidence import EvidenceRun, aggregate_run_evidence
-from tests.e2e.live_job import _join_ray_task_attempts
+from tests.e2e.live_job import _extract_events, _join_ray_task_attempts
 
 
 SHA_A = "a" * 64
@@ -238,6 +238,21 @@ class EvidenceAggregationTests(unittest.TestCase):
         event = _passing_events()[0]
         event["partition_id"] = "ray-task-id-1"
         event["task_attempt"] = ""
+        event = _extract_events(
+            [
+                json.dumps(
+                    {
+                        "runtime_task_id": "ray-task-id-1",
+                        "runtime_node_id": event["node_id"],
+                        "runtime_actor_id": event["actor_id"],
+                        "runtime_worker_id": "ray-worker-id-1",
+                        "pid": event["pid"],
+                        "events": [event],
+                    }
+                )
+            ]
+        )[0]
+        self.assertEqual(event["worker_id"], "ray-worker-id-1")
         record = SimpleNamespace(
             task_id="ray-task-id-1",
             attempt_number=0,
@@ -268,7 +283,7 @@ class EvidenceAggregationTests(unittest.TestCase):
             retry = _join_ray_task_attempts([event])
         self.assertEqual(retry[0]["task_attempt"], "")
 
-    def test_ray_state_join_accepts_unique_actor_node_pid_fallback(self) -> None:
+    def test_ray_state_join_rejects_actor_node_pid_without_exact_task_id(self) -> None:
         event = _passing_events()[0]
         event["partition_id"] = "nested-runtime-task-id"
         event["task_attempt"] = ""
@@ -287,16 +302,6 @@ class EvidenceAggregationTests(unittest.TestCase):
         ray_module = ModuleType("ray")
         ray_module.util = util_module
 
-        with mock.patch.dict(
-            sys.modules,
-            {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
-        ):
-            joined = _join_ray_task_attempts([event])
-        self.assertEqual(joined[0]["task_attempt"], "attempt-0")
-
-        ambiguous = SimpleNamespace(**vars(record))
-        ambiguous.task_id = "another-physical-plan-task-id"
-        state_module.list_tasks = lambda **_kwargs: [record, ambiguous]
         with mock.patch.dict(
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},

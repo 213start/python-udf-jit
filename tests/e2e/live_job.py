@@ -432,7 +432,23 @@ def _extract_events(values: list[str]) -> list[dict[str, object]]:
     unique: dict[tuple[object, ...], dict[str, object]] = {}
     for value in values:
         report = json.loads(value)
-        for event in report["events"]:
+        runtime_identity = (
+            str(report["runtime_node_id"]),
+            str(report["runtime_actor_id"]),
+            str(report["runtime_worker_id"]),
+            int(report["pid"]),
+        )
+        if not all(runtime_identity[:3]) or runtime_identity[3] <= 0:
+            raise RuntimeError("ray_runtime_identity_incomplete")
+        for raw_event in report["events"]:
+            event = dict(raw_event)
+            if (
+                str(event["node_id"]) != runtime_identity[0]
+                or str(event["actor_id"]) != runtime_identity[1]
+                or int(event["pid"]) != runtime_identity[3]
+            ):
+                raise RuntimeError("runtime_event_process_identity_drift")
+            event["worker_id"] = runtime_identity[2]
             key = (
                 event["timestamp_ns"],
                 event["pid"],
@@ -502,7 +518,7 @@ def _event_documents(
             "role": roles.get(str(event["node_id"]), "unknown"),
             "node_id": event["node_id"],
             "actor_id": event["actor_id"],
-            "worker_id": "",
+            "worker_id": event.get("worker_id", ""),
             "pid": event["pid"],
             "process_generation": event["process_generation"],
             "partition_id": event["partition_id"],
@@ -546,34 +562,16 @@ def _join_ray_task_attempts(events: list[dict[str, object]]) -> list[dict[str, o
 
     records = list(list_tasks(detail=True, limit=10000, timeout=30))
     records_by_id: dict[str, list[Any]] = {}
-    records_by_worker_identity: dict[tuple[str, str, int], list[Any]] = {}
     for record in records:
         task_id = _state_text(record, "task_id")
         if task_id:
             records_by_id.setdefault(task_id, []).append(record)
-        actor_id = _state_text(record, "actor_id")
-        node_id = _state_text(record, "node_id")
-        worker_pid = _state_int(record, "worker_pid")
-        if actor_id and node_id and worker_pid > 0:
-            records_by_worker_identity.setdefault(
-                (actor_id, node_id, worker_pid), []
-            ).append(record)
 
     joined = []
     for event in events:
         item = dict(event)
         task_id = str(item.get("partition_id", ""))
         records = records_by_id.get(task_id, [])
-        if not records:
-            event_actor = str(item.get("actor_id", ""))
-            event_node = str(item.get("node_id", ""))
-            try:
-                event_pid = int(item.get("pid", -1))
-            except (TypeError, ValueError):
-                event_pid = -1
-            records = records_by_worker_identity.get(
-                (event_actor, event_node, event_pid), []
-            )
         if len(records) == 1:
             record = records[0]
             identity_matches = (
