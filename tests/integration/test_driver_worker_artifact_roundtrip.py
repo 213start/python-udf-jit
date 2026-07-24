@@ -21,6 +21,23 @@ from python_udf_jit.protocol.artifact import build_artifact
 from python_udf_jit.protocol.codec import encode_artifact
 
 
+def worker_environment(**overrides: str) -> dict[str, str]:
+    """Make test-defined callables importable under every unittest discovery mode."""
+
+    import_roots = (
+        str(Path(__file__).resolve().parent),
+        str(Path(__file__).resolve().parents[2]),
+        os.environ.get("PYTHONPATH", ""),
+    )
+    return dict(
+        os.environ,
+        PYTHONPATH=os.pathsep.join(
+            path for path in import_roots if path
+        ),
+        **overrides,
+    )
+
+
 def scalar_affine(value):
     return value * 2.0 + 3.0
 
@@ -55,7 +72,7 @@ print(json.dumps({
     'usage': wrapper.usage_context,
 }))
 """
-        env = dict(os.environ, UDFJIT_WRAPPER=payload)
+        env = worker_environment(UDFJIT_WRAPPER=payload)
 
         completed = subprocess.run(
             [sys.executable, "-c", script],
@@ -109,7 +126,7 @@ print(json.dumps({
             check=False,
             capture_output=True,
             text=True,
-            env=dict(os.environ, UDFJIT_WRAPPER=payload),
+            env=worker_environment(UDFJIT_WRAPPER=payload),
             timeout=15,
         )
 
@@ -136,8 +153,7 @@ print(json.dumps({'result': wrapper(None, 2.0)}))
 """
         with tempfile.TemporaryDirectory() as directory:
             side_effect_file = Path(directory, "calls.txt")
-            env = dict(
-                os.environ,
+            env = worker_environment(
                 UDFJIT_WRAPPER=payload,
                 UDFJIT_MODE="auto",
                 UDFJIT_RUN_ID="run-roundtrip",
