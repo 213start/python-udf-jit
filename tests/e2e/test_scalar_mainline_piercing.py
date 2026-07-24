@@ -296,7 +296,47 @@ class EvidenceAggregationTests(unittest.TestCase):
             retry = _join_ray_task_attempts([event])
         self.assertEqual(retry[0]["task_attempt"], "")
 
-    def test_ray_state_join_rejects_actor_node_pid_without_exact_task_id(self) -> None:
+        temporal_event = dict(event)
+        temporal_event["partition_id"] = "runtime-thread-task-id"
+        temporal_event["timestamp_ns"] = 2_000_500_000
+        temporal_record = SimpleNamespace(
+            **(
+                vars(record)
+                | {
+                    "task_id": "physical-actor-task-id",
+                    "attempt_number": 0,
+                    "type": "ACTOR_TASK",
+                    "start_time_ms": 2_000,
+                    "end_time_ms": 2_001,
+                }
+            )
+        )
+        state_module.list_tasks = lambda **_kwargs: [temporal_record]
+        with mock.patch.dict(
+            sys.modules,
+            {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
+        ):
+            temporal = _join_ray_task_attempts([temporal_event], wait_seconds=0)
+        self.assertEqual(temporal[0]["partition_id"], "physical-actor-task-id")
+        self.assertEqual(temporal[0]["task_attempt"], "attempt-0")
+        self.assertEqual(
+            temporal[0]["ray_state_join_strategy"],
+            "unique_identity_time_window",
+        )
+
+        overlapping = SimpleNamespace(
+            **(vars(temporal_record) | {"task_id": "overlapping-actor-task-id"})
+        )
+        state_module.list_tasks = lambda **_kwargs: [temporal_record, overlapping]
+        with mock.patch.dict(
+            sys.modules,
+            {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
+        ):
+            ambiguous = _join_ray_task_attempts([temporal_event], wait_seconds=0)
+        self.assertEqual(ambiguous[0]["task_attempt"], "")
+        self.assertEqual(len(ambiguous[0]["ray_state_temporal_candidates"]), 2)
+
+    def test_ray_state_join_rejects_identity_without_task_or_time_window(self) -> None:
         event = _passing_events()[0]
         event["partition_id"] = "nested-runtime-task-id"
         event["task_attempt"] = ""

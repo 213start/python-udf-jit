@@ -438,6 +438,7 @@ def _extract_events(values: list[str]) -> list[dict[str, object]]:
             str(report["runtime_worker_id"]),
             int(report["pid"]),
         )
+        runtime_probe_task_id = str(report["runtime_task_id"])
         if not all(runtime_identity[:3]) or runtime_identity[3] <= 0:
             raise RuntimeError("ray_runtime_identity_incomplete")
         for raw_event in report["events"]:
@@ -449,6 +450,7 @@ def _extract_events(values: list[str]) -> list[dict[str, object]]:
             ):
                 raise RuntimeError("runtime_event_process_identity_drift")
             event["worker_id"] = runtime_identity[2]
+            event["runtime_probe_task_id"] = runtime_probe_task_id
             key = (
                 event["timestamp_ns"],
                 event["pid"],
@@ -523,6 +525,7 @@ def _event_documents(
             "process_generation": event["process_generation"],
             "partition_id": event["partition_id"],
             "task_attempt": event["task_attempt"],
+            "runtime_probe_task_id": event.get("runtime_probe_task_id", ""),
             "variant_key": event["variant_key"],
             "artifact_hash": event["artifact_hash"],
             "code_hash": event["code_hash"],
@@ -565,7 +568,80 @@ def _task_state_document(record: Any) -> dict[str, object]:
         "node_id": _state_text(record, "node_id"),
         "worker_id": _state_text(record, "worker_id"),
         "worker_pid": _state_int(record, "worker_pid"),
+        "name": _state_text(record, "name"),
+        "parent_task_id": _state_text(record, "parent_task_id"),
+        "start_time_ms": _state_int(record, "start_time_ms"),
+        "end_time_ms": _state_int(record, "end_time_ms"),
     }
+
+
+def _state_identity_matches(
+    record: Any,
+    event: dict[str, object],
+) -> bool:
+    try:
+        worker_pid = int(event.get("pid", -1))
+    except (TypeError, ValueError):
+        return False
+    return (
+        bool(_state_text(record, "actor_id"))
+        and _state_text(record, "actor_id") == str(event.get("actor_id", ""))
+        and _state_text(record, "node_id") == str(event.get("node_id", ""))
+        and _state_text(record, "worker_id") == str(event.get("worker_id", ""))
+        and _state_int(record, "worker_pid") == worker_pid
+    )
+
+
+def _temporal_task_candidates(
+    event: dict[str, object],
+    records: list[Any],
+) -> list[Any]:
+    try:
+        timestamp_ms = int(event.get("timestamp_ns", 0)) / 1_000_000
+    except (TypeError, ValueError):
+        return []
+    if timestamp_ms <= 0:
+        return []
+    candidates = []
+    for record in records:
+        start_ms = _state_int(record, "start_time_ms")
+        end_ms = _state_int(record, "end_time_ms")
+        if (
+            _state_text(record, "state") == "FINISHED"
+            and _state_text(record, "type") == "ACTOR_TASK"
+            and _state_identity_matches(record, event)
+            and start_ms > 0
+            and end_ms >= start_ms
+            and start_ms <= timestamp_ms <= end_ms + 1
+        ):
+            candidates.append(record)
+    return candidates
+
+
+def _state_join_pending(
+    events: list[dict[str, object]],
+    records: list[Any],
+    records_by_id: dict[str, list[Any]],
+) -> bool:
+    for event in events:
+        runtime_task_id = str(event.get("partition_id", ""))
+        exact_records = records_by_id.get(runtime_task_id, [])
+        if exact_records:
+            if len(exact_records) == 1 and _state_text(
+                exact_records[0], "state"
+            ) not in {"FINISHED", "FAILED"}:
+                return True
+            continue
+        temporal = _temporal_task_candidates(event, records)
+        if not temporal:
+            return True
+        if len(temporal) == 1:
+            attempts = records_by_id.get(_state_text(temporal[0], "task_id"), [])
+            if len(attempts) == 1 and _state_text(
+                attempts[0], "state"
+            ) not in {"FINISHED", "FAILED"}:
+                return True
+    return False
 
 
 def _join_ray_task_attempts(
@@ -578,31 +654,17 @@ def _join_ray_task_attempts(
 
     from ray.util.state import list_tasks
 
-    task_ids = {
-        str(event.get("partition_id", ""))
-        for event in events
-        if event.get("partition_id")
-    }
     state_records: list[Any] = []
     records_by_id: dict[str, list[Any]] = {}
     deadline = time.monotonic() + max(0.0, wait_seconds)
-    while task_ids:
+    while events:
         state_records = list(list_tasks(detail=True, limit=10000, timeout=30))
         records_by_id = {}
         for record in state_records:
             task_id = _state_text(record, "task_id")
             if task_id:
                 records_by_id.setdefault(task_id, []).append(record)
-        pending = False
-        for task_id in task_ids:
-            matches = records_by_id.get(task_id, [])
-            if not matches or (
-                len(matches) == 1
-                and _state_text(matches[0], "state")
-                not in {"FINISHED", "FAILED"}
-            ):
-                pending = True
-                break
+        pending = _state_join_pending(events, state_records, records_by_id)
         remaining = deadline - time.monotonic()
         if not pending or remaining <= 0:
             break
@@ -611,10 +673,25 @@ def _join_ray_task_attempts(
     joined = []
     for event in events:
         item = dict(event)
-        task_id = str(item.get("partition_id", ""))
-        exact_records = records_by_id.get(task_id, [])
+        runtime_task_id = str(item.get("partition_id", ""))
+        exact_records = records_by_id.get(runtime_task_id, [])
+        temporal_candidates = _temporal_task_candidates(item, state_records)
+        attempt_records = exact_records
+        strategy = "runtime_task_id" if exact_records else ""
+        if not exact_records and len(temporal_candidates) == 1:
+            authoritative_task_id = _state_text(
+                temporal_candidates[0],
+                "task_id",
+            )
+            attempt_records = records_by_id.get(authoritative_task_id, [])
+            strategy = "unique_identity_time_window"
+        item["runtime_context_task_id"] = runtime_task_id
+        item["ray_state_join_strategy"] = strategy
         item["ray_state_exact_records"] = [
             _task_state_document(record) for record in exact_records
+        ]
+        item["ray_state_temporal_candidates"] = [
+            _task_state_document(record) for record in temporal_candidates
         ]
         if not exact_records:
             actor_id = str(item.get("actor_id", ""))
@@ -632,23 +709,18 @@ def _join_ray_task_attempts(
                     and _state_int(record, "worker_pid") == worker_pid
                 )
             ][-10:]
-        if len(exact_records) == 1:
-            record = exact_records[0]
+        item["ray_state_attempt_records"] = [
+            _task_state_document(record) for record in attempt_records
+        ]
+        if len(attempt_records) == 1:
+            record = attempt_records[0]
             identity_matches = (
                 _state_text(record, "state") == "FINISHED"
-                and _state_text(record, "node_id") == str(item.get("node_id"))
-                and _state_int(record, "worker_pid") == int(item.get("pid", -2))
+                and _state_identity_matches(record, item)
             )
-            record_actor = _state_text(record, "actor_id")
-            event_actor = str(item.get("actor_id", ""))
-            if record_actor and event_actor:
-                identity_matches = identity_matches and record_actor == event_actor
-            record_worker = _state_text(record, "worker_id")
-            event_worker = str(item.get("worker_id", ""))
-            if record_worker and event_worker:
-                identity_matches = identity_matches and record_worker == event_worker
             attempt_number = _state_int(record, "attempt_number")
             if identity_matches and attempt_number == 0:
+                item["partition_id"] = _state_text(record, "task_id")
                 item["task_attempt"] = "attempt-0"
         joined.append(item)
     return joined
