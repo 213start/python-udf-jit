@@ -17,7 +17,9 @@ class TestEvidenceTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.path = Path(self.temporary.name) / "unit.log"
         self.path.write_text(
-            "test_alpha (tests.Alpha.test_alpha) ... ok\n"
+            "test_alpha (tests.Alpha.test_alpha) ... live worker log\n"
+            "remote scheduler detail\n"
+            "ok\n"
             "test_beta (tests.Beta.test_beta) ... ok\n"
             "\n"
             "----------------------------------------------------------------------\n"
