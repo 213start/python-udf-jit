@@ -43,12 +43,25 @@ def _runtime(container: str) -> dict[str, str]:
 
 
 def capture(
-    *, containers: dict[str, str], cinderx_commit: str, udf_jit_wheel_sha256: str
+    *,
+    containers: dict[str, str],
+    source_git_commit: str,
+    cinderx_commit: str,
+    cinderx_source_tree_sha256: str,
+    cinderx_patch_sha256: str,
+    udf_jit_wheel_sha256: str,
 ) -> dict[str, object]:
-    if re.fullmatch(r"[0-9a-f]{7,64}", cinderx_commit) is None:
-        raise ValueError("cinderx_commit must be a lowercase Git object ID")
-    if _SHA256.fullmatch(udf_jit_wheel_sha256) is None:
-        raise ValueError("udf_jit_wheel_sha256 must be a lowercase SHA-256")
+    if re.fullmatch(r"[0-9a-f]{40}", source_git_commit) is None:
+        raise ValueError("source_git_commit must be a full lowercase Git object ID")
+    if re.fullmatch(r"[0-9a-f]{40}", cinderx_commit) is None:
+        raise ValueError("cinderx_commit must be a full lowercase Git object ID")
+    for field, value in (
+        ("cinderx_source_tree_sha256", cinderx_source_tree_sha256),
+        ("cinderx_patch_sha256", cinderx_patch_sha256),
+        ("udf_jit_wheel_sha256", udf_jit_wheel_sha256),
+    ):
+        if _SHA256.fullmatch(value) is None:
+            raise ValueError(f"{field} must be a lowercase SHA-256")
     runtimes = [_runtime(containers[role]) for role in _ROLES]
     if any(runtime != runtimes[0] for runtime in runtimes[1:]):
         raise RuntimeError("runtime/manifest drift across cluster roles")
@@ -59,6 +72,19 @@ def capture(
     image_digests = {str(document["Image"]) for document in inspect_documents}
     if len(image_digests) != 1:
         raise RuntimeError("candidate image drift across cluster roles")
+    expected_labels = {
+        "org.opencontainers.image.revision": source_git_commit,
+        "org.python-udf-jit.cinderx-commit": cinderx_commit,
+        "org.python-udf-jit.cinderx-source-tree-sha256": cinderx_source_tree_sha256,
+        "org.python-udf-jit.cinderx-patch-sha256": cinderx_patch_sha256,
+        "org.python-udf-jit.wheel-sha256": udf_jit_wheel_sha256,
+    }
+    for document in inspect_documents:
+        labels = document.get("Config", {}).get("Labels", {})
+        if not isinstance(labels, dict) or any(
+            labels.get(name) != value for name, value in expected_labels.items()
+        ):
+            raise RuntimeError("candidate source/image label drift")
     runtime = runtimes[0]
     if (
         runtime["python_version"] != "3.14.3"
@@ -85,7 +111,10 @@ def main() -> None:
     parser.add_argument("--head-container", required=True)
     parser.add_argument("--worker-1-container", required=True)
     parser.add_argument("--worker-2-container", required=True)
+    parser.add_argument("--source-git-commit", required=True)
     parser.add_argument("--cinderx-commit", required=True)
+    parser.add_argument("--cinderx-source-tree-sha256", required=True)
+    parser.add_argument("--cinderx-patch-sha256", required=True)
     parser.add_argument("--udf-jit-wheel-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
@@ -95,7 +124,10 @@ def main() -> None:
             "ray-worker-1": arguments.worker_1_container,
             "ray-worker-2": arguments.worker_2_container,
         },
+        source_git_commit=arguments.source_git_commit,
         cinderx_commit=arguments.cinderx_commit,
+        cinderx_source_tree_sha256=arguments.cinderx_source_tree_sha256,
+        cinderx_patch_sha256=arguments.cinderx_patch_sha256,
         udf_jit_wheel_sha256=arguments.udf_jit_wheel_sha256,
     )
     arguments.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

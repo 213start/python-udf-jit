@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
+import json
 import unittest
 from pathlib import Path
 
@@ -10,12 +12,174 @@ from python_udf_jit.diagnostics.acceptance import (
     aggregate_formal_acceptance,
     load_acceptance_contract,
 )
+from python_udf_jit.diagnostics.environment_evidence import (
+    seal_environment_proof,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
 CONTRACT_PATH = ROOT / "config/scalar-piercing-acceptance.json"
 HEX_64 = "a" * 64
 IMAGE_DIGEST = f"sha256:{'b' * 64}"
+CINDERX_COMMIT = "f" * 40
+
+
+def _test_proof(
+    *,
+    gate_id: str,
+    tier: str,
+    required_tests: list[str],
+    test_count: int,
+) -> dict[str, object]:
+    argv = ["python", "-m", "unittest", "-v", gate_id]
+    argv_sha256 = hashlib.sha256(
+        json.dumps(argv, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    fields = {
+        "gate_id": gate_id,
+        "tier": tier,
+        "run_id": "u13-run",
+        "cluster_epoch": "u13-epoch",
+        "source_git_commit": "e" * 40,
+        "argv_sha256": argv_sha256,
+        "log_sha256": "a" * 64,
+        "required_tests": required_tests,
+        "test_count": test_count,
+        "skipped": 0,
+    }
+    proof_sha256 = hashlib.sha256(
+        json.dumps(
+            fields,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        **fields,
+        "argv": argv,
+        "duration_seconds": 1.0,
+        "proof_sha256": proof_sha256,
+    }
+
+
+def _auth_proof() -> dict[str, object]:
+    return seal_environment_proof(
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "run_id": "u13-run",
+            "cluster_epoch": "u13-epoch",
+            "dashboard": {
+                "published_bindings": [
+                    {
+                        "host_ip": "127.0.0.1",
+                        "host_port": 8265,
+                        "container_port": 8265,
+                        "protocol": "tcp",
+                    }
+                ],
+                "published_non_dashboard_ports": [],
+                "non_loopback_connect": "refused",
+                "requests": {
+                    "unauthenticated": 401,
+                    "wrong_token": 403,
+                    "authenticated": 200,
+                },
+                "token_file_mode": "0600",
+            },
+            "secret_scan": {
+                "scanned_artifact_count": 12,
+                "scanned_image_count": 1,
+                "token_matches": 0,
+                "token_in_image_environment": False,
+                "token_in_image_history": False,
+                "token_in_retained_reports": False,
+            },
+        }
+    )
+
+
+def _cleanup_proof() -> dict[str, object]:
+    return seal_environment_proof(
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "run_id": "u13-run",
+            "cluster_epoch": "u13-epoch",
+            "before": {
+                "routes_sha256": "4" * 64,
+                "firewall_sha256": "5" * 64,
+            },
+            "after": {
+                "routes_sha256": "4" * 64,
+                "firewall_sha256": "5" * 64,
+            },
+            "cleanup": {
+                "removed_container_ids": [
+                    "6" * 64,
+                    "7" * 64,
+                    "8" * 64,
+                ],
+                "removed_network_ids": ["9" * 64, "a" * 64],
+                "remaining_project_containers": [],
+                "remaining_project_networks": [],
+                "dashboard_port_open": False,
+                "token_exists": False,
+            },
+        }
+    )
+
+
+def _hygiene_proof() -> dict[str, object]:
+    return seal_environment_proof(
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "run_id": "u13-run",
+            "cluster_epoch": "u13-epoch",
+            "evidence_hygiene": {
+                "retained_reports": [
+                    {
+                        "name": "base-report.json",
+                        "mode": "0600",
+                        "sha256": "b" * 64,
+                    }
+                ],
+                "raw_event_files_remaining": [],
+                "raw_event_files_removed": ["off-events.jsonl", "auto-events.jsonl"],
+            },
+        }
+    )
+
+
+def _invalidation_proof() -> dict[str, object]:
+    return seal_environment_proof(
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "run_id": "u13-run",
+            "cluster_epoch": "u13-epoch",
+            "source_git_commit": "e" * 40,
+            "probe": {
+                "changed_role": "ray-worker-2",
+                "before_boot_id": "worker-2-before",
+                "after_boot_id": "worker-2-after",
+                "head_unchanged": True,
+                "other_worker_unchanged": True,
+                "manifest_unchanged": True,
+                "image_unchanged": True,
+                "invalidated_verdict": "inconclusive",
+                "reason_code": "phase_identity_drift",
+            },
+            "artifacts": {
+                "before_snapshot_sha256": "c" * 64,
+                "after_snapshot_sha256": "d" * 64,
+                "invalidated_report_sha256": "e" * 64,
+            },
+        }
+    )
 
 
 def _base_report() -> dict[str, object]:
@@ -40,6 +204,7 @@ def _base_report() -> dict[str, object]:
         "manifest": {
             "image_digest": IMAGE_DIGEST,
             "udf_jit_wheel_sha256": HEX_64,
+            "cinderx_commit": CINDERX_COMMIT,
         },
     }
 
@@ -84,12 +249,99 @@ def _black_box(mode: str) -> dict[str, object]:
 
 
 def _evidence() -> dict[str, object]:
+    cinderx_proof = {
+        "schema_version": 1,
+        "status": "pass",
+        "identity": {
+            "cinderx_commit": CINDERX_COMMIT,
+            "source_tree_sha256": "2" * 64,
+            "patch_sha256": "3" * 64,
+            "image_digest": f"sha256:{'4' * 64}",
+            "python_version": "3.14.3",
+            "soabi": "cpython-314-aarch64-linux-gnu",
+            "py_enable_shared": 0,
+            "python_library": "/opt/python314/lib/libpython3.14.a",
+        },
+        "runtime_tests": {
+            "normal": {"passed": 1176, "failed": 0},
+            "lightweight_frames_deopt": {"passed": 66, "failed": 0},
+            "osr": {"passed": 130, "failed": 0},
+            "udf_cases": [
+                "UdfDataIntrinsicTest.RuntimeHelpersEnforceBorrowAndLifetime",
+                "UdfDataIntrinsicTest.RuntimeHelpersRejectCrossProcessCapsule",
+                "UdfDataIntrinsicTest.ExactGuardedLoadProducesPrimitiveHIR",
+                "UdfDataIntrinsicTest.HIRMetadataMatchesPrimitiveRead",
+                "UdfDataIntrinsicTest.LIRCallsFloat64SlotLoadHelper",
+                "UdfDataIntrinsicHIRTest.ParserPrinterAndOutputTypePreserveGuardedPrimitiveLoad",
+            ],
+        },
+        "python_tests": {
+            "release_pytest": {
+                "passed": 1331,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 63,
+                "deselected": 8,
+            },
+            "adaptive_libtest": {
+                "module_count": 456,
+                "mode": "frame-eval-adaptive-aware",
+                "runner": "dispatcher",
+                "adaptive_compile_after": 24,
+                "returncode": 0,
+            },
+            "official_skip_libtest": {
+                "module_count": 26,
+                "mode": "frame-eval-adaptive-aware",
+                "runner": "dispatcher",
+                "adaptive_compile_after": 24,
+                "returncode": 0,
+            },
+            "udf_data_intrinsic": {"passed": 5, "failed": 0},
+        },
+        "artifacts": {
+            name: str(index) * 64
+            for index, name in enumerate(
+                (
+                    "fingerprint",
+                    "runtime_log",
+                    "release_log",
+                    "adaptive_summary",
+                    "adaptive_log",
+                    "official_summary",
+                    "official_log",
+                    "targeted_log",
+                ),
+                start=1,
+            )
+        },
+    }
+    cinderx_material = {
+        name: cinderx_proof[name]
+        for name in (
+            "identity",
+            "runtime_tests",
+            "python_tests",
+            "artifacts",
+        )
+    }
+    cinderx_proof["proof_sha256"] = hashlib.sha256(
+        json.dumps(
+            cinderx_material,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
     return {
         "run_id": "u13-run",
         "cluster_epoch": "u13-epoch",
         "source": {
             "git_commit": "e" * 40,
             "dirty": False,
+            "cinderx_commit": CINDERX_COMMIT,
+            "cinderx_source_tree_sha256": "2" * 64,
+            "cinderx_patch_sha256": "3" * 64,
             "image_digest": IMAGE_DIGEST,
             "udf_jit_wheel_sha256": HEX_64,
         },
@@ -99,31 +351,78 @@ def _evidence() -> dict[str, object]:
             "auto": _black_box("auto"),
         },
         "infrastructure": {
-            "object_store_data_plane": True,
-            "cinderx_runtime_tests": True,
-            "cinderx_python_tests": True,
-            "dashboard_unauthenticated_status": 401,
-            "dashboard_wrong_token_status": 403,
-            "dashboard_authenticated_status": 200,
-            "dashboard_loopback_only": True,
-            "other_ray_ports_unpublished": True,
-            "secret_hygiene": True,
-            "raw_events_removed": True,
-            "report_permissions_0600": True,
-            "python_unit_tests": True,
-            "python_integration_tests": True,
-            "live_tests_executed": True,
-            "containers_removed": True,
-            "networks_removed": True,
-            "dashboard_port_closed": True,
-            "firewall_restored": True,
-            "routes_restored": True,
-            "token_removed": True,
+            "cinderx": cinderx_proof,
+            "environment_auth": _auth_proof(),
+            "environment_cleanup": _cleanup_proof(),
+            "evidence_hygiene": _hygiene_proof(),
+            "invalidation": _invalidation_proof(),
+            "python_test_proofs": {
+                "unit": _test_proof(
+                    gate_id="python.unit",
+                    tier="unit",
+                    required_tests=[
+                        "test_contract_traces_every_requirement_and_acceptance_example",
+                        "test_exact_static_runtime_and_python_gates_produce_proof",
+                        "test_fixture_never_imports_or_calls_plugin_internals",
+                        "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
+                    ],
+                    test_count=114,
+                ),
+                "integration": _test_proof(
+                    gate_id="python.integration",
+                    tier="integration",
+                    required_tests=[
+                        "test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip",
+                        "test_exact_live_topology_is_accepted",
+                        "test_partitioned_float_projection_runs_only_on_worker_nodes",
+                        "test_head_owned_object_ref_reaches_both_workers",
+                        "test_both_workers_execute_region_driven_cinderx_scalar_load",
+                        "test_same_production_plan_compiles_and_executes_on_each_worker",
+                    ],
+                    test_count=29,
+                ),
+                "live": _test_proof(
+                    gate_id="python.live",
+                    tier="system",
+                    required_tests=[
+                        "test_ae1_to_ae8_pass_and_keep_natural_coverage_separate",
+                        "test_live_evidence_is_supplied_by_the_external_harness",
+                    ],
+                    test_count=12,
+                ),
+            },
         },
         "measurement": {
-            "completed": True,
-            "semantic_equivalent": True,
+            "schema_version": 1,
+            "run_id": "u13-run",
+            "cluster_epoch": "u13-epoch",
+            "measurement_scope": "small_e2e_validation_not_release_performance",
+            "units": "nanoseconds",
+            "sample_count": 3,
+            "warmup_count": 1,
+            "environment": {
+                "python_version": "3.14.3",
+                "platform_machine": "aarch64",
+                "daft_version": "0.7.2",
+                "ray_version": "2.55.0",
+                "pyarrow_version": "22.0.0",
+                "manifest_sha256": "4" * 64,
+            },
+            "off": {
+                "warmup_ns": 10,
+                "samples_ns": [8, 9, 10],
+                "median_ns": 9,
+                "result_digest": "5" * 64,
+            },
+            "auto": {
+                "cold_compile_window_ns": 12,
+                "samples_ns": [7, 8, 9],
+                "median_ns": 8,
+                "result_digest": "5" * 64,
+            },
+            "result_equivalent": True,
             "speedup_gate_applied": False,
+            "notes": ["validation only", "not a release claim"],
         },
     }
 
@@ -196,26 +495,112 @@ class AcceptanceContractTests(unittest.TestCase):
         )
 
     def test_missing_or_false_external_proof_cannot_silently_pass(self) -> None:
-        for field in (
-            "object_store_data_plane",
-            "cinderx_runtime_tests",
-            "dashboard_loopback_only",
-            "secret_hygiene",
-            "containers_removed",
-            "routes_restored",
-        ):
-            with self.subTest(field=field):
-                evidence = _evidence()
-                evidence["infrastructure"][field] = False
-                report = aggregate_formal_acceptance(self.contract, evidence)
-                self.assertEqual(report["verdict"], "fail")
-                self.assertTrue(report["reason_codes"])
-
         evidence = _evidence()
-        del evidence["infrastructure"]["routes_restored"]
+        del evidence["infrastructure"]["environment_cleanup"]
         report = aggregate_formal_acceptance(self.contract, evidence)
         self.assertEqual(report["verdict"], "incomplete")
         self.assertIn("gate_missing:environment.cleanup", report["reason_codes"])
+
+        evidence = _evidence()
+        evidence["infrastructure"]["environment_auth"]["dashboard"][
+            "non_loopback_connect"
+        ] = "connected"
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "fail")
+        self.assertIn(
+            "gate_failed:environment.auth_loopback",
+            report["reason_codes"],
+        )
+
+        evidence = _evidence()
+        evidence["infrastructure"]["evidence_hygiene"][
+            "evidence_hygiene"
+        ]["raw_event_files_remaining"] = ["auto-events.jsonl"]
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "fail")
+        self.assertIn(
+            "gate_failed:evidence.permissions_cleanup",
+            report["reason_codes"],
+        )
+
+        evidence = _evidence()
+        del evidence["infrastructure"]["invalidation"]
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "incomplete")
+        self.assertIn(
+            "gate_missing:evidence.invalidation_negative",
+            report["reason_codes"],
+        )
+
+        for proof_name, gate in (
+            ("unit", "tests.unit_suite"),
+            ("integration", "tests.integration_suite"),
+            ("live", "tests.live_suite"),
+        ):
+            with self.subTest(proof=proof_name):
+                evidence = _evidence()
+                del evidence["infrastructure"]["python_test_proofs"][
+                    proof_name
+                ]
+                report = aggregate_formal_acceptance(self.contract, evidence)
+                self.assertEqual(report["verdict"], "incomplete")
+                self.assertIn(
+                    f"gate_missing:{gate}",
+                    report["reason_codes"],
+                )
+
+        evidence = _evidence()
+        del evidence["infrastructure"]["cinderx"]
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "incomplete")
+        self.assertIn(
+            "gate_missing:integration.cinderx_runtime",
+            report["reason_codes"],
+        )
+        self.assertIn(
+            "gate_missing:provenance.cinderx_source_identity",
+            report["reason_codes"],
+        )
+
+    def test_cinderx_totals_or_source_identity_cannot_be_fabricated(self) -> None:
+        evidence = _evidence()
+        evidence["infrastructure"]["cinderx"]["runtime_tests"]["normal"][
+            "passed"
+        ] = 1175
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "fail")
+        self.assertIn(
+            "gate_failed:integration.cinderx_runtime",
+            report["reason_codes"],
+        )
+
+        evidence = _evidence()
+        evidence["source"]["cinderx_patch_sha256"] = "9" * 64
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "fail")
+        self.assertIn(
+            "gate_failed:provenance.cinderx_source_identity",
+            report["reason_codes"],
+        )
+
+    def test_measurement_must_be_raw_identity_bound_equivalent_evidence(self) -> None:
+        evidence = _evidence()
+        evidence["measurement"]["auto"]["result_digest"] = "9" * 64
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "fail")
+        self.assertIn(
+            "gate_failed:measurement.non_gating",
+            report["reason_codes"],
+        )
+
+        evidence = _evidence()
+        del evidence["measurement"]["sample_count"]
+        report = aggregate_formal_acceptance(self.contract, evidence)
+        self.assertEqual(report["verdict"], "incomplete")
+        self.assertIn(
+            "gate_missing:measurement.non_gating",
+            report["reason_codes"],
+        )
 
     def test_black_box_drift_or_test_only_import_fails_transparency(self) -> None:
         cases = []

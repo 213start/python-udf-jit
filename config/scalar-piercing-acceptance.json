@@ -12,6 +12,11 @@
       "description": "The final image and wheel hashes match the preserved base report.",
       "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_source_run_and_report_identity_are_locked"]
     },
+    "provenance.cinderx_source_identity": {
+      "tier": "integration",
+      "description": "The pinned CinderX commit, reproducible patch, normalized source-tree hash, static CPython image, and retained test proof describe one candidate.",
+      "test_targets": ["tests.unit.diagnostics.test_cinderx_evidence.CinderXEvidenceTests.test_exact_static_runtime_and_python_gates_produce_proof", "tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_all_required_gates_produce_a_pass_report"]
+    },
     "tests.unit_suite": {
       "tier": "unit",
       "description": "The complete Python unit suite passes in the candidate image.",
@@ -40,17 +45,17 @@
     "environment.auth_loopback": {
       "tier": "system",
       "description": "Dashboard/Jobs is loopback-only and enforces the per-run token.",
-      "test_targets": ["tests.integration.test_driver_worker_isolation.DriverWorkerIsolationTests.test_compose_exposes_only_loopback_dashboard_jobs_port", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
+      "test_targets": ["tests.unit.diagnostics.test_environment_evidence.EnvironmentEvidenceTests.test_exact_auth_and_secret_negative_probes_pass", "tests.integration.test_driver_worker_isolation.DriverWorkerIsolationTests.test_compose_exposes_only_loopback_dashboard_jobs_port", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "environment.secret_hygiene": {
       "tier": "system",
       "description": "Authentication material is absent from image metadata, logs, events, and reports.",
-      "test_targets": ["tests.integration.test_environment_contract.EnvironmentContractTests.test_manifest_contains_no_runtime_secret_value", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
+      "test_targets": ["tests.unit.diagnostics.test_environment_evidence.EnvironmentEvidenceTests.test_wrong_status_non_loopback_exposure_or_token_leak_fails", "tests.integration.test_environment_contract.EnvironmentContractTests.test_manifest_contains_no_runtime_secret_value", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "environment.cleanup": {
       "tier": "system",
       "description": "Containers, networks, routes, firewall changes, ports, and tokens are cleaned.",
-      "test_targets": ["tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_missing_or_false_external_proof_cannot_silently_pass", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
+      "test_targets": ["tests.unit.diagnostics.test_environment_evidence.EnvironmentEvidenceTests.test_cleanup_requires_exact_resource_removal_and_host_state_restore", "tests.unit.diagnostics.test_acceptance.AcceptanceContractTests.test_missing_or_false_external_proof_cannot_silently_pass", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "integration.object_store_data_plane": {
       "tier": "integration",
@@ -59,8 +64,8 @@
     },
     "integration.cinderx_runtime": {
       "tier": "integration",
-      "description": "CinderX runtime and Python intrinsic tests pass for the pinned commit.",
-      "test_targets": ["tests.integration.test_ray_cinderx_scalar_slot_smoke.RayCinderXScalarSlotSmokeTests.test_both_workers_execute_region_driven_cinderx_scalar_load"]
+      "description": "Static-CPython RuntimeTests, release pytest, both lib-test gates, the five intrinsic Python tests, and the live two-Worker slot smoke all pass.",
+      "test_targets": ["tests.unit.diagnostics.test_cinderx_evidence.CinderXEvidenceTests.test_exact_static_runtime_and_python_gates_produce_proof", "tests.integration.test_ray_cinderx_scalar_slot_smoke.RayCinderXScalarSlotSmokeTests.test_both_workers_execute_region_driven_cinderx_scalar_load"]
     },
     "integration.worker_pool_qualification": {
       "tier": "integration",
@@ -137,6 +142,11 @@
       "description": "Readiness, qualification, and E2E share one epoch, manifest, topology, and boot identity.",
       "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_cross_phase_boot_drift_is_inconclusive"]
     },
+    "evidence.invalidation_negative": {
+      "tier": "system",
+      "description": "A real Worker restart changes its boot identity and makes the old phase evidence inconclusive with phase_identity_drift while Head and the other Worker remain stable.",
+      "test_targets": ["tests.unit.diagnostics.test_invalidation_evidence.InvalidationEvidenceTests.test_real_worker_restart_and_inconclusive_report_produce_proof", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
+    },
     "evidence.no_head_data_plane": {
       "tier": "system",
       "description": "No artifact, layout, JIT, or execute event occurs on the Head.",
@@ -145,7 +155,7 @@
     "evidence.permissions_cleanup": {
       "tier": "system",
       "description": "Raw events are ephemeral and all retained reports are value-free mode 0600.",
-      "test_targets": ["tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_raw_event_permissions_whitelist_canary_and_cleanup_on_all_verdicts", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
+      "test_targets": ["tests.unit.system.test_hygiene_evidence.HygieneEvidenceTests.test_private_retained_report_and_removed_raw_event_pass", "tests.e2e.test_scalar_mainline_piercing.EvidenceAggregationTests.test_raw_event_permissions_whitelist_canary_and_cleanup_on_all_verdicts", "tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "measurement.non_gating": {
       "tier": "system",
@@ -154,26 +164,26 @@
     }
   },
   "requirements": {
-    "R1": ["provenance.clean_source", "provenance.image_identity", "environment.locked_manifest", "tests.unit_suite", "tests.integration_suite"],
+    "R1": ["provenance.clean_source", "provenance.image_identity", "provenance.cinderx_source_identity", "environment.locked_manifest", "tests.unit_suite", "tests.integration_suite"],
     "R2": ["system.transparent_bootstrap", "system.with_column_semantics", "environment.three_node_topology"],
     "R3": ["system.transparent_bootstrap", "system.with_column_semantics", "system.with_columns_semantics"],
     "R4": ["tests.unit_suite", "system.with_column_semantics", "system.with_columns_semantics", "system.unsupported_semantics"],
     "R5": ["tests.unit_suite", "system.supported_jit", "system.unsupported_semantics"],
     "R6": ["tests.unit_suite", "tests.integration_suite", "system.fail_open"],
-    "R7": ["tests.unit_suite", "integration.cinderx_runtime", "integration.worker_pool_qualification"],
+    "R7": ["tests.unit_suite", "provenance.cinderx_source_identity", "integration.cinderx_runtime", "integration.worker_pool_qualification"],
     "R8": ["integration.cinderx_runtime", "system.supported_jit", "evidence.compile_hit_chain"],
     "R9": ["tests.unit_suite", "system.guard_miss_semantics", "system.exception_semantics"],
     "R10": ["tests.unit_suite", "system.guard_miss_semantics", "system.unsupported_semantics", "system.fail_open", "system.exception_semantics"],
     "R11": ["system.supported_jit", "evidence.compile_hit_chain", "evidence.attempt_identity", "evidence.no_head_data_plane"],
-    "R12": ["integration.cinderx_runtime", "evidence.compile_hit_chain"],
+    "R12": ["provenance.cinderx_source_identity", "integration.cinderx_runtime", "evidence.compile_hit_chain"],
     "R13": ["measurement.non_gating"],
     "R14": ["environment.three_node_topology", "integration.object_store_data_plane", "evidence.no_head_data_plane"],
     "R15": ["integration.cinderx_runtime", "integration.worker_pool_qualification"],
-    "R16": ["evidence.phase_identity", "evidence.attempt_identity"],
+    "R16": ["evidence.phase_identity", "evidence.invalidation_negative", "evidence.attempt_identity"],
     "R17": ["environment.auth_loopback", "environment.secret_hygiene"],
     "R18": ["evidence.permissions_cleanup", "environment.cleanup"],
     "R19": ["integration.worker_pool_qualification"],
-    "R20": ["provenance.clean_source", "provenance.image_identity", "tests.unit_suite", "tests.integration_suite", "tests.live_suite", "environment.cleanup"]
+    "R20": ["provenance.clean_source", "provenance.image_identity", "provenance.cinderx_source_identity", "tests.unit_suite", "tests.integration_suite", "tests.live_suite", "evidence.invalidation_negative", "environment.cleanup"]
   },
   "acceptance_examples": {
     "AE1": ["system.transparent_bootstrap", "system.supported_jit", "system.with_column_semantics", "system.ordered_results", "evidence.compile_hit_chain"],
@@ -182,7 +192,7 @@
     "AE4": ["system.transparent_bootstrap", "system.fail_open"],
     "AE5": ["system.zero_row_semantics"],
     "AE6": ["environment.three_node_topology", "integration.cinderx_runtime", "evidence.no_head_data_plane"],
-    "AE7": ["evidence.base_verdict", "evidence.phase_identity", "evidence.attempt_identity"],
+    "AE7": ["evidence.base_verdict", "evidence.phase_identity", "evidence.invalidation_negative", "evidence.attempt_identity"],
     "AE8": ["integration.worker_pool_qualification", "tests.live_suite"]
   }
 }

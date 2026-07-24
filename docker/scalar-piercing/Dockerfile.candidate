@@ -6,8 +6,16 @@ ARG DAFT_WHEEL_SHA256
 ARG PYARROW_WHEEL_SHA256
 ARG RAY_WHEEL_SHA256
 ARG UDFJIT_WHEEL_SHA256
+ARG SOURCE_GIT_COMMIT
+ARG CINDERX_COMMIT
+ARG CINDERX_SOURCE_TREE_SHA256
+ARG CINDERX_PATCH_SHA256
 
 LABEL org.opencontainers.image.title="python-udf-jit scalar piercing candidate" \
+      org.opencontainers.image.revision="${SOURCE_GIT_COMMIT}" \
+      org.python-udf-jit.cinderx-commit="${CINDERX_COMMIT}" \
+      org.python-udf-jit.cinderx-source-tree-sha256="${CINDERX_SOURCE_TREE_SHA256}" \
+      org.python-udf-jit.cinderx-patch-sha256="${CINDERX_PATCH_SHA256}" \
       org.python-udf-jit.cinderx-wheel-sha256="${CINDERX_WHEEL_SHA256}" \
       org.python-udf-jit.daft-wheel-sha256="${DAFT_WHEEL_SHA256}" \
       org.python-udf-jit.pyarrow-wheel-sha256="${PYARROW_WHEEL_SHA256}" \

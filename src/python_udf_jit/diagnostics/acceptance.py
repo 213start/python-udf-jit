@@ -7,6 +7,23 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from python_udf_jit.diagnostics.cinderx_evidence import (
+    EXPECTED_UDF_RUNTIME_CASES,
+    validate_cinderx_evidence,
+)
+from python_udf_jit.diagnostics.environment_evidence import (
+    validate_auth_evidence,
+    validate_cleanup_evidence,
+    validate_hygiene_evidence,
+    validate_secret_evidence,
+)
+from python_udf_jit.diagnostics.invalidation_evidence import (
+    validate_invalidation_evidence,
+)
+from python_udf_jit.diagnostics.test_evidence import (
+    validate_unittest_evidence,
+)
+
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -14,6 +31,24 @@ _STATUSES = frozenset({"pass", "fail", "inconclusive", "incomplete", "stop"})
 _TIERS = frozenset({"unit", "integration", "system"})
 _EXPECTED_REQUIREMENTS = frozenset(f"R{index}" for index in range(1, 21))
 _EXPECTED_ACCEPTANCE_EXAMPLES = frozenset(f"AE{index}" for index in range(1, 9))
+_UNIT_REQUIRED_TESTS = (
+    "test_contract_traces_every_requirement_and_acceptance_example",
+    "test_exact_static_runtime_and_python_gates_produce_proof",
+    "test_fixture_never_imports_or_calls_plugin_internals",
+    "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
+)
+_INTEGRATION_REQUIRED_TESTS = (
+    "test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip",
+    "test_exact_live_topology_is_accepted",
+    "test_partitioned_float_projection_runs_only_on_worker_nodes",
+    "test_head_owned_object_ref_reaches_both_workers",
+    "test_both_workers_execute_region_driven_cinderx_scalar_load",
+    "test_same_production_plan_compiles_and_executes_on_each_worker",
+)
+_LIVE_REQUIRED_TESTS = (
+    "test_ae1_to_ae8_pass_and_keep_natural_coverage_separate",
+    "test_live_evidence_is_supplied_by_the_external_harness",
+)
 
 
 class AcceptanceContractError(ValueError):
@@ -329,6 +364,273 @@ def _source_gates(
     return clean_source, image_identity
 
 
+def _cinderx_source_identity(
+    source: Mapping[str, Any],
+    base: Mapping[str, Any],
+    infrastructure: Mapping[str, Any],
+) -> str:
+    raw_proof = infrastructure.get("cinderx")
+    manifest = base.get("manifest")
+    if not isinstance(raw_proof, Mapping) or not isinstance(manifest, Mapping):
+        return "incomplete"
+    identity = raw_proof.get("identity")
+    required_source = (
+        "cinderx_commit",
+        "cinderx_source_tree_sha256",
+        "cinderx_patch_sha256",
+    )
+    required_identity = (
+        "cinderx_commit",
+        "source_tree_sha256",
+        "patch_sha256",
+        "image_digest",
+        "python_version",
+        "soabi",
+        "py_enable_shared",
+        "python_library",
+    )
+    if (
+        any(field not in source for field in required_source)
+        or not isinstance(identity, Mapping)
+        or any(field not in identity for field in required_identity)
+        or "cinderx_commit" not in manifest
+    ):
+        return "incomplete"
+    cinderx_commit = source["cinderx_commit"]
+    source_tree = source["cinderx_source_tree_sha256"]
+    patch = source["cinderx_patch_sha256"]
+    valid = (
+        validate_cinderx_evidence(raw_proof) == "pass"
+        and isinstance(cinderx_commit, str)
+        and _GIT_COMMIT.fullmatch(cinderx_commit) is not None
+        and _valid_sha256(source_tree)
+        and _valid_sha256(patch)
+        and raw_proof.get("schema_version") == 1
+        and raw_proof.get("status") == "pass"
+        and _valid_sha256(raw_proof.get("proof_sha256"))
+        and identity.get("cinderx_commit")
+        == manifest.get("cinderx_commit")
+        == cinderx_commit
+        and identity.get("source_tree_sha256") == source_tree
+        and identity.get("patch_sha256") == patch
+        and isinstance(identity.get("image_digest"), str)
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(identity["image_digest"])
+        )
+        is not None
+        and identity.get("python_version") == "3.14.3"
+        and identity.get("soabi") == "cpython-314-aarch64-linux-gnu"
+        and identity.get("py_enable_shared") == 0
+        and identity.get("python_library")
+        == "/opt/python314/lib/libpython3.14.a"
+    )
+    return "pass" if valid else "fail"
+
+
+def _cinderx_test_status(infrastructure: Mapping[str, Any]) -> str:
+    raw_proof = infrastructure.get("cinderx")
+    if not isinstance(raw_proof, Mapping):
+        return "incomplete"
+    runtime = raw_proof.get("runtime_tests")
+    python_tests = raw_proof.get("python_tests")
+    artifacts = raw_proof.get("artifacts")
+    if (
+        not isinstance(runtime, Mapping)
+        or not isinstance(python_tests, Mapping)
+        or not isinstance(artifacts, Mapping)
+    ):
+        return "incomplete"
+    required_runtime = (
+        "normal",
+        "lightweight_frames_deopt",
+        "osr",
+        "udf_cases",
+    )
+    required_python = (
+        "release_pytest",
+        "adaptive_libtest",
+        "official_skip_libtest",
+        "udf_data_intrinsic",
+    )
+    if (
+        any(field not in runtime for field in required_runtime)
+        or any(field not in python_tests for field in required_python)
+        or len(artifacts) != 8
+    ):
+        return "incomplete"
+
+    expected_counts = {
+        "normal": 1176,
+        "lightweight_frames_deopt": 66,
+        "osr": 130,
+    }
+    runtime_valid = all(
+        isinstance(runtime.get(name), Mapping)
+        and runtime[name].get("passed") == count
+        and runtime[name].get("failed") == 0
+        for name, count in expected_counts.items()
+    )
+    release = python_tests["release_pytest"]
+    adaptive = python_tests["adaptive_libtest"]
+    official = python_tests["official_skip_libtest"]
+    targeted = python_tests["udf_data_intrinsic"]
+    python_valid = (
+        isinstance(release, Mapping)
+        and release.get("passed") == 1331
+        and release.get("failed") == 0
+        and release.get("errors") == 0
+        and isinstance(adaptive, Mapping)
+        and adaptive.get("module_count") == 456
+        and adaptive.get("returncode") == 0
+        and isinstance(official, Mapping)
+        and official.get("module_count") == 26
+        and official.get("returncode") == 0
+        and isinstance(targeted, Mapping)
+        and targeted.get("passed") == 5
+        and targeted.get("failed") == 0
+    )
+    valid = (
+        validate_cinderx_evidence(raw_proof) == "pass"
+        and runtime_valid
+        and runtime.get("udf_cases") == list(EXPECTED_UDF_RUNTIME_CASES)
+        and python_valid
+        and all(_valid_sha256(value) for value in artifacts.values())
+    )
+    return "pass" if valid else "fail"
+
+
+def _python_test_statuses(
+    infrastructure: Mapping[str, Any],
+    *,
+    run_id: str,
+    cluster_epoch: str,
+    source_git_commit: object,
+) -> tuple[str, str, str]:
+    proofs = infrastructure.get("python_test_proofs")
+    if not isinstance(proofs, Mapping):
+        return "incomplete", "incomplete", "incomplete"
+    if (
+        not isinstance(source_git_commit, str)
+        or _GIT_COMMIT.fullmatch(source_git_commit) is None
+    ):
+        return "fail", "fail", "fail"
+    unit = validate_unittest_evidence(
+        proofs.get("unit"),
+        gate_id="python.unit",
+        tier="unit",
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
+        source_git_commit=source_git_commit,
+        required_tests=_UNIT_REQUIRED_TESTS,
+        minimum_test_count=114,
+        allow_skips=False,
+    )
+    integration = validate_unittest_evidence(
+        proofs.get("integration"),
+        gate_id="python.integration",
+        tier="integration",
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
+        source_git_commit=source_git_commit,
+        required_tests=_INTEGRATION_REQUIRED_TESTS,
+        minimum_test_count=29,
+        allow_skips=False,
+    )
+    live = validate_unittest_evidence(
+        proofs.get("live"),
+        gate_id="python.live",
+        tier="system",
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
+        source_git_commit=source_git_commit,
+        required_tests=_LIVE_REQUIRED_TESTS,
+        minimum_test_count=12,
+        allow_skips=False,
+    )
+    return unit, integration, live
+
+
+def _measurement_status(
+    measurement: Mapping[str, Any],
+    *,
+    run_id: str,
+    cluster_epoch: str,
+    base: Mapping[str, Any],
+) -> str:
+    required = (
+        "schema_version",
+        "run_id",
+        "cluster_epoch",
+        "measurement_scope",
+        "units",
+        "sample_count",
+        "warmup_count",
+        "environment",
+        "off",
+        "auto",
+        "result_equivalent",
+        "speedup_gate_applied",
+    )
+    if any(field not in measurement for field in required):
+        return "incomplete"
+    environment = measurement["environment"]
+    off = measurement["off"]
+    auto = measurement["auto"]
+    manifest = base.get("manifest")
+    if (
+        not isinstance(environment, Mapping)
+        or not isinstance(off, Mapping)
+        or not isinstance(auto, Mapping)
+        or not isinstance(manifest, Mapping)
+    ):
+        return "fail"
+    sample_count = measurement["sample_count"]
+    off_samples = off.get("samples_ns")
+    auto_samples = auto.get("samples_ns")
+    expected_manifest = manifest.get("candidate_manifest_sha256")
+    manifest_valid = (
+        _valid_sha256(environment.get("manifest_sha256"))
+        and (
+            expected_manifest is None
+            or environment.get("manifest_sha256") == expected_manifest
+        )
+    )
+    valid = (
+        measurement["schema_version"] == 1
+        and measurement["run_id"] == run_id
+        and measurement["cluster_epoch"] == cluster_epoch
+        and measurement["measurement_scope"]
+        == "small_e2e_validation_not_release_performance"
+        and measurement["units"] == "nanoseconds"
+        and isinstance(sample_count, int)
+        and not isinstance(sample_count, bool)
+        and 1 <= sample_count <= 20
+        and measurement["warmup_count"] == 1
+        and environment.get("python_version") == "3.14.3"
+        and environment.get("platform_machine") == "aarch64"
+        and environment.get("daft_version") == "0.7.2"
+        and environment.get("ray_version") == "2.55.0"
+        and environment.get("pyarrow_version") == "22.0.0"
+        and manifest_valid
+        and isinstance(off_samples, list)
+        and isinstance(auto_samples, list)
+        and len(off_samples) == len(auto_samples) == sample_count
+        and all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (*off_samples, *auto_samples)
+        )
+        and isinstance(off.get("warmup_ns"), int)
+        and off["warmup_ns"] >= 0
+        and isinstance(auto.get("cold_compile_window_ns"), int)
+        and auto["cold_compile_window_ns"] >= 0
+        and _valid_sha256(off.get("result_digest"))
+        and off.get("result_digest") == auto.get("result_digest")
+        and measurement["result_equivalent"] is True
+        and measurement["speedup_gate_applied"] is False
+    )
+    return "pass" if valid else "fail"
+
+
 def _gate_statuses(
     contract: AcceptanceContract, evidence: Mapping[str, Any]
 ) -> dict[str, str]:
@@ -349,6 +651,21 @@ def _gate_statuses(
     infrastructure = _mapping(evidence.get("infrastructure"), "infrastructure")
     measurement = _mapping(evidence.get("measurement"), "measurement")
     clean_source, image_identity = _source_gates(source, base)
+    cinderx_source_identity = _cinderx_source_identity(
+        source, base, infrastructure
+    )
+    unit_tests, integration_tests, live_tests = _python_test_statuses(
+        infrastructure,
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
+        source_git_commit=source.get("git_commit"),
+    )
+    invalidation_negative = validate_invalidation_evidence(
+        infrastructure.get("invalidation"),
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
+        source_git_commit=str(source.get("git_commit", "")),
+    )
 
     with_column = _equivalent_scenario(
         off, auto, "with_column", require_non_empty=True
@@ -356,95 +673,57 @@ def _gate_statuses(
     with_columns = _equivalent_scenario(
         off, auto, "with_columns", require_non_empty=True
     )
-    cleanup = _combine(
-        *(
-            _external_boolean(infrastructure, field)
-            for field in (
-                "containers_removed",
-                "networks_removed",
-                "dashboard_port_closed",
-                "firewall_restored",
-                "routes_restored",
-                "token_removed",
-            )
-        )
+    cleanup = validate_cleanup_evidence(
+        infrastructure.get("environment_cleanup"),
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
     )
-    auth = _combine(
-        *(
-            _external_boolean(infrastructure, field)
-            for field in ("dashboard_loopback_only", "other_ray_ports_unpublished")
-        ),
-        (
-            "pass"
-            if infrastructure.get("dashboard_unauthenticated_status") == 401
-            and infrastructure.get("dashboard_wrong_token_status") == 403
-            and infrastructure.get("dashboard_authenticated_status") == 200
-            else (
-                "incomplete"
-                if any(
-                    field not in infrastructure
-                    for field in (
-                        "dashboard_unauthenticated_status",
-                        "dashboard_wrong_token_status",
-                        "dashboard_authenticated_status",
-                    )
-                )
-                else "fail"
-            )
-        ),
+    auth_proof = infrastructure.get("environment_auth")
+    auth = validate_auth_evidence(
+        auth_proof,
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
+    )
+    secret_hygiene = validate_secret_evidence(
+        auth_proof,
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
     )
     permissions_cleanup = _combine(
-        *(
-            _external_boolean(infrastructure, field)
-            for field in (
-                "raw_events_removed",
-                "report_permissions_0600",
-                "token_removed",
-            )
-        )
+        validate_hygiene_evidence(
+            infrastructure.get("evidence_hygiene"),
+            run_id=run_id,
+            cluster_epoch=cluster_epoch,
+        ),
+        cleanup,
     )
     cinderx_runtime = _combine(
-        _external_boolean(infrastructure, "cinderx_runtime_tests"),
-        _external_boolean(infrastructure, "cinderx_python_tests"),
+        _cinderx_test_status(infrastructure),
+        integration_tests,
     )
-    measurement_gate = _combine(
-        _external_boolean(measurement, "completed"),
-        _external_boolean(measurement, "semantic_equivalent"),
-        (
-            "pass"
-            if measurement.get("speedup_gate_applied") is False
-            else (
-                "incomplete"
-                if "speedup_gate_applied" not in measurement
-                else "fail"
-            )
-        ),
+    measurement_gate = _measurement_status(
+        measurement,
+        run_id=run_id,
+        cluster_epoch=cluster_epoch,
+        base=base,
     )
     statuses = {
         "provenance.clean_source": clean_source,
         "provenance.image_identity": image_identity,
-        "tests.unit_suite": _external_boolean(
-            infrastructure, "python_unit_tests"
-        ),
-        "tests.integration_suite": _external_boolean(
-            infrastructure, "python_integration_tests"
-        ),
-        "tests.live_suite": _external_boolean(
-            infrastructure, "live_tests_executed"
-        ),
+        "provenance.cinderx_source_identity": cinderx_source_identity,
+        "tests.unit_suite": unit_tests,
+        "tests.integration_suite": integration_tests,
+        "tests.live_suite": live_tests,
         "environment.locked_manifest": _base_check(base, "manifest"),
         "environment.three_node_topology": _base_check(base, "readiness"),
         "environment.auth_loopback": auth,
-        "environment.secret_hygiene": _external_boolean(
-            infrastructure, "secret_hygiene"
-        ),
+        "environment.secret_hygiene": secret_hygiene,
         "environment.cleanup": cleanup,
-        "integration.object_store_data_plane": _external_boolean(
-            infrastructure, "object_store_data_plane"
-        ),
+        "integration.object_store_data_plane": integration_tests,
         "integration.cinderx_runtime": cinderx_runtime,
-        "integration.worker_pool_qualification": _base_check(
-            base, "worker_pool_qualification"
+        "integration.worker_pool_qualification": _combine(
+            _base_check(base, "worker_pool_qualification"),
+            integration_tests,
         ),
         "system.transparent_bootstrap": _transparent_bootstrap(off, auto),
         "system.supported_jit": _base_check(base, "supported_hit"),
@@ -466,6 +745,7 @@ def _gate_statuses(
         "evidence.compile_hit_chain": _base_check(base, "supported_hit"),
         "evidence.attempt_identity": _base_check(base, "attempt_attribution"),
         "evidence.phase_identity": _base_check(base, "evidence_identity"),
+        "evidence.invalidation_negative": invalidation_negative,
         "evidence.no_head_data_plane": _base_check(
             base, "data_plane_isolation"
         ),
@@ -518,6 +798,15 @@ def aggregate_formal_acceptance(
         ),
         "source": {
             "git_commit": evidence["source"].get("git_commit", ""),
+            "cinderx_commit": evidence["source"].get(
+                "cinderx_commit", ""
+            ),
+            "cinderx_source_tree_sha256": evidence["source"].get(
+                "cinderx_source_tree_sha256", ""
+            ),
+            "cinderx_patch_sha256": evidence["source"].get(
+                "cinderx_patch_sha256", ""
+            ),
             "image_digest": evidence["source"].get("image_digest", ""),
             "udf_jit_wheel_sha256": evidence["source"].get(
                 "udf_jit_wheel_sha256", ""
