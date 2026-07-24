@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://python-udf-jit.invalid/scalar-piercing-measurement-v1.schema.json",
+  "title": "Scalar piercing validation measurement",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "cluster_epoch",
+    "measurement_scope",
+    "units",
+    "sample_count",
+    "warmup_count",
+    "environment",
+    "off",
+    "auto",
+    "result_equivalent",
+    "speedup_gate_applied",
+    "notes"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "cluster_epoch": {"type": "string", "minLength": 1, "maxLength": 128},
+    "measurement_scope": {"const": "small_e2e_validation_not_release_performance"},
+    "units": {"const": "nanoseconds"},
+    "sample_count": {"type": "integer", "minimum": 1, "maximum": 20},
+    "warmup_count": {"const": 1},
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["python_version", "platform_machine", "daft_version", "ray_version", "pyarrow_version", "manifest_sha256"],
+      "properties": {
+        "python_version": {"type": "string"},
+        "platform_machine": {"type": "string"},
+        "daft_version": {"type": "string"},
+        "ray_version": {"type": "string"},
+        "pyarrow_version": {"type": "string"},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "off": {"$ref": "#/$defs/offMeasurement"},
+    "auto": {"$ref": "#/$defs/autoMeasurement"},
+    "result_equivalent": {"const": true},
+    "speedup_gate_applied": {"const": false},
+    "notes": {"type": "array", "items": {"type": "string"}, "minItems": 2}
+  },
+  "$defs": {
+    "samples": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "minItems": 1,
+      "maxItems": 20
+    },
+    "offMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warmup_ns", "samples_ns", "median_ns", "result_digest"],
+      "properties": {
+        "warmup_ns": {"type": "integer", "minimum": 0},
+        "samples_ns": {"$ref": "#/$defs/samples"},
+        "median_ns": {"type": "integer", "minimum": 0},
+        "result_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "autoMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cold_compile_window_ns", "samples_ns", "median_ns", "result_digest"],
+      "properties": {
+        "cold_compile_window_ns": {"type": "integer", "minimum": 0},
+        "samples_ns": {"$ref": "#/$defs/samples"},
+        "median_ns": {"type": "integer", "minimum": 0},
+        "result_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}
