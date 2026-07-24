@@ -92,7 +92,6 @@ def _environment() -> dict[str, str]:
 
 def _write_report(path: Path, report: dict[str, object]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
     payload = json.dumps(
         report, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("ascii")

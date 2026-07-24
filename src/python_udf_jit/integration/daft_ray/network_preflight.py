@@ -196,7 +196,6 @@ def preflight_compose_networks(
 
 def _write_report(path: Path, report: NetworkPreflightReport) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="ascii") as stream:
         json.dump(

@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
+
+from tests.system.private_output import write_private_json
 
 
 def _run(arguments: list[str]) -> bytes:
@@ -68,21 +69,7 @@ def capture() -> dict[str, object]:
 
 
 def write_output(path: Path, document: dict[str, object]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    payload = json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("ascii")
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        0o600,
-    )
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload)
+    write_private_json(path, document)
 
 
 def main() -> None:

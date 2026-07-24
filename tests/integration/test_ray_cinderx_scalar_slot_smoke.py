@@ -188,7 +188,6 @@ class RayCinderXScalarSlotSmokeTests(unittest.TestCase):
                 }
                 path = Path(output_path)
                 path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                os.chmod(path.parent, 0o700)
                 descriptor = os.open(
                     path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
                 )

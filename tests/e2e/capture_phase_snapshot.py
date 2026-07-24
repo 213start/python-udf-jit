@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import subprocess
 from pathlib import Path
+
+from tests.system.private_output import write_private_json
 
 
 _ROLES = ("ray-head-driver", "ray-worker-1", "ray-worker-2")
@@ -93,17 +94,7 @@ def capture(
 
 
 def _write(path: Path, document: dict[str, object]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="ascii") as stream:
-        json.dump(
-            document,
-            stream,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
+    write_private_json(path, document)
 
 
 def main() -> None:
