@@ -1,0 +1,1646 @@
+# CinderX runtime candidate overlay for scalar UDF JIT piercing.
+# Upstream commit: ac09c68527153b43cc8b4f16f36d9245cb861d12
+# Baseline runtime tree SHA-256: d29b9cb3512f7cca22d9fefece56484f705c4049e724ec6e99f04153477ff5de
+# Candidate runtime tree SHA-256: 0a20e7ad522bbe6f765d73fc42c75f49055687e31d179cae700b416dafb53850
+#
+--- a/cinderx/Jit/hir/function.cpp
++++ b/cinderx/Jit/hir/function.cpp
+@@ -3,6 +3,7 @@
+ #include "cinderx/Jit/hir/function.h"
+ 
+ #include <algorithm>
++#include <limits>
+ 
+ namespace jit::hir {
+ 
+@@ -86,16 +87,37 @@
+ 
+ namespace {
+ 
+-const unsigned char* parseExceptionTableVarint(
+-    const unsigned char* cursor,
++bool parseExceptionTableVarint(
++    const unsigned char*& cursor,
++    const unsigned char* end,
++    bool is_entry_start,
+     int* result) {
+-  int value = cursor[0] & 63;
++  if (cursor >= end) {
++    return false;
++  }
++  if (((cursor[0] & 128) != 0) != is_entry_start) {
++    return false;
++  }
++
++  unsigned int value = cursor[0] & 63;
+   while ((cursor[0] & 64) != 0) {
+     cursor++;
+-    value = (value << 6) | (cursor[0] & 63);
+-  }
+-  *result = value;
+-  return cursor + 1;
++    if (cursor >= end) {
++      return false;
++    }
++    if ((cursor[0] & 128) != 0) {
++      return false;
++    }
++
++    unsigned int chunk = cursor[0] & 63;
++    if (value > (std::numeric_limits<int>::max() - chunk) >> 6) {
++      return false;
++    }
++    value = (value << 6) | chunk;
++  }
++  *result = static_cast<int>(value);
++  cursor++;
++  return true;
+ }
+ 
+ bool isInExceptionProtectedRange(
+@@ -110,11 +132,13 @@
+     int start = 0;
+     int size = 0;
+     int unused = 0;
+-    cursor = parseExceptionTableVarint(cursor, &start);
+-    cursor = parseExceptionTableVarint(cursor, &size);
+-    cursor = parseExceptionTableVarint(cursor, &unused);
+-    cursor = parseExceptionTableVarint(cursor, &unused);
+-    if (target_index >= start && target_index < start + size) {
++    if (!parseExceptionTableVarint(cursor, end, true, &start) ||
++        !parseExceptionTableVarint(cursor, end, false, &size) ||
++        !parseExceptionTableVarint(cursor, end, false, &unused) ||
++        !parseExceptionTableVarint(cursor, end, false, &unused)) {
++      return true;
++    }
++    if (target_index >= start && target_index - start < size) {
+       return true;
+     }
+   }
+--- a/cinderx/Jit/hir/hir.cpp
++++ b/cinderx/Jit/hir/hir.cpp
+@@ -401,6 +401,7 @@
+     case Opcode::kLoadFieldAddress:
+     case Opcode::kLoadFunctionIndirect:
+     case Opcode::kLoadGlobalCached:
++    case Opcode::kLoadUdfDataF64:
+     case Opcode::kLoadSplitDictItem:
+     case Opcode::kLoadTupleItem:
+     case Opcode::kLoadTypeAttrCacheEntryType:
+@@ -782,6 +783,7 @@
+     case Opcode::kLoadFunctionIndirect:
+     case Opcode::kLoadGlobal:
+     case Opcode::kLoadGlobalCached:
++    case Opcode::kLoadUdfDataF64:
+     case Opcode::kLoadMethod:
+     case Opcode::kLoadMethodCached:
+     case Opcode::kLoadMethodSuper:
+--- a/cinderx/Jit/hir/hir.h
++++ b/cinderx/Jit/hir/hir.h
+@@ -1186,6 +1186,11 @@
+   void* addr_;
+ };
+ 
++// Read a float64 value from a process-local scalar-slot capsule.  This may
++// only be emitted from the exact `_udf_data_load_f64(exact_guard(slot))`
++// sequence; the operand is the result of the guard, never the unguarded slot.
++DEFINE_SIMPLE_INSTR(LoadUdfDataF64, (TObject), HasOutput, Operands<1>);
++
+ // Invokes a function with a static entry point, where we can
+ // directly provide the arguments using the x64 calling convention.
+ class INSTR_CLASS(
+--- a/cinderx/Jit/hir/hir_ops.h
++++ b/cinderx/Jit/hir/hir_ops.h
+@@ -113,6 +113,7 @@
+   V(LoadFunctionIndirect)          \
+   V(LoadGlobalCached)              \
+   V(LoadGlobal)                    \
++  V(LoadUdfDataF64)                \
+   V(LoadMethod)                    \
+   V(LoadMethodCached)              \
+   V(LoadModuleAttrCached)          \
+--- a/cinderx/Jit/hir/instr_effects.cpp
++++ b/cinderx/Jit/hir/instr_effects.cpp
+@@ -49,6 +49,7 @@
+     case Opcode::kIsCompactLong:
+     case Opcode::kIsNegativeAndErrOccurred:
+     case Opcode::kLoadEvalBreaker:
++    case Opcode::kLoadUdfDataF64:
+     case Opcode::kLoadVarObjectSize:
+     case Opcode::kLongCompare:
+     case Opcode::kMakeCell:
+@@ -428,6 +429,7 @@
+     case Opcode::kLoadFieldAddress:
+     case Opcode::kLoadFunctionIndirect:
+     case Opcode::kLoadGlobalCached:
++    case Opcode::kLoadUdfDataF64:
+     case Opcode::kLoadSplitDictItem:
+     case Opcode::kLoadTupleItem:
+     case Opcode::kLoadTypeAttrCacheEntryType:
+--- a/cinderx/Jit/hir/parser.cpp
++++ b/cinderx/Jit/hir/parser.cpp
+@@ -755,6 +755,11 @@
+       auto idx = ParseRegister();
+       auto array_unused = ParseRegister();
+       NEW_INSTR(LoadArrayItem, dst, ob_item, idx, array_unused, 0, TObject);
++      break;
++    }
++    case Opcode::kLoadUdfDataF64: {
++      auto guarded_slot = ParseRegister();
++      NEW_INSTR(LoadUdfDataF64, dst, guarded_slot);
+       break;
+     }
+     case Opcode::kPhi: {
+--- a/cinderx/Jit/hir/pass.cpp
++++ b/cinderx/Jit/hir/pass.cpp
+@@ -276,6 +276,8 @@
+       return static_cast<const LoadField&>(instr).type();
+     case Opcode::kLoadFieldAddress:
+       return TCPtr;
++    case Opcode::kLoadUdfDataF64:
++      return TCDouble;
+     case Opcode::kCallStatic: {
+       auto& call = static_cast<const CallStatic&>(instr);
+       return call.ret_type();
+--- a/cinderx/Jit/hir/printer.cpp
++++ b/cinderx/Jit/hir/printer.cpp
+@@ -278,6 +278,7 @@
+     case Opcode::kLoadCurrentFunc:
+     case Opcode::kLoadFrame:
+     case Opcode::kLoadEvalBreaker:
++    case Opcode::kLoadUdfDataF64:
+     case Opcode::kAtQuiescentState:
+     case Opcode::kLoadFieldAddress:
+     case Opcode::kLoadVarObjectSize:
+--- a/cinderx/Jit/hir/simplify.cpp
++++ b/cinderx/Jit/hir/simplify.cpp
+@@ -1874,6 +1874,16 @@
+     BorrowedRef<PyTypeObject> type{ty.runtimePyType()};
+ 
+     if (type == &PyModule_Type || type == &Ci_StrictModule_Type) {
++      BorrowedRef<PyUnicodeObject> attr_name{load_attr->name()};
++      // TODO: This is a temporary mitigation for package search path state.
++      // LoadModuleAttrCached should eventually be fixed by making global
++      // cache / dict watcher invalidation correctly cover importlib-managed
++      // module __path__ updates, then this per-attribute exclusion can be
++      // removed.
++      if (type == &PyModule_Type &&
++          PyUnicode_CompareWithASCIIString(attr_name, "__path__") == 0) {
++        return nullptr;
++      }
+       return env.emit<LoadModuleAttrCached>(
+           load_attr->GetOperand(0),
+           load_attr->name_idx(),
+@@ -2146,6 +2156,99 @@
+     }
+   }
+   return nullptr;
++}
++
++bool isExactUdfScalarHelper(Register* callable, PyCFunction expected) {
++  Type callable_type = callable->type();
++  if (!callable_type.hasObjectSpec()) {
++    return false;
++  }
++  PyObject* callable_obj = callable_type.objectSpec();
++  if (Py_TYPE(callable_obj) != &PyCFunction_Type) {
++    return false;
++  }
++  auto* function = reinterpret_cast<PyCFunctionObject*>(callable_obj);
++  return function->m_ml->ml_meth == expected;
++}
++
++const VectorCall* guardedUdfScalarProducer(Register* value) {
++  while (value->instr()->IsAssign() || value->instr()->IsCheckExc()) {
++    value = value->instr()->GetOperand(0);
++  }
++  if (!value->instr()->IsVectorCall()) {
++    return nullptr;
++  }
++  return static_cast<const VectorCall*>(value->instr());
++}
++
++bool isAdjacentUdfGuardChain(const VectorCall* guard, const VectorCall* load) {
++  if (guard->block() != load->block()) {
++    return false;
++  }
++
++  Register* guarded_value = guard->output();
++  bool after_guard = false;
++  for (const Instr& candidate : *guard->block()) {
++    if (&candidate == guard) {
++      after_guard = true;
++      continue;
++    }
++    if (!after_guard) {
++      continue;
++    }
++    if (&candidate == load) {
++      return guarded_value == load->arg(0);
++    }
++    if (candidate.IsUseType() || candidate.IsSnapshot() ||
++        candidate.IsUpdatePrevInstr()) {
++      continue;
++    }
++    if ((candidate.IsAssign() || candidate.IsCheckExc()) &&
++        candidate.GetOperand(0) == guarded_value) {
++      guarded_value = candidate.output();
++      continue;
++    }
++    // Snapshot and UpdatePrevInstr only preserve deoptimization/bytecode
++    // metadata and cannot execute Python or mutate the slot. Calls, branches,
++    // and any other instruction may end the borrow, mutate the slot, or move
++    // the load across an unmodelled effect.
++    return false;
++  }
++  return false;
++}
++
++Register* trySimplifyGuardedUdfDataLoad(Env& env, const VectorCall* instr) {
++#ifdef Py_GIL_DISABLED
++  // A separate thread could end the borrow after the Python guard returns but
++  // before the native load.  Keep the checked Python call on free-threading
++  // builds until the capability protocol has an atomic guard+load operation.
++  (void)env;
++  (void)instr;
++  return nullptr;
++#endif
++  if (instr->frameState() == nullptr ||
++      instr->flags() != CallFlags::None || instr->numArgs() != 1 ||
++      !isExactUdfScalarHelper(
++          instr->func(), reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadF64))) {
++    return nullptr;
++  }
++
++  const VectorCall* guard_call = guardedUdfScalarProducer(instr->arg(0));
++  if (guard_call == nullptr || guard_call->flags() != CallFlags::None ||
++      guard_call->numArgs() != 1 ||
++      !isExactUdfScalarHelper(
++          guard_call->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfGuardDataHandle)) ||
++      !isAdjacentUdfGuardChain(guard_call, instr)) {
++    return nullptr;
++  }
++
++  // Preserve the exact global identities on which the native lowering relies.
++  // The primitive load consumes the checked guard result, never guard->arg(0).
++  env.emit<UseType>(guard_call->func(), guard_call->func()->type());
++  env.emit<UseType>(instr->func(), instr->func()->type());
++  Register* value = env.emit<LoadUdfDataF64>(instr->arg(0));
++  return env.emit<PrimitiveBox>(value, TCDouble, *instr->frameState());
+ }
+ 
+ Register* simplifyVectorCallStatic(Env& env, const VectorCall* instr) {
+@@ -2253,6 +2356,9 @@
+ }
+ 
+ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
++  if (Register* result = trySimplifyGuardedUdfDataLoad(env, instr)) {
++    return result;
++  }
+   if (Register* result = simplifyVectorCallStatic(env, instr)) {
+     return result;
+   }
+--- a/cinderx/Jit/inline_cache.cpp
++++ b/cinderx/Jit/inline_cache.cpp
+@@ -72,8 +72,6 @@
+ TypeWatcher<LoadTypeAttrCache> ltac_watcher;
+ TypeWatcher<LoadMethodCache> lm_watcher;
+ TypeWatcher<LoadTypeMethodCache> ltm_watcher;
+-
+-constexpr uintptr_t kKindMask = 0x07;
+ 
+ // Sentinel PyTypeObject that must never escape into user code.
+ #pragma clang diagnostic push
+@@ -554,17 +552,8 @@
+   reset();
+ }
+ 
+-PyTypeObject* AttributeMutator::type() const {
+-  // clear tagged bits and return
+-  return reinterpret_cast<PyTypeObject*>(type_ & ~kKindMask);
+-}
+-
+ void AttributeMutator::reset() {
+   type_ = 0;
+-}
+-
+-bool AttributeMutator::isEmpty() const {
+-  return type_ == 0;
+ }
+ 
+ void AttributeMutator::set_combined(PyTypeObject* type) {
+@@ -676,13 +665,9 @@
+ 
+ void AttributeMutator::set_type(PyTypeObject* type, Kind kind) {
+   auto raw = reinterpret_cast<uintptr_t>(type);
+-  JIT_CHECK((raw & kKindMask) == 0, "PyTypeObject* expected to be aligned");
++  JIT_CHECK((raw & kindMask()) == 0, "PyTypeObject* expected to be aligned");
+   auto mask = static_cast<uintptr_t>(kind);
+   type_ = raw | mask;
+-}
+-
+-AttributeMutator::Kind AttributeMutator::get_kind() const {
+-  return static_cast<Kind>(type_ & kKindMask);
+ }
+ 
+ AttributeCache::AttributeCache() {
+@@ -737,10 +722,6 @@
+       }
+     }
+   }
+-}
+-
+-std::span<AttributeMutator> AttributeCache::entries() {
+-  return {entries_, getConfig().attr_cache_size};
+ }
+ 
+ AttributeMutator* AttributeCache::findEmptyEntry() {
+--- a/cinderx/Jit/inline_cache.h
++++ b/cinderx/Jit/inline_cache.h
+@@ -98,9 +98,14 @@
+       "Kind enum should fit in 3 bits");
+ 
+   AttributeMutator();
+-  PyTypeObject* type() const;
++  PyTypeObject* type() const {
++    // clear tagged bits and return
++    return reinterpret_cast<PyTypeObject*>(type_ & ~kindMask());
++  }
+   void reset();
+-  bool isEmpty() const;
++  bool isEmpty() const {
++    return type_ == 0;
++  }
+   void set_combined(PyTypeObject* type);
+   void set_data_descr(PyTypeObject* type, PyObject* descr);
+   void set_member_descr(PyTypeObject* type, PyObject* descr);
+@@ -135,7 +140,9 @@
+ 
+  private:
+   void set_type(PyTypeObject* type, Kind kind);
+-  Kind get_kind() const;
++  Kind get_kind() const {
++    return static_cast<Kind>(type_ & kindMask());
++  }
+ 
+   uintptr_t type_; // This value stores both a PyTypeObject* for the type object
+                    // and the Kind enum value which are bitpacked together to
+@@ -161,7 +168,9 @@
+   }
+ 
+  protected:
+-  std::span<AttributeMutator> entries();
++  std::span<AttributeMutator> entries() {
++    return {entries_, getConfig().attr_cache_size};
++  }
+ 
+   AttributeMutator* findEmptyEntry();
+ 
+--- a/cinderx/Jit/jit_rt.cpp
++++ b/cinderx/Jit/jit_rt.cpp
+@@ -36,8 +36,283 @@
+ #include "internal/pycore_qsbr.h"
+ #endif
+ 
++#include <atomic>
+ #include <cmath>
++#include <cstdint>
+ #include <limits>
++#include <memory>
++#include <mutex>
++#include <unordered_map>
++
++#ifdef WIN32
++#include <process.h>
++#else
++#include <unistd.h>
++#endif
++
++namespace {
++
++constexpr const char* kUdfScalarSlotCapsuleName =
++    "cinderjit._udf_scalar_slot_f64.v1";
++constexpr uint64_t kUdfScalarSlotMagic = 0x554446534c4f5431ULL;
++constexpr uint64_t kUdfScalarSlotDeadMagic = 0x5544464445414431ULL;
++
++struct UdfScalarSlot {
++  uint64_t magic{kUdfScalarSlotMagic};
++  uint64_t owner_pid{0};
++  uint64_t generation{0};
++  mutable std::mutex mutex;
++  bool borrowed{false};
++  bool released{false};
++  bool initialized{false};
++  double value{0.0};
++};
++
++std::atomic<uint64_t> g_udf_scalar_slot_generation{1};
++std::mutex g_udf_scalar_slots_mutex;
++std::unordered_map<PyObject*, std::unique_ptr<UdfScalarSlot>>
++    g_udf_scalar_slots;
++
++uint64_t udfScalarSlotProcessId() {
++#ifdef WIN32
++  return static_cast<uint64_t>(_getpid());
++#else
++  return static_cast<uint64_t>(getpid());
++#endif
++}
++
++void udfScalarSlotCapsuleDestructor(PyObject* capsule) {
++  std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
++  auto it = g_udf_scalar_slots.find(capsule);
++  if (it == g_udf_scalar_slots.end()) {
++    return;
++  }
++  it->second->magic = kUdfScalarSlotDeadMagic;
++  g_udf_scalar_slots.erase(it);
++}
++
++UdfScalarSlot* checkedUdfScalarSlot(PyObject* capsule) {
++  if (!PyCapsule_CheckExact(capsule)) {
++    PyErr_SetString(
++        PyExc_TypeError, "expected a CinderX float64 scalar-slot capsule");
++    return nullptr;
++  }
++
++  std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
++  auto it = g_udf_scalar_slots.find(capsule);
++  if (it == g_udf_scalar_slots.end()) {
++    PyErr_SetString(
++        PyExc_RuntimeError, "unknown or forged scalar-slot capsule");
++    return nullptr;
++  }
++  UdfScalarSlot* slot = it->second.get();
++  void* pointer = PyCapsule_GetPointer(capsule, kUdfScalarSlotCapsuleName);
++  if (pointer == nullptr) {
++    return nullptr;
++  }
++  auto generation = reinterpret_cast<uintptr_t>(PyCapsule_GetContext(capsule));
++  if (PyErr_Occurred()) {
++    return nullptr;
++  }
++  if (pointer != slot || generation != slot->generation ||
++      slot->magic != kUdfScalarSlotMagic || slot->generation == 0) {
++    PyErr_SetString(PyExc_RuntimeError, "invalid scalar-slot generation");
++    return nullptr;
++  }
++  if (slot->owner_pid != udfScalarSlotProcessId()) {
++    PyErr_SetString(
++        PyExc_RuntimeError, "scalar-slot capsule belongs to another process");
++    return nullptr;
++  }
++  return slot;
++}
++
++bool requireLiveUdfScalarSlot(UdfScalarSlot* slot) {
++  if (slot->released) {
++    PyErr_SetString(
++        PyExc_RuntimeError, "scalar-slot capsule has been released");
++    return false;
++  }
++  return true;
++}
++
++bool requireBorrowedUdfScalarSlot(UdfScalarSlot* slot) {
++  if (!requireLiveUdfScalarSlot(slot)) {
++    return false;
++  }
++  if (!slot->borrowed) {
++    PyErr_SetString(PyExc_RuntimeError, "scalar-slot capsule is not borrowed");
++    return false;
++  }
++  return true;
++}
++
++bool requireInitializedUdfScalarSlot(UdfScalarSlot* slot) {
++  if (!requireBorrowedUdfScalarSlot(slot)) {
++    return false;
++  }
++  if (!slot->initialized) {
++    PyErr_SetString(
++        PyExc_RuntimeError, "scalar-slot capsule has no value for this borrow");
++    return false;
++  }
++  return true;
++}
++
++} // namespace
++
++PyObject* JITRT_UdfCreateScalarSlot(PyObject*, PyObject*) {
++  auto slot = std::make_unique<UdfScalarSlot>();
++  slot->owner_pid = udfScalarSlotProcessId();
++  slot->generation =
++      g_udf_scalar_slot_generation.fetch_add(1, std::memory_order_relaxed);
++  if (slot->generation == 0) {
++    slot->generation =
++        g_udf_scalar_slot_generation.fetch_add(1, std::memory_order_relaxed);
++  }
++
++  PyObject* capsule = PyCapsule_New(
++      slot.get(), kUdfScalarSlotCapsuleName, udfScalarSlotCapsuleDestructor);
++  if (capsule == nullptr) {
++    return nullptr;
++  }
++  if (PyCapsule_SetContext(
++          capsule, reinterpret_cast<void*>(slot->generation)) < 0) {
++    Py_DECREF(capsule);
++    return nullptr;
++  }
++
++  {
++    std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
++    g_udf_scalar_slots.emplace(capsule, std::move(slot));
++  }
++  return capsule;
++}
++
++PyObject* JITRT_UdfSetScalarSlot(PyObject*, PyObject* args) {
++  PyObject* capsule;
++  PyObject* value;
++  if (!PyArg_ParseTuple(args, "OO:_udf_set_scalar_slot", &capsule, &value)) {
++    return nullptr;
++  }
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock{slot->mutex};
++  if (!requireBorrowedUdfScalarSlot(slot)) {
++    return nullptr;
++  }
++  if (!PyFloat_CheckExact(value)) {
++    PyErr_SetString(
++        PyExc_TypeError, "scalar-slot value must be an exact float");
++    return nullptr;
++  }
++  slot->value = PyFloat_AS_DOUBLE(value);
++  slot->initialized = true;
++  Py_RETURN_NONE;
++}
++
++PyObject* JITRT_UdfBeginScalarSlotBorrow(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock{slot->mutex};
++  if (!requireLiveUdfScalarSlot(slot)) {
++    return nullptr;
++  }
++  if (slot->borrowed) {
++    PyErr_SetString(
++        PyExc_RuntimeError, "scalar-slot capsule is already borrowed");
++    return nullptr;
++  }
++  slot->borrowed = true;
++  slot->initialized = false;
++  slot->value = 0.0;
++  Py_RETURN_NONE;
++}
++
++PyObject* JITRT_UdfEndScalarSlotBorrow(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock{slot->mutex};
++  if (!requireLiveUdfScalarSlot(slot)) {
++    return nullptr;
++  }
++  if (!slot->borrowed) {
++    PyErr_SetString(PyExc_RuntimeError, "scalar-slot capsule is not borrowed");
++    return nullptr;
++  }
++  slot->borrowed = false;
++  slot->initialized = false;
++  slot->value = 0.0;
++  Py_RETURN_NONE;
++}
++
++PyObject* JITRT_UdfReleaseScalarSlot(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock{slot->mutex};
++  if (slot->released) {
++    Py_RETURN_NONE;
++  }
++  if (slot->borrowed) {
++    PyErr_SetString(
++        PyExc_RuntimeError,
++        "cannot release a scalar slot during an active borrow");
++    return nullptr;
++  }
++  slot->released = true;
++  slot->initialized = false;
++  slot->value = 0.0;
++  Py_RETURN_NONE;
++}
++
++PyObject* JITRT_UdfGuardDataHandle(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock{slot->mutex};
++  if (!requireInitializedUdfScalarSlot(slot)) {
++    return nullptr;
++  }
++  Py_INCREF(capsule);
++  return capsule;
++}
++
++PyObject* JITRT_UdfDataLoadF64(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock{slot->mutex};
++  if (!requireInitializedUdfScalarSlot(slot)) {
++    return nullptr;
++  }
++  return PyFloat_FromDouble(slot->value);
++}
++
++double JITRT_LoadUdfDataF64Unchecked(PyObject* capsule) {
++  // This helper is never exposed to Python.  The HIR rewrite passes the result
++  // of the exact guard call, not the original slot argument.  With that guard
++  // and the active borrow, release and mutation cannot invalidate this read.
++  std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
++  auto it = g_udf_scalar_slots.find(capsule);
++  JIT_CHECK(it != g_udf_scalar_slots.end(), "guarded scalar slot disappeared");
++  const UdfScalarSlot* slot = it->second.get();
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  JIT_CHECK(
++      slot->magic == kUdfScalarSlotMagic && !slot->released && slot->borrowed &&
++          slot->initialized && slot->owner_pid == udfScalarSlotProcessId(),
++      "guarded scalar slot became invalid before data load");
++  return slot->value;
++}
+ 
+ // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
+ // We use the same logic to turn **args, nargsf, and kwnames into
+--- a/cinderx/Jit/jit_rt.h
++++ b/cinderx/Jit/jit_rt.h
+@@ -27,6 +27,19 @@
+   double xmm0;
+   double xmm1;
+ };
++
++// Process-local scalar-slot helpers used by the python-udf-jit vertical slice.
++// The public helpers have normal Python-call semantics.  The unchecked load is
++// emitted only after an exact _udf_guard_data_handle() call has validated the
++// same capsule and established an active borrow.
++PyObject* JITRT_UdfCreateScalarSlot(PyObject* module, PyObject* unused);
++PyObject* JITRT_UdfSetScalarSlot(PyObject* module, PyObject* args);
++PyObject* JITRT_UdfBeginScalarSlotBorrow(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfEndScalarSlotBorrow(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfReleaseScalarSlot(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfGuardDataHandle(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfDataLoadF64(PyObject* module, PyObject* capsule);
++double JITRT_LoadUdfDataF64Unchecked(PyObject* capsule);
+ 
+ PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Debug(
+     PyFunctionObject* func,
+--- a/cinderx/Jit/lir/generator.cpp
++++ b/cinderx/Jit/lir/generator.cpp
+@@ -3489,6 +3489,14 @@
+         bbb.appendInstr(dest, Instruction::kLea, Ind{object, offset});
+         break;
+       }
++      case Opcode::kLoadUdfDataF64: {
++        auto instr = static_cast<const LoadUdfDataF64*>(&i);
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_LoadUdfDataF64Unchecked,
++            instr->GetOperand(0));
++        break;
++      }
+ 
+       case Opcode::kStoreField: {
+         auto instr = static_cast<const StoreField*>(&i);
+--- a/cinderx/Jit/pyjit.cpp
++++ b/cinderx/Jit/pyjit.cpp
+@@ -38,6 +38,7 @@
+ #include "cinderx/Jit/jit_flag_processor.h"
+ #include "cinderx/Jit/jit_gdb_support.h"
+ #include "cinderx/Jit/jit_list.h"
++#include "cinderx/Jit/jit_rt.h"
+ #include "cinderx/Jit/jit_time_log.h"
+ #include "cinderx/Jit/mmap_file.h"
+ #include "cinderx/Jit/osr.h"
+@@ -3467,6 +3468,34 @@
+ }
+ 
+ PyMethodDef jit_methods[] = {
++    {"_udf_create_scalar_slot",
++     JITRT_UdfCreateScalarSlot,
++     METH_NOARGS,
++     PyDoc_STR("Create a process-local float64 scalar-slot capsule.")},
++    {"_udf_set_scalar_slot",
++     JITRT_UdfSetScalarSlot,
++     METH_VARARGS,
++     PyDoc_STR("Bind an exact float to an actively borrowed scalar slot.")},
++    {"_udf_begin_scalar_slot_borrow",
++     JITRT_UdfBeginScalarSlotBorrow,
++     METH_O,
++     PyDoc_STR("Begin a scalar-slot borrow and clear its prior value.")},
++    {"_udf_end_scalar_slot_borrow",
++     JITRT_UdfEndScalarSlotBorrow,
++     METH_O,
++     PyDoc_STR("End an active scalar-slot borrow.")},
++    {"_udf_release_scalar_slot",
++     JITRT_UdfReleaseScalarSlot,
++     METH_O,
++     PyDoc_STR("Idempotently release an inactive scalar slot.")},
++    {"_udf_guard_data_handle",
++     JITRT_UdfGuardDataHandle,
++     METH_O,
++     PyDoc_STR("Validate an initialized, actively borrowed scalar slot.")},
++    {"_udf_data_load_f64",
++     JITRT_UdfDataLoadF64,
++     METH_O,
++     PyDoc_STR("Load float64 from a guarded scalar-slot capsule.")},
+     {"disable",
+      reinterpret_cast<PyCFunction>(disable_jit),
+      METH_VARARGS | METH_KEYWORDS,
+--- a/cinderx/PythonLib/test_cinderx/test_jit_global_cache.py
++++ b/cinderx/PythonLib/test_cinderx/test_jit_global_cache.py
+@@ -5,6 +5,7 @@
+ # pyre-unsafe
+ 
+ import builtins
++import types
+ import unittest
+ from textwrap import dedent
+ 
+@@ -13,6 +14,60 @@
+ from cinderx.test_support import run_in_subprocess, skip_unless_lazy_imports
+ 
+ from .common import failUnlessHasOpcodes, with_globals
++
++
++class LoadModuleAttrCacheTests(unittest.TestCase):
++    def setUp(self):
++        if not cinderx.jit.is_enabled():
++            self.skipTest("JIT is disabled")
++
++    @staticmethod
++    def _warm(func, *args):
++        for _ in range(5_000):
++            func(*args)
++
++    @staticmethod
++    def _bind_module_global(func, module):
++        return with_globals({"module": module, "__builtins__": builtins})(func)
++
++    @staticmethod
++    def _compile_for_hir(func):
++        cinderx.jit.compile_after_n_calls(1_000_000)
++        return cinderx.jit.force_compile(func)
++
++    @run_in_subprocess
++    def test_module_dunder_path_does_not_use_module_attr_cache(self):
++        def get_path():
++            # pyre-ignore[10]: Dynamically injected into function globals.
++            return module.__path__
++
++        module_obj = types.ModuleType("pkg")
++        module_obj.__path__ = ["pkg-path"]
++        get_path = self._bind_module_global(get_path, module_obj)
++        self._warm(get_path)
++
++        self.assertTrue(self._compile_for_hir(get_path))
++        ops = cinderx.jit.get_function_hir_opcode_counts(get_path)
++        self.assertEqual(ops.get("LoadModuleAttrCached", 0), 0)
++        self.assertEqual(ops.get("LoadAttrCached", 0), 0)
++        self.assertGreaterEqual(ops.get("LoadAttr", 0), 1)
++        self.assertEqual(get_path(), ["pkg-path"])
++
++    @run_in_subprocess
++    def test_regular_module_attr_still_uses_module_attr_cache(self):
++        def get_value():
++            # pyre-ignore[10]: Dynamically injected into function globals.
++            return module.value
++
++        module_obj = types.ModuleType("plain")
++        module_obj.value = 42
++        get_value = self._bind_module_global(get_value, module_obj)
++        self._warm(get_value)
++
++        self.assertTrue(self._compile_for_hir(get_value))
++        ops = cinderx.jit.get_function_hir_opcode_counts(get_value)
++        self.assertGreaterEqual(ops.get("LoadModuleAttrCached", 0), 1)
++        self.assertEqual(get_value(), 42)
+ 
+ 
+ class LoadGlobalCacheTests(unittest.TestCase):
+--- a/cinderx/PythonLib/test_cinderx/test_kunpeng/test_autojit_gate_stats.py
++++ b/cinderx/PythonLib/test_cinderx/test_kunpeng/test_autojit_gate_stats.py
+@@ -8,6 +8,10 @@
+ 
+ 
+ HELPER = Path(__file__).resolve()
++CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED = sys.version_info[:3] == (3, 14, 0)
++CP3140_AUTOJIT_SKIP_REASON = (
++    "CPython 3.14.0 direct calls bypass the AutoJIT classification gate"
++)
+ 
+ 
+ def install_fake_lib2to3_importer() -> None:
+@@ -578,6 +582,10 @@
+             )
+             self.assertFalse(stats_path.exists())
+ 
++    @unittest.skipIf(
++        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
++        CP3140_AUTOJIT_SKIP_REASON,
++    )
+     def test_plugin_roi_backoff_uncompiles_deopt_storm(self) -> None:
+         with tempfile.TemporaryDirectory() as temp:
+             env = _plugin_env()
+@@ -597,6 +605,10 @@
+                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+             )
+ 
++    @unittest.skipIf(
++        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
++        CP3140_AUTOJIT_SKIP_REASON,
++    )
+     def test_plugin_roi_backoff_defaults_freeze_first_deopt_storm(self) -> None:
+         with tempfile.TemporaryDirectory() as temp:
+             env = _plugin_env()
+@@ -613,6 +625,10 @@
+                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+             )
+ 
++    @unittest.skipIf(
++        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
++        CP3140_AUTOJIT_SKIP_REASON,
++    )
+     def test_plugin_roi_backoff_env_zero_disables_backoff(self) -> None:
+         with tempfile.TemporaryDirectory() as temp:
+             env = _plugin_env()
+@@ -630,6 +646,10 @@
+                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+             )
+ 
++    @unittest.skipIf(
++        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
++        CP3140_AUTOJIT_SKIP_REASON,
++    )
+     def test_plugin_freezes_low_roi_functions(self) -> None:
+         with tempfile.TemporaryDirectory() as temp:
+             env = _plugin_env()
+@@ -689,6 +709,10 @@
+                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+             )
+ 
++    @unittest.skipIf(
++        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
++        CP3140_AUTOJIT_SKIP_REASON,
++    )
+     def test_plugin_freezes_low_loop_object_manipulators(self) -> None:
+         with tempfile.TemporaryDirectory() as temp:
+             env = _plugin_env()
+@@ -735,6 +759,10 @@
+                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+             )
+ 
++    @unittest.skipIf(
++        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
++        CP3140_AUTOJIT_SKIP_REASON,
++    )
+     def test_plugin_defers_logging_disabled_fast_path(self) -> None:
+         with tempfile.TemporaryDirectory() as temp:
+             env = _plugin_env()
+--- a/cinderx/PythonLib/test_cinderx/test_kunpeng/test_autojit_policy.py
++++ b/cinderx/PythonLib/test_cinderx/test_kunpeng/test_autojit_policy.py
+@@ -7,6 +7,10 @@
+ 
+ 
+ HELPER = Path(__file__).resolve()
++CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED = sys.version_info[:3] == (3, 14, 0)
++CP3140_AUTOJIT_SKIP_REASON = (
++    "CPython 3.14.0 direct calls bypass the AutoJIT classification gate"
++)
+ 
+ 
+ def _run_compile_smoke():
+@@ -120,9 +124,17 @@
+             f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+         )
+ 
++    @unittest.skipIf(
++        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
++        CP3140_AUTOJIT_SKIP_REASON,
++    )
+     def test_autojit_defers_asyncio_event_loop_helpers(self) -> None:
+         self.assert_case_passes("asyncio_event_loop_helpers")
+ 
++    @unittest.skipIf(
++        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
++        CP3140_AUTOJIT_SKIP_REASON,
++    )
+     def test_autojit_defers_deepcopy_tuple_and_keep_alive(self) -> None:
+         self.assert_case_passes(
+             "deepcopy_exception_helpers",
+--- a/cinderx/PythonLib/test_cinderx/test_udf_data_intrinsic.py
++++ b/cinderx/PythonLib/test_cinderx/test_udf_data_intrinsic.py
+@@ -0,0 +1,193 @@
++"""Tests for the guarded scalar-slot float64 CinderX intrinsic."""
++
++import math
++import os
++import unittest
++
++import cinderx.jit
++
++try:
++    from cinderjit import (
++        _udf_begin_scalar_slot_borrow,
++        _udf_create_scalar_slot,
++        _udf_data_load_f64,
++        _udf_end_scalar_slot_borrow,
++        _udf_guard_data_handle,
++        _udf_release_scalar_slot,
++        _udf_set_scalar_slot,
++    )
++except ImportError:
++    _udf_create_scalar_slot = None
++
++
++@unittest.skipUnless(
++    cinderx.jit.is_enabled() and _udf_create_scalar_slot is not None,
++    "requires CinderX JIT scalar-slot helpers",
++)
++class UdfDataIntrinsicTests(unittest.TestCase):
++    def setUp(self):
++        self.slot = _udf_create_scalar_slot()
++
++    def tearDown(self):
++        try:
++            _udf_end_scalar_slot_borrow(self.slot)
++        except RuntimeError:
++            pass
++        _udf_release_scalar_slot(self.slot)
++
++    def test_interpreter_lifecycle_and_exact_float(self):
++        with self.assertRaises(RuntimeError):
++            _udf_guard_data_handle(self.slot)
++
++        _udf_begin_scalar_slot_borrow(self.slot)
++        with self.assertRaises(RuntimeError):
++            _udf_guard_data_handle(self.slot)
++        for value in (0.0, -0.0, 1.25, float("inf"), float("-inf"), float("nan")):
++            _udf_set_scalar_slot(self.slot, value)
++            result = _udf_data_load_f64(_udf_guard_data_handle(self.slot))
++            if math.isnan(value):
++                self.assertTrue(math.isnan(result))
++            else:
++                self.assertEqual(result, value)
++                self.assertEqual(math.copysign(1.0, result), math.copysign(1.0, value))
++
++        with self.assertRaises(TypeError):
++            _udf_set_scalar_slot(self.slot, 1)
++
++        _udf_end_scalar_slot_borrow(self.slot)
++        _udf_begin_scalar_slot_borrow(self.slot)
++        with self.assertRaises(RuntimeError):
++            _udf_data_load_f64(self.slot)
++
++    def test_release_is_idempotent_and_prevents_aba(self):
++        _udf_begin_scalar_slot_borrow(self.slot)
++        with self.assertRaises(RuntimeError):
++            _udf_release_scalar_slot(self.slot)
++        _udf_end_scalar_slot_borrow(self.slot)
++
++        _udf_release_scalar_slot(self.slot)
++        _udf_release_scalar_slot(self.slot)
++        with self.assertRaises(RuntimeError):
++            _udf_begin_scalar_slot_borrow(self.slot)
++
++        replacement = _udf_create_scalar_slot()
++        try:
++            _udf_begin_scalar_slot_borrow(replacement)
++            _udf_set_scalar_slot(replacement, 7.0)
++            self.assertEqual(
++                _udf_data_load_f64(_udf_guard_data_handle(replacement)), 7.0
++            )
++            with self.assertRaises(RuntimeError):
++                _udf_guard_data_handle(self.slot)
++            _udf_end_scalar_slot_borrow(replacement)
++        finally:
++            _udf_release_scalar_slot(replacement)
++
++    @unittest.skipUnless(hasattr(os, "fork"), "requires fork")
++    def test_cross_process_capsule_is_rejected(self):
++        _udf_begin_scalar_slot_borrow(self.slot)
++        pid = os.fork()
++        if pid == 0:
++            try:
++                _udf_guard_data_handle(self.slot)
++            except RuntimeError:
++                os._exit(0)
++            os._exit(1)
++        _, status = os.waitpid(pid, 0)
++        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
++
++    def test_exact_guarded_call_is_compiled_and_wrong_guard_is_not(self):
++        def calibrated(slot):
++            return _udf_data_load_f64(_udf_guard_data_handle(slot)) * 2.0 - 1.0
++
++        def unguarded(slot):
++            return _udf_data_load_f64(slot)
++
++        def passthrough(value):
++            return value
++
++        def wrong_guard(slot):
++            return _udf_data_load_f64(passthrough(slot))
++
++        def fake_load(value):
++            return _udf_data_load_f64(value)
++
++        def wrong_load(slot):
++            return fake_load(_udf_guard_data_handle(slot))
++
++        self.assertTrue(cinderx.jit.force_compile(calibrated))
++        self.assertTrue(cinderx.jit.force_compile(unguarded))
++        self.assertTrue(cinderx.jit.force_compile(wrong_guard))
++        self.assertTrue(cinderx.jit.force_compile(wrong_load))
++        self.assertTrue(cinderx.jit.is_jit_compiled(calibrated))
++        self.assertEqual(
++            cinderx.jit.get_function_hir_opcode_counts(calibrated).get(
++                "LoadUdfDataF64", 0
++            ),
++            1,
++        )
++        self.assertEqual(
++            cinderx.jit.get_function_hir_opcode_counts(unguarded).get(
++                "LoadUdfDataF64", 0
++            ),
++            0,
++        )
++        self.assertEqual(
++            cinderx.jit.get_function_hir_opcode_counts(wrong_guard).get(
++                "LoadUdfDataF64", 0
++            ),
++            0,
++        )
++        self.assertEqual(
++            cinderx.jit.get_function_hir_opcode_counts(wrong_load).get(
++                "LoadUdfDataF64", 0
++            ),
++            0,
++        )
++
++        _udf_begin_scalar_slot_borrow(self.slot)
++        for value in (
++            0.0,
++            -0.0,
++            1.25,
++            1.7976931348623157e308,
++            float("inf"),
++            float("-inf"),
++            float("nan"),
++        ):
++            _udf_set_scalar_slot(self.slot, value)
++            expected = value * 2.0 - 1.0
++            result = calibrated(self.slot)
++            if math.isnan(expected):
++                self.assertTrue(math.isnan(result))
++            else:
++                self.assertEqual(result, expected)
++
++        _udf_end_scalar_slot_borrow(self.slot)
++        _udf_release_scalar_slot(self.slot)
++        with self.assertRaises(RuntimeError):
++            calibrated(self.slot)
++        with self.assertRaises(TypeError):
++            calibrated(object())
++
++    def test_state_change_between_guard_and_load_disables_intrinsic(self):
++        def end_between_guard_and_load(slot):
++            guarded = _udf_guard_data_handle(slot)
++            _udf_end_scalar_slot_borrow(slot)
++            return _udf_data_load_f64(guarded)
++
++        self.assertTrue(cinderx.jit.force_compile(end_between_guard_and_load))
++        self.assertEqual(
++            cinderx.jit.get_function_hir_opcode_counts(
++                end_between_guard_and_load
++            ).get("LoadUdfDataF64", 0),
++            0,
++        )
++        _udf_begin_scalar_slot_borrow(self.slot)
++        _udf_set_scalar_slot(self.slot, 3.0)
++        with self.assertRaises(RuntimeError):
++            end_between_guard_and_load(self.slot)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/cinderx/RuntimeTests/hir_tests/udf_data_intrinsic_test.txt
++++ b/cinderx/RuntimeTests/hir_tests/udf_data_intrinsic_test.txt
+@@ -0,0 +1,34 @@
++--- Test Suite Name ---
++UdfDataIntrinsicHIRTest
++--- Passes ---
++Simplify
++--- Test Name ---
++ParserPrinterAndOutputTypePreserveGuardedPrimitiveLoad
++--- Input ---
++# HIR
++fun test {
++  bb 0 {
++    v0 = LoadArg<0; "slot">
++    v1 = LoadUdfDataF64 v0
++    v2 = PrimitiveBox<CDouble> v1 {
++      FrameState {
++        CurInstrOffset 0
++      }
++    }
++    Return v2
++  }
++}
++--- Expected 3.14 ---
++fun test {
++  bb 0 {
++    v0:Object = LoadArg<0>
++    v1:CDouble = LoadUdfDataF64 v0
++    v2:FloatExact = PrimitiveBox<CDouble> v1 {
++      FrameState {
++        CurInstrOffset 0
++      }
++    }
++    Return v2
++  }
++}
++--- End ---
+--- a/cinderx/RuntimeTests/inline_cache_test.cpp
++++ b/cinderx/RuntimeTests/inline_cache_test.cpp
+@@ -61,6 +61,38 @@
+ void expectUnicodeEquals(PyObject* obj, const char* expected) {
+   ASSERT_TRUE(PyUnicode_Check(obj)) << "Expected a unicode result";
+   ASSERT_EQ(PyUnicode_CompareWithASCIIString(obj, expected), 0);
++}
++
++TEST_F(InlineCacheTest, AttributeMutatorTaggedKindMaskKeepsTypePointer) {
++  jit::AttributeMutator mutator;
++  ASSERT_TRUE(mutator.isEmpty());
++  EXPECT_EQ(mutator.type(), nullptr);
++
++  auto* type = &PyBaseObject_Type;
++  mutator.set_combined(type);
++  EXPECT_FALSE(mutator.isEmpty());
++  EXPECT_EQ(mutator.type(), type);
++  EXPECT_EQ(mutator.watchedDescrType(), nullptr);
++
++  mutator.set_split(type, 0, nullptr, false);
++  EXPECT_EQ(mutator.type(), type);
++  EXPECT_EQ(mutator.watchedDescrType(), nullptr);
++
++  mutator.set_split(type, 0, nullptr, true);
++  EXPECT_EQ(mutator.type(), type);
++  EXPECT_EQ(mutator.watchedDescrType(), nullptr);
++
++  mutator.set_descr_or_classvar(type, Py_None, 0);
++  EXPECT_EQ(mutator.type(), type);
++  EXPECT_EQ(mutator.watchedDescrType(), nullptr);
++
++  mutator.set_data_descr(type, Py_None);
++  EXPECT_EQ(mutator.type(), type);
++  EXPECT_EQ(mutator.watchedDescrType(), Py_TYPE(Py_None));
++
++  mutator.reset();
++  EXPECT_TRUE(mutator.isEmpty());
++  EXPECT_EQ(mutator.type(), nullptr);
+ }
+ 
+ TEST_F(InlineCacheTest, LoadTypeMethodCacheLookUp) {
+--- a/cinderx/RuntimeTests/main.cpp
++++ b/cinderx/RuntimeTests/main.cpp
+@@ -262,6 +262,7 @@
+   register_test("all_passes_static_test.txt", RuntimeTest::kStaticCompiler);
+   register_test("native_calls_test.txt", RuntimeTest::kStaticCompiler);
+   register_test("static_array_item_test.txt", RuntimeTest::kStaticCompiler);
++  register_test("udf_data_intrinsic_test.txt");
+ 
+   wchar_t* argv0 = Py_DecodeLocale(argv[0], nullptr);
+   if (argv0 == nullptr) {
+--- a/cinderx/RuntimeTests/osr_loop_header_secondary_entry_test.cpp
++++ b/cinderx/RuntimeTests/osr_loop_header_secondary_entry_test.cpp
+@@ -372,6 +372,73 @@
+   auto irfunc = buildHIR(func);
+   auto targets = collectBackedgeTargetOffsets(func->func_code);
+   ASSERT_EQ(targets.size(), 1);
++
++  irfunc->markOSREntries(targets, func->func_code);
++
++  EXPECT_FALSE(irfunc->hasOSREntries());
++  EXPECT_EQ(countOSREntries(*irfunc), 0);
++}
++
++TEST_F(OSRCompileTest, RejectsTruncatedExceptionTableVarint) {
++  Ref<PyFunctionObject> func(compileAndGet(
++      R"(
++def test():
++    while True:
++        pass
++
++test.__code__ = test.__code__.replace(co_exceptiontable=bytes((0xc0,)))
++)",
++      "test"));
++  auto irfunc = buildHIR(func);
++  auto targets = collectBackedgeTargetOffsets(func->func_code);
++  ASSERT_EQ(targets.size(), 1);
++  ASSERT_NE(blockWithEntrySnapshotAt(*irfunc, targets.front()), nullptr);
++
++  irfunc->markOSREntries(targets, func->func_code);
++
++  EXPECT_FALSE(irfunc->hasOSREntries());
++  EXPECT_EQ(countOSREntries(*irfunc), 0);
++}
++
++TEST_F(OSRCompileTest, RejectsExceptionTableEntryWithoutStartMarker) {
++  Ref<PyFunctionObject> func(compileAndGet(
++      R"(
++def test():
++    while True:
++        pass
++
++test.__code__ = test.__code__.replace(
++    co_exceptiontable=bytes((0x00, 0x00, 0x00, 0x00))
++)
++)",
++      "test"));
++  auto irfunc = buildHIR(func);
++  auto targets = collectBackedgeTargetOffsets(func->func_code);
++  ASSERT_EQ(targets.size(), 1);
++  ASSERT_NE(blockWithEntrySnapshotAt(*irfunc, targets.front()), nullptr);
++
++  irfunc->markOSREntries(targets, func->func_code);
++
++  EXPECT_FALSE(irfunc->hasOSREntries());
++  EXPECT_EQ(countOSREntries(*irfunc), 0);
++}
++
++TEST_F(OSRCompileTest, RejectsOverflowingExceptionTableVarint) {
++  Ref<PyFunctionObject> func(compileAndGet(
++      R"(
++def test():
++    while True:
++        pass
++
++test.__code__ = test.__code__.replace(
++    co_exceptiontable=bytes((0xff, 0x7f, 0x7f, 0x7f, 0x7f, 0x3f))
++)
++)",
++      "test"));
++  auto irfunc = buildHIR(func);
++  auto targets = collectBackedgeTargetOffsets(func->func_code);
++  ASSERT_EQ(targets.size(), 1);
++  ASSERT_NE(blockWithEntrySnapshotAt(*irfunc, targets.front()), nullptr);
+ 
+   irfunc->markOSREntries(targets, func->func_code);
+ 
+--- a/cinderx/RuntimeTests/udf_data_intrinsic_test.cpp
++++ b/cinderx/RuntimeTests/udf_data_intrinsic_test.cpp
+@@ -0,0 +1,320 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++
++#include "cinderx/Jit/code_runtime.h"
++#include "cinderx/Jit/codegen/environ.h"
++#include "cinderx/Jit/compiler.h"
++#include "cinderx/Jit/context.h"
++#include "cinderx/Jit/hir/instr_effects.h"
++#include "cinderx/Jit/hir/parser.h"
++#include "cinderx/Jit/hir/pass.h"
++#include "cinderx/Jit/jit_rt.h"
++#include "cinderx/Jit/lir/generator.h"
++#include "cinderx/Jit/lir/printer.h"
++#include "cinderx/RuntimeTests/fixtures.h"
++
++#include <fmt/format.h>
++
++#include <cstdint>
++#include <sstream>
++#include <string>
++
++using UdfDataIntrinsicTest = RuntimeTest;
++
++TEST_F(UdfDataIntrinsicTest, RuntimeHelpersEnforceBorrowAndLifetime) {
++  runStockCode(R"(
++import math
++
++from cinderjit import (
++    _udf_begin_scalar_slot_borrow,
++    _udf_create_scalar_slot,
++    _udf_data_load_f64,
++    _udf_end_scalar_slot_borrow,
++    _udf_guard_data_handle,
++    _udf_release_scalar_slot,
++    _udf_set_scalar_slot,
++)
++
++slot = _udf_create_scalar_slot()
++
++for operation in (
++    lambda: _udf_set_scalar_slot(slot, 1.0),
++    lambda: _udf_guard_data_handle(slot),
++    lambda: _udf_data_load_f64(slot),
++):
++    try:
++        operation()
++    except RuntimeError:
++        pass
++    else:
++        raise AssertionError("slot access outside an active borrow must fail")
++
++_udf_begin_scalar_slot_borrow(slot)
++for operation in (
++    lambda: _udf_guard_data_handle(slot),
++    lambda: _udf_data_load_f64(slot),
++):
++    try:
++        operation()
++    except RuntimeError:
++        pass
++    else:
++        raise AssertionError("a new borrow must be initialized before load")
++for value in (0.0, -0.0, 1.25, float("inf"), float("-inf"), float("nan")):
++    _udf_set_scalar_slot(slot, value)
++    result = _udf_data_load_f64(_udf_guard_data_handle(slot))
++    if math.isnan(value):
++        assert math.isnan(result)
++    else:
++        assert result == value
++        assert math.copysign(1.0, result) == math.copysign(1.0, value)
++_udf_end_scalar_slot_borrow(slot)
++
++_udf_begin_scalar_slot_borrow(slot)
++try:
++    _udf_guard_data_handle(slot)
++except RuntimeError:
++    pass
++else:
++    raise AssertionError("a second borrow must not reuse the previous value")
++_udf_end_scalar_slot_borrow(slot)
++
++try:
++    _udf_set_scalar_slot(slot, 1)
++except RuntimeError:
++    # The borrow check is allowed to win before the exact-float check.
++    pass
++else:
++    raise AssertionError("setting outside an active borrow must fail")
++
++_udf_release_scalar_slot(slot)
++_udf_release_scalar_slot(slot)
++for operation in (
++    lambda: _udf_begin_scalar_slot_borrow(slot),
++    lambda: _udf_guard_data_handle(slot),
++    lambda: _udf_data_load_f64(slot),
++):
++    try:
++        operation()
++    except RuntimeError:
++        pass
++    else:
++        raise AssertionError("released slots must stay invalid")
++
++replacement = _udf_create_scalar_slot()
++_udf_begin_scalar_slot_borrow(replacement)
++_udf_set_scalar_slot(replacement, 9.5)
++assert _udf_data_load_f64(_udf_guard_data_handle(replacement)) == 9.5
++_udf_end_scalar_slot_borrow(replacement)
++_udf_release_scalar_slot(replacement)
++
++try:
++    _udf_guard_data_handle(object())
++except TypeError:
++    pass
++else:
++    raise AssertionError("forged handles must fail before data load")
++)");
++}
++
++#ifndef WIN32
++TEST_F(UdfDataIntrinsicTest, RuntimeHelpersRejectCrossProcessCapsule) {
++  runStockCode(R"(
++import os
++
++from cinderjit import (
++    _udf_begin_scalar_slot_borrow,
++    _udf_create_scalar_slot,
++    _udf_end_scalar_slot_borrow,
++    _udf_guard_data_handle,
++    _udf_release_scalar_slot,
++)
++
++slot = _udf_create_scalar_slot()
++_udf_begin_scalar_slot_borrow(slot)
++pid = os.fork()
++if pid == 0:
++    try:
++        _udf_guard_data_handle(slot)
++    except RuntimeError:
++        os._exit(0)
++    os._exit(1)
++
++_, status = os.waitpid(pid, 0)
++assert os.waitstatus_to_exitcode(status) == 0
++try:
++    _udf_release_scalar_slot(slot)
++except RuntimeError:
++    pass
++else:
++    raise AssertionError("active borrows must prevent release")
++_udf_end_scalar_slot_borrow(slot)
++_udf_release_scalar_slot(slot)
++)");
++}
++#endif
++
++TEST_F(UdfDataIntrinsicTest, ExactGuardedLoadProducesPrimitiveHIR) {
++  runStockCode(R"(
++import math
++
++import cinderx.jit as jit
++from cinderjit import (
++    _udf_begin_scalar_slot_borrow,
++    _udf_create_scalar_slot,
++    _udf_data_load_f64,
++    _udf_end_scalar_slot_borrow,
++    _udf_guard_data_handle,
++    _udf_release_scalar_slot,
++    _udf_set_scalar_slot,
++)
++
++def calibrated(slot):
++    return _udf_data_load_f64(_udf_guard_data_handle(slot)) * 2.0 - 1.0
++
++def unguarded(slot):
++    return _udf_data_load_f64(slot)
++
++def passthrough(value):
++    return value
++
++def wrong_guard(slot):
++    return _udf_data_load_f64(passthrough(slot))
++
++def fake_load(value):
++    return _udf_data_load_f64(value)
++
++def wrong_load(slot):
++    return fake_load(_udf_guard_data_handle(slot))
++
++def end_between_guard_and_load(slot):
++    guarded = _udf_guard_data_handle(slot)
++    _udf_end_scalar_slot_borrow(slot)
++    return _udf_data_load_f64(guarded)
++
++assert jit.force_compile(calibrated)
++assert jit.force_compile(unguarded)
++assert jit.force_compile(wrong_guard)
++assert jit.force_compile(wrong_load)
++assert jit.force_compile(end_between_guard_and_load)
++assert jit.is_jit_compiled(calibrated)
++
++counts = jit.get_function_hir_opcode_counts(calibrated)
++assert counts.get("LoadUdfDataF64", 0) == 1, counts
++assert jit.get_function_hir_opcode_counts(unguarded).get("LoadUdfDataF64", 0) == 0
++assert jit.get_function_hir_opcode_counts(wrong_guard).get("LoadUdfDataF64", 0) == 0
++assert jit.get_function_hir_opcode_counts(wrong_load).get("LoadUdfDataF64", 0) == 0
++assert jit.get_function_hir_opcode_counts(end_between_guard_and_load).get("LoadUdfDataF64", 0) == 0
++
++interposed_slot = _udf_create_scalar_slot()
++_udf_begin_scalar_slot_borrow(interposed_slot)
++_udf_set_scalar_slot(interposed_slot, 4.0)
++try:
++    end_between_guard_and_load(interposed_slot)
++except RuntimeError:
++    pass
++else:
++    raise AssertionError("load after end_borrow must retain interpreter failure")
++_udf_release_scalar_slot(interposed_slot)
++
++slot = _udf_create_scalar_slot()
++_udf_begin_scalar_slot_borrow(slot)
++for value in (0.0, -0.0, 1.25, 1.7976931348623157e308, float("inf"), float("-inf"), float("nan")):
++    _udf_set_scalar_slot(slot, value)
++    expected = value * 2.0 - 1.0
++    result = calibrated(slot)
++    if math.isnan(expected):
++        assert math.isnan(result)
++    else:
++        assert result == expected
++        if expected == 0.0:
++            assert math.copysign(1.0, result) == math.copysign(1.0, expected)
++_udf_end_scalar_slot_borrow(slot)
++_udf_release_scalar_slot(slot)
++for invalid in (slot, object()):
++    try:
++        calibrated(invalid)
++    except (RuntimeError, TypeError):
++        pass
++    else:
++        raise AssertionError("descriptor guard must fail before native load")
++)");
++}
++
++TEST_F(UdfDataIntrinsicTest, HIRMetadataMatchesPrimitiveRead) {
++  auto function = jit::hir::HIRParser{}.ParseHIR(R"(
++fun test {
++  bb 0 {
++    v0 = LoadArg<0>
++    v1 = LoadUdfDataF64 v0
++    v2 = PrimitiveBox<CDouble> v1 {
++      FrameState {
++        CurInstrOffset 0
++      }
++    }
++    Return v2
++  }
++}
++)");
++  ASSERT_NE(function, nullptr);
++
++  const jit::hir::Instr* load = nullptr;
++  for (const auto& block : function->cfg.blocks) {
++    for (const auto& instr : block) {
++      if (instr.IsLoadUdfDataF64()) {
++        load = &instr;
++      }
++    }
++  }
++
++  ASSERT_NE(load, nullptr);
++  EXPECT_EQ(jit::hir::outputType(*load), jit::hir::TCDouble);
++  EXPECT_TRUE(load->isReplayable());
++  EXPECT_FALSE(jit::hir::isPassthrough(*load));
++  EXPECT_FALSE(jit::hir::hasArbitraryExecution(*load));
++  EXPECT_EQ(jit::hir::memoryEffects(*load).may_store, jit::hir::AEmpty);
++}
++
++TEST_F(UdfDataIntrinsicTest, LIRCallsFloat64SlotLoadHelper) {
++  auto function = jit::hir::HIRParser{}.ParseHIR(R"(
++fun test {
++  bb 0 {
++    v0 = LoadArg<0>
++    v1 = LoadUdfDataF64 v0
++    v2 = PrimitiveBox<CDouble> v1 {
++      FrameState {
++        CurInstrOffset 0
++      }
++    }
++    Return v2
++  }
++}
++)");
++  ASSERT_NE(function, nullptr);
++
++  jit::Compiler::runPasses(
++      *function,
++      static_cast<jit::PassConfig>(
++          jit::PassConfig::kAllExceptInliner &
++          ~jit::PassConfig::kInsertUpdatePrevInstr));
++
++  jit::codegen::Environ env;
++  env.ctx = jit::getContext();
++  jit::CodeRuntime code_runtime{
++      function->code, function->builtins, function->globals};
++  env.code_rt = &code_runtime;
++
++  jit::lir::LIRGenerator generator{function.get(), &env};
++  auto lir = generator.TranslateFunction();
++  lir->sortBasicBlocks();
++  std::stringstream stream;
++  stream << *lir;
++  const std::string text = stream.str();
++
++  EXPECT_NE(text.find(":Double = Call"), std::string::npos) << text;
++  EXPECT_NE(
++      text.find(fmt::format(
++          "{}",
++          reinterpret_cast<uint64_t>(JITRT_LoadUdfDataF64Unchecked))),
++      std::string::npos)
++      << text;
++}
+--- a/cinderx/_cinderx.pyi
++++ b/cinderx/_cinderx.pyi
+@@ -81,6 +81,10 @@
+ def _autojit_import_depth() -> int: ...
+ def _autojit_import_enter() -> None: ...
+ def _autojit_import_leave() -> None: ...
++def _autojit_import_scope_depth() -> int: ...
++def _autojit_setup_enter() -> None: ...
++def _autojit_setup_leave() -> None: ...
++def _autojit_setup_depth() -> int: ...
+ def _get_entire_call_stack_as_qualnames_with_lineno() -> list[tuple[str, int]]: ...
+ def _get_entire_call_stack_as_qualnames_with_lineno_and_frame() -> list[
+     tuple[str, int, object]
