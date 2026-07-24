@@ -284,14 +284,15 @@ class EvidenceAggregationTests(unittest.TestCase):
         ):
             joined = _join_ray_task_attempts(
                 [event],
-                wait_seconds=0.1,
+                wait_seconds=2.1,
                 poll_seconds=0,
             )
         self.assertEqual(joined[0]["task_attempt"], "attempt-0")
         self.assertEqual(state_module.list_tasks.call_count, 2)
         self.assertTrue(
             all(
-                0 < call.kwargs["timeout"] <= 0.1
+                isinstance(call.kwargs["timeout"], int)
+                and 1 <= call.kwargs["timeout"] <= 2
                 for call in state_module.list_tasks.call_args_list
             )
         )
@@ -329,7 +330,10 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            temporal = _join_ray_task_attempts([temporal_event], wait_seconds=1)
+            temporal = _join_ray_task_attempts(
+                [temporal_event],
+                wait_seconds=2.1,
+            )
         self.assertEqual(temporal[0]["partition_id"], "physical-actor-task-id")
         self.assertEqual(temporal[0]["task_attempt"], "attempt-0")
         self.assertEqual(
@@ -345,7 +349,10 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            ambiguous = _join_ray_task_attempts([temporal_event], wait_seconds=1)
+            ambiguous = _join_ray_task_attempts(
+                [temporal_event],
+                wait_seconds=2.1,
+            )
         self.assertEqual(ambiguous[0]["task_attempt"], "")
         self.assertEqual(len(ambiguous[0]["ray_state_temporal_candidates"]), 2)
 
@@ -372,7 +379,7 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            joined = _join_ray_task_attempts([event], wait_seconds=1)
+            joined = _join_ray_task_attempts([event], wait_seconds=2.1)
         self.assertEqual(joined[0]["task_attempt"], "")
 
     def test_ray_state_join_never_starts_a_query_after_budget_expires(self) -> None:
@@ -388,7 +395,7 @@ class EvidenceAggregationTests(unittest.TestCase):
             sys.modules,
             {"ray": ray_module, "ray.util": util_module, "ray.util.state": state_module},
         ):
-            joined = _join_ray_task_attempts([event], wait_seconds=0)
+            joined = _join_ray_task_attempts([event], wait_seconds=0.9)
 
         state_module.list_tasks.assert_not_called()
         self.assertEqual(joined[0]["ray_state_exact_records"], [])

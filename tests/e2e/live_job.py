@@ -704,11 +704,14 @@ def _join_ray_task_attempts(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        query_timeout = min(30, int(remaining))
+        if query_timeout < 1:
+            break
         state_records = list(
             list_tasks(
                 detail=True,
                 limit=10000,
-                timeout=min(30.0, remaining),
+                timeout=query_timeout,
             )
         )
         records_by_id = {}
