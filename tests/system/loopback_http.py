@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 
 class LoopbackRedirectError(RuntimeError):
-    """A credential-bearing loopback request attempted to redirect."""
+    """An authenticated loopback request attempted to redirect."""
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):

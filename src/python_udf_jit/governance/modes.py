@@ -45,7 +45,7 @@ def _decision(
 
 def resolve_mode(
     *,
-    emergency_disabled: bool,
+    locally_disabled: bool,
     plugin_enabled: bool,
     requested_mode: str | RuntimeMode,
     compatible: bool,
@@ -55,12 +55,12 @@ def resolve_mode(
     """Resolve the scalar runtime mode in the externally visible precedence.
 
     Precedence is intentionally explicit:
-    emergency disable, plugin enable, requested mode, compatibility, then
+    local disable, plugin enable, requested mode, compatibility, then
     immutable policy.  A lower-priority input can only tighten the result.
     """
 
-    if emergency_disabled:
-        return _decision(RuntimeMode.OFF, "emergency_disabled")
+    if locally_disabled:
+        return _decision(RuntimeMode.OFF, "locally_disabled")
     if not plugin_enabled:
         return _decision(RuntimeMode.OFF, "plugin_disabled")
     try:
@@ -107,7 +107,7 @@ def resolve_environment_mode(
 ) -> ModeDecision:
     values = os.environ if environment is None else environment
     return resolve_mode(
-        emergency_disabled=_enabled(
+        locally_disabled=_enabled(
             values.get("UDFJIT_DISABLE"),
             default=False,
         ),

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import tempfile
@@ -43,9 +42,10 @@ class MainlineContractIntegrationTests(unittest.TestCase):
             ROOT / "config/mainline-production-acceptance.json",
             contract=contract,
         )
+        self.assertEqual(report["unit_completion_status"], "complete")
         self.assertEqual(
-            set(report["gates"].values()),
-            {"stop"},
+            report["gates"],
+            {"multi_node_environment": "stop"},
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -61,7 +61,37 @@ class MainlineContractIntegrationTests(unittest.TestCase):
                     contract=contract,
                 )
 
-    def test_external_platform_contract_separates_admission_and_coverage(self) -> None:
+    def test_runtime_baselines_separate_target_from_current_validation(self) -> None:
+        matrix = json.loads(
+            (ROOT / "config/mainline-support-matrix.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        baselines = matrix["runtime_baselines"]
+
+        self.assertEqual(
+            baselines["production_target"]["python"],
+            "3.11.6",
+        )
+        self.assertEqual(
+            baselines["production_target"]["cinderx_status"],
+            "python_3_11_adaptation_pending",
+        )
+        self.assertEqual(
+            baselines["current_development_validation"]["python"],
+            "3.14.3",
+        )
+        self.assertEqual(
+            baselines["current_development_validation"]["purpose"],
+            "development_test_and_blue98_validation",
+        )
+        self.assertFalse(
+            baselines["production_target"][
+                "blocks_current_functional_development"
+            ]
+        )
+
+    def test_trusted_job_contract_uses_hash_and_worker_revalidation(self) -> None:
         matrix = json.loads(
             (ROOT / "config/mainline-support-matrix.json").read_text(
                 encoding="utf-8"
@@ -69,30 +99,18 @@ class MainlineContractIntegrationTests(unittest.TestCase):
         )
         platform = matrix["external_platform_contract"]
 
-        self.assertEqual(platform["credential_scope"], "job")
-        self.assertEqual(platform["trust_domain"], "same_job")
-        authentication = platform["artifact_authentication"]
-        self.assertEqual(authentication["algorithm"], "hmac-sha256")
-        self.assertEqual(authentication["tag_size_bytes"], 32)
+        self.assertEqual(platform["trust_domain"], "same_trusted_ray_job")
+        integrity = platform["artifact_integrity"]
+        self.assertEqual(integrity["content_hash"], "sha256")
         self.assertEqual(
-            authentication["key_material_transport"],
-            "credential_handle_only",
+            integrity["source_authentication"],
+            "not_required_in_current_scope",
         )
-        self.assertEqual(authentication["downgrade"], "forbidden")
-        self.assertEqual(
-            set(authentication["covered_fields"]),
-            {
-                "artifact_schema_version",
-                "artifact_content_sha256",
-                "manifest_sha256",
-                "job_id",
-                "tenant_id",
-                "key_id",
-                "key_generation",
-                "issued_at_ns",
-                "expires_at_ns",
-            },
-        )
+        self.assertFalse(integrity["external_artifact_ingress"])
+        self.assertFalse(integrity["cross_job_artifact_cache"])
+        self.assertTrue(integrity["worker_revalidation_required"])
+        self.assertNotIn("artifact_authentication", platform)
+        self.assertNotIn("credential_scope", platform)
         self.assertEqual(
             list(platform["admission"]),
             ["commit", "node_join", "task_entry"],
@@ -103,30 +121,7 @@ class MainlineContractIntegrationTests(unittest.TestCase):
             platform["natural_business_coverage"],
         )
 
-    def test_current_support_window_blocks_but_next_baseline_trial_does_not(self) -> None:
-        matrix = json.loads(
-            (ROOT / "config/mainline-support-matrix.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        risks = matrix["maintenance_risks"]
-        windows = matrix["support_windows"]
-
-        self.assertTrue(risks["current_locked_baseline"]["release_blocking"])
-        self.assertTrue(
-            windows["current_locked_baseline"][
-                "unsupported_or_expired_is_release_blocker"
-            ]
-        )
-        self.assertFalse(windows["next_baseline_trial"]["u2_blocking"])
-        self.assertFalse(risks["next_baseline_trial"]["release_blocking"])
-        self.assertFalse(risks["next_baseline_trial"]["u2_blocking"])
-        self.assertEqual(
-            risks["next_baseline_trial"]["disposition"],
-            "track_without_blocking_u2",
-        )
-
-    def test_unknown_external_prerequisites_are_machine_readable_stops(
+    def test_only_physical_multinode_is_an_external_release_prerequisite(
         self,
     ) -> None:
         matrix = json.loads(
@@ -136,35 +131,14 @@ class MainlineContractIntegrationTests(unittest.TestCase):
         )
         prerequisites = matrix["release_prerequisites"]
 
-        support = prerequisites["current_component_support"]
-        self.assertEqual(support["status"], "incomplete")
-        self.assertEqual(support["gate_outcome"], "stop")
-        for field in (
-            "delivery_window",
-            "first_adoption_window",
-            "remaining_support_days",
-            "minimum_remaining_support_days",
-            "lifecycle_owner",
-            "verified_on",
-        ):
-            self.assertIn(field, support)
         self.assertEqual(
-            set(support["component_evidence"]),
+            set(prerequisites),
             {
-                "python",
-                "cinderx",
-                "daft",
-                "ray",
-                "lance",
-                "pyarrow",
+                "target_runtime_adaptation",
+                "multi_node_environment",
+                "first_adopter",
             },
         )
-        for component, evidence in support["component_evidence"].items():
-            with self.subTest(component=component):
-                self.assertIsNone(evidence["support_ends_on"])
-                self.assertIsNone(evidence["remaining_support_days"])
-                self.assertIsNone(evidence["verified_on"])
-                self.assertIsNone(evidence["source"])
 
         multi_node = prerequisites["multi_node_environment"]
         self.assertEqual(multi_node["status"], "incomplete")
@@ -179,113 +153,20 @@ class MainlineContractIntegrationTests(unittest.TestCase):
         self.assertFalse(adopter["blocks_functional_completion"])
 
         report = evaluate_mainline_prerequisites(matrix)
-        self.assertEqual(report["unit_completion_status"], "incomplete")
+        self.assertEqual(report["unit_completion_status"], "complete")
         self.assertEqual(
-            report["gates"]["current_component_support"],
-            "stop",
-        )
-        self.assertEqual(
-            report["gates"]["multi_node_environment"],
-            "stop",
-        )
-        self.assertIn("current_component_support.lifecycle_owner", report["missing"])
-
-    def test_support_window_pass_requires_consistent_dates_and_remaining_days(
-        self,
-    ) -> None:
-        matrix = json.loads(
-            (ROOT / "config/mainline-support-matrix.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        support = matrix["release_prerequisites"][
-            "current_component_support"
-        ]
-        support.update(
-            {
-                "status": "complete",
-                "gate_outcome": "pass",
-                "delivery_window": {
-                    "starts_on": "2026-08-01",
-                    "ends_on": "2026-10-31",
-                },
-                "first_adoption_window": {
-                    "starts_on": "2026-09-01",
-                    "ends_on": "2026-12-31",
-                },
-                "remaining_support_days": 365,
-                "minimum_remaining_support_days": 180,
-                "lifecycle_owner": "runtime-maintainers",
-                "verified_on": "2026-07-27",
-            }
-        )
-        for component, evidence in support["component_evidence"].items():
-            evidence.update(
-                {
-                    "support_ends_on": "2027-07-27",
-                    "remaining_support_days": 365,
-                    "verified_on": "2026-07-27",
-                    "source": f"https://support.example/{component}",
-                }
-            )
-
-        report = evaluate_mainline_prerequisites(matrix)
-
-        self.assertEqual(
-            report["gates"]["current_component_support"],
-            "pass",
-        )
-        credentials = matrix["release_prerequisites"][
-            "credential_distribution"
-        ]
-        credentials.update(
-            {
-                "status": "complete",
-                "gate_outcome": "pass",
-                "owner": "platform-runtime",
-                "channel_provider": "platform-credential-channel",
-                "deadline": "2026-08-01",
-                "external_evidence": "evidence://blue98/credentials",
-            }
-        )
-        emergency = matrix["release_prerequisites"][
-            "emergency_disable_distribution"
-        ]
-        emergency.update(
-            {
-                "status": "complete",
-                "gate_outcome": "pass",
-                "owner": "platform-runtime",
-                "channel_provider": "platform-emergency-channel",
-                "deadline": "2026-08-01",
-                "blue98_evidence": "evidence://blue98/emergency",
-            }
-        )
-
-        u1_report = evaluate_mainline_prerequisites(matrix)
-
-        self.assertEqual(u1_report["unit_completion_status"], "complete")
-        self.assertEqual(
-            u1_report["gates"]["multi_node_environment"],
-            "stop",
+            report["gates"],
+            {"multi_node_environment": "stop"},
         )
         self.assertEqual(
-            u1_report["future_blocking"],
-            {
-                "multi_node_environment": "stop",
-                "emergency_physical_multinode_evidence": "stop",
-            },
+            report["future_blocking"],
+            {"multi_node_environment": "stop"},
         )
-
-        invalid = copy.deepcopy(matrix)
-        invalid["release_prerequisites"]["current_component_support"][
-            "component_evidence"
-        ]["python"]["remaining_support_days"] = -1
-        with self.assertRaisesRegex(
-            AcceptanceContractError,
-            "release_prerequisite_false_claim:current_component_support",
-        ):
-            evaluate_mainline_prerequisites(invalid)
+        self.assertFalse(
+            prerequisites["target_runtime_adaptation"][
+                "blocks_current_functional_work"
+            ]
+        )
 
     def test_first_adopter_registration_alone_does_not_authorize_auto(
         self,

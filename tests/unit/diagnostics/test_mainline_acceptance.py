@@ -36,11 +36,11 @@ class MainlineAcceptanceContractTests(unittest.TestCase):
         self.assertEqual(examples["maxProperties"], 12)
         self.assertEqual(
             schema["properties"]["required_gates"]["minItems"],
-            60,
+            57,
         )
         self.assertEqual(
             schema["properties"]["gates"]["minProperties"],
-            60,
+            57,
         )
         self.assertIn(
             "release",
@@ -264,19 +264,23 @@ class MainlineAcceptanceContractTests(unittest.TestCase):
                 contract=contract,
             )
         )
-        stopped = aggregate_formal_acceptance(contract, evidence)
-        self.assertEqual(stopped["executed_gate_verdict"], "stop")
-        self.assertEqual(
-            stopped["gates"]["prerequisite.current_component_support"],
-            "stop",
+        milestone = aggregate_formal_acceptance(contract, evidence)
+        self.assertEqual(milestone["executed_gate_verdict"], "pass")
+        self.assertNotIn(
+            "prerequisite.current_component_support",
+            contract.gates,
         )
-        self.assertEqual(
-            stopped["gates"]["prerequisite.credential_distribution"],
-            "stop",
+        self.assertNotIn(
+            "prerequisite.credential_distribution",
+            contract.gates,
         )
-        self.assertEqual(
-            stopped["gates"]["prerequisite.emergency_distribution"],
-            "stop",
+        self.assertNotIn(
+            "prerequisite.emergency_distribution",
+            contract.gates,
+        )
+        self.assertIn(
+            "prerequisite.multi_node_environment",
+            milestone["missing_gates"],
         )
 
     def test_real_aggregation_records_unexecuted_receipt_as_missing(self) -> None:

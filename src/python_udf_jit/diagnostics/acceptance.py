@@ -4,7 +4,6 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -45,9 +44,6 @@ _EXPECTED_MAINLINE_RFCS = frozenset(
 )
 _DISABLED_ADVANCED_RFCS = tuple(
     f"RFC-{index:03d}" for index in range(9, 13)
-)
-_SUPPORT_COMPONENTS = frozenset(
-    {"python", "cinderx", "daft", "ray", "lance", "pyarrow"}
 )
 _SCALAR_PROFILE = "u13-formal-scalar-mainline-acceptance"
 _MAINLINE_PROFILE = "mainline-production"
@@ -624,192 +620,6 @@ def _missing_prerequisite_paths(
     return missing
 
 
-def _prerequisite_date(
-    value: object,
-    *,
-    field: str,
-    issues: list[str],
-) -> date | None:
-    if value is None or value == "":
-        return None
-    if not isinstance(value, str):
-        issues.append(f"{field}:date_invalid")
-        return None
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        issues.append(f"{field}:date_invalid")
-        return None
-
-
-def _prerequisite_nonnegative_int(
-    value: object,
-    *,
-    field: str,
-    issues: list[str],
-    allow_zero: bool,
-) -> int | None:
-    if value is None:
-        return None
-    minimum = 0 if allow_zero else 1
-    if type(value) is not int or value < minimum:
-        issues.append(f"{field}:integer_invalid")
-        return None
-    return value
-
-
-def _current_support_issues(
-    section: Mapping[str, Any],
-    *,
-    expected_components: set[str],
-) -> list[str]:
-    issues: list[str] = []
-    delivery = _mapping(
-        section.get("delivery_window"),
-        "current_component_support_delivery_window",
-    )
-    adoption = _mapping(
-        section.get("first_adoption_window"),
-        "current_component_support_first_adoption_window",
-    )
-    delivery_start = _prerequisite_date(
-        delivery.get("starts_on"),
-        field="current_component_support.delivery_window.starts_on",
-        issues=issues,
-    )
-    delivery_end = _prerequisite_date(
-        delivery.get("ends_on"),
-        field="current_component_support.delivery_window.ends_on",
-        issues=issues,
-    )
-    adoption_start = _prerequisite_date(
-        adoption.get("starts_on"),
-        field="current_component_support.first_adoption_window.starts_on",
-        issues=issues,
-    )
-    adoption_end = _prerequisite_date(
-        adoption.get("ends_on"),
-        field="current_component_support.first_adoption_window.ends_on",
-        issues=issues,
-    )
-    verified_on = _prerequisite_date(
-        section.get("verified_on"),
-        field="current_component_support.verified_on",
-        issues=issues,
-    )
-    remaining = _prerequisite_nonnegative_int(
-        section.get("remaining_support_days"),
-        field="current_component_support.remaining_support_days",
-        issues=issues,
-        allow_zero=True,
-    )
-    minimum = _prerequisite_nonnegative_int(
-        section.get("minimum_remaining_support_days"),
-        field="current_component_support.minimum_remaining_support_days",
-        issues=issues,
-        allow_zero=False,
-    )
-    if (
-        delivery_start is not None
-        and delivery_end is not None
-        and delivery_start > delivery_end
-    ):
-        issues.append(
-            "current_component_support.delivery_window:range_invalid"
-        )
-    if (
-        adoption_start is not None
-        and adoption_end is not None
-        and adoption_start > adoption_end
-    ):
-        issues.append(
-            "current_component_support.first_adoption_window:range_invalid"
-        )
-    if (
-        delivery_start is not None
-        and adoption_start is not None
-        and adoption_start < delivery_start
-    ):
-        issues.append(
-            "current_component_support.first_adoption_window:"
-            "starts_before_delivery"
-        )
-    if (
-        remaining is not None
-        and minimum is not None
-        and remaining < minimum
-    ):
-        issues.append(
-            "current_component_support.remaining_support_days:"
-            "below_minimum"
-        )
-
-    component_evidence = _mapping(
-        section.get("component_evidence"),
-        "current_component_support_component_evidence",
-    )
-    component_remaining: list[int] = []
-    for component in sorted(expected_components):
-        evidence = _mapping(
-            component_evidence.get(component),
-            f"current_component_support_component_{component}",
-        )
-        prefix = f"current_component_support.component_evidence.{component}"
-        support_end = _prerequisite_date(
-            evidence.get("support_ends_on"),
-            field=f"{prefix}.support_ends_on",
-            issues=issues,
-        )
-        component_verified = _prerequisite_date(
-            evidence.get("verified_on"),
-            field=f"{prefix}.verified_on",
-            issues=issues,
-        )
-        component_days = _prerequisite_nonnegative_int(
-            evidence.get("remaining_support_days"),
-            field=f"{prefix}.remaining_support_days",
-            issues=issues,
-            allow_zero=True,
-        )
-        if (
-            support_end is not None
-            and component_verified is not None
-            and component_days is not None
-            and component_days != (support_end - component_verified).days
-        ):
-            issues.append(f"{prefix}.remaining_support_days:mismatch")
-        if (
-            component_verified is not None
-            and verified_on is not None
-            and component_verified != verified_on
-        ):
-            issues.append(f"{prefix}.verified_on:snapshot_mismatch")
-        if (
-            support_end is not None
-            and adoption_end is not None
-            and support_end < adoption_end
-        ):
-            issues.append(f"{prefix}.support_ends_on:before_adoption_end")
-        if (
-            component_days is not None
-            and minimum is not None
-            and component_days < minimum
-        ):
-            issues.append(f"{prefix}.remaining_support_days:below_minimum")
-        if component_days is not None:
-            component_remaining.append(component_days)
-    if (
-        remaining is not None
-        and len(component_remaining) == len(expected_components)
-        and remaining != min(component_remaining)
-    ):
-        issues.append(
-            "current_component_support.remaining_support_days:"
-            "component_minimum_mismatch"
-        )
-    return issues
-
-
 def evaluate_mainline_prerequisites(
     matrix: Mapping[str, Any],
 ) -> dict[str, object]:
@@ -823,16 +633,6 @@ def evaluate_mainline_prerequisites(
         "release_prerequisites",
     )
     blocking_requirements = {
-        "current_component_support": (
-            ("delivery_window", "starts_on"),
-            ("delivery_window", "ends_on"),
-            ("first_adoption_window", "starts_on"),
-            ("first_adoption_window", "ends_on"),
-            ("remaining_support_days",),
-            ("minimum_remaining_support_days",),
-            ("lifecycle_owner",),
-            ("verified_on",),
-        ),
         "multi_node_environment": (
             ("owner",),
             ("reservation", "reservation_id"),
@@ -842,18 +642,6 @@ def evaluate_mainline_prerequisites(
             ("identity_owner",),
             ("external_evidence",),
         ),
-        "credential_distribution": (
-            ("owner",),
-            ("channel_provider",),
-            ("deadline",),
-            ("external_evidence",),
-        ),
-        "emergency_disable_distribution": (
-            ("owner",),
-            ("channel_provider",),
-            ("deadline",),
-            ("blue98_evidence",),
-        ),
     }
     missing: list[str] = []
     gates: dict[str, str] = {}
@@ -862,42 +650,12 @@ def evaluate_mainline_prerequisites(
             prerequisites.get(name),
             f"release_prerequisite_{name}",
         )
-        if name == "current_component_support":
-            component_evidence = _mapping(
-                section.get("component_evidence"),
-                "current_component_support_component_evidence",
-            )
-            if set(component_evidence) != _SUPPORT_COMPONENTS:
-                raise AcceptanceContractError(
-                    "current_component_support_components_invalid"
-                )
-            required_paths = (
-                *required_paths,
-                *(
-                    ("component_evidence", component, field)
-                    for component in sorted(_SUPPORT_COMPONENTS)
-                    for field in (
-                        "support_ends_on",
-                        "remaining_support_days",
-                        "verified_on",
-                        "source",
-                    )
-                ),
-            )
         section_missing = _missing_prerequisite_paths(
             section,
             prefix=name,
             required_paths=required_paths,
         )
-        semantic_issues = (
-            _current_support_issues(
-                section,
-                expected_components=set(_SUPPORT_COMPONENTS),
-            )
-            if name == "current_component_support"
-            else []
-        )
-        blockers = [*section_missing, *semantic_issues]
+        blockers = list(section_missing)
         expected_status = "incomplete" if blockers else "complete"
         expected_outcome = "stop" if blockers else "pass"
         if (
@@ -944,48 +702,29 @@ def evaluate_mainline_prerequisites(
         )
     missing.extend(adopter_missing)
 
-    next_baseline = _mapping(
-        prerequisites.get("next_baseline_trial"),
-        "release_prerequisite_next_baseline_trial",
+    target_runtime = _mapping(
+        prerequisites.get("target_runtime_adaptation"),
+        "release_prerequisite_target_runtime_adaptation",
     )
     if (
-        next_baseline.get("blocks_u2") is not False
-        or next_baseline.get("blocks_current_functional_work") is not False
+        target_runtime.get("target_python") != "3.11.6"
+        or target_runtime.get("current_validation_python") != "3.14.3"
+        or target_runtime.get("blocks_current_functional_work") is not False
     ):
         raise AcceptanceContractError(
-            "next_baseline_trial_must_be_non_blocking"
+            "target_runtime_adaptation_contract_invalid"
         )
-    emergency = _mapping(
-        prerequisites.get("emergency_disable_distribution"),
-        "release_prerequisite_emergency_disable_distribution",
-    )
 
     return {
-        "unit_completion_status": (
-            "complete"
-            if all(
-                gates[name] == "pass"
-                for name in (
-                    "current_component_support",
-                    "credential_distribution",
-                    "emergency_disable_distribution",
-                )
-            )
-            else "incomplete"
-        ),
+        "unit_completion_status": "complete",
         "gates": gates,
         "missing": sorted(missing),
         "future_blocking": {
             "multi_node_environment": gates["multi_node_environment"],
-            "emergency_physical_multinode_evidence": (
-                "stop"
-                if emergency.get("physical_multinode_evidence") in {None, ""}
-                else "pass"
-            ),
         },
         "rollout_ceiling": expected_rollout_ceiling,
         "non_blocking_tracking": {
-            "next_baseline_trial": next_baseline.get("status"),
+            "target_runtime_adaptation": target_runtime.get("status"),
             "first_adopter": expected_adopter_status,
         },
     }
@@ -1596,14 +1335,7 @@ def _gate_statuses(
             prerequisites.get("gates"),
             "mainline_prerequisite_gates",
         )
-        prerequisite_mapping = {
-            "current_component_support":
-                "prerequisite.current_component_support",
-            "credential_distribution":
-                "prerequisite.credential_distribution",
-            "emergency_disable_distribution":
-                "prerequisite.emergency_distribution",
-        }
+        prerequisite_mapping: dict[str, str] = {}
         for source_name, gate_id in prerequisite_mapping.items():
             raw_status = prerequisite_gates.get(source_name)
             if raw_status not in {"pass", "stop"}:

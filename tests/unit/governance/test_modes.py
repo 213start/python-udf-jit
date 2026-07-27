@@ -32,17 +32,17 @@ class ModeResolutionTests(unittest.TestCase):
         cases = (
             (
                 {
-                    "emergency_disabled": True,
+                    "locally_disabled": True,
                     "plugin_enabled": True,
                     "requested_mode": "auto",
                     "compatible": True,
                     "policy": _policy(),
                 },
-                "emergency_disabled",
+                "locally_disabled",
             ),
             (
                 {
-                    "emergency_disabled": False,
+                    "locally_disabled": False,
                     "plugin_enabled": False,
                     "requested_mode": "auto",
                     "compatible": True,
@@ -52,7 +52,7 @@ class ModeResolutionTests(unittest.TestCase):
             ),
             (
                 {
-                    "emergency_disabled": False,
+                    "locally_disabled": False,
                     "plugin_enabled": True,
                     "requested_mode": "off",
                     "compatible": False,
@@ -62,7 +62,7 @@ class ModeResolutionTests(unittest.TestCase):
             ),
             (
                 {
-                    "emergency_disabled": False,
+                    "locally_disabled": False,
                     "plugin_enabled": True,
                     "requested_mode": "auto",
                     "compatible": False,
@@ -72,7 +72,7 @@ class ModeResolutionTests(unittest.TestCase):
             ),
             (
                 {
-                    "emergency_disabled": False,
+                    "locally_disabled": False,
                     "plugin_enabled": True,
                     "requested_mode": "auto",
                     "compatible": True,
@@ -90,7 +90,7 @@ class ModeResolutionTests(unittest.TestCase):
 
     def test_observe_does_not_shadow_compile_without_two_explicit_authorizations(self) -> None:
         default = resolve_mode(
-            emergency_disabled=False,
+            locally_disabled=False,
             plugin_enabled=True,
             requested_mode="observe",
             compatible=True,
@@ -98,7 +98,7 @@ class ModeResolutionTests(unittest.TestCase):
             shadow_compile_requested=True,
         )
         policy_only = resolve_mode(
-            emergency_disabled=False,
+            locally_disabled=False,
             plugin_enabled=True,
             requested_mode="observe",
             compatible=True,
@@ -106,7 +106,7 @@ class ModeResolutionTests(unittest.TestCase):
             shadow_compile_requested=False,
         )
         authorized = resolve_mode(
-            emergency_disabled=False,
+            locally_disabled=False,
             plugin_enabled=True,
             requested_mode="observe",
             compatible=True,
@@ -121,7 +121,7 @@ class ModeResolutionTests(unittest.TestCase):
 
     def test_auto_requires_independent_rollout_authorization(self) -> None:
         decision = resolve_mode(
-            emergency_disabled=False,
+            locally_disabled=False,
             plugin_enabled=True,
             requested_mode="auto",
             compatible=True,

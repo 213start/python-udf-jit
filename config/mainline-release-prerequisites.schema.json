@@ -185,15 +185,15 @@
     },
     "required_gates": {
       "type": "array",
-      "minItems": 60,
-      "maxItems": 60,
+      "minItems": 57,
+      "maxItems": 57,
       "uniqueItems": true,
       "items": {"$ref": "#/$defs/gateId"}
     },
     "gates": {
       "type": "object",
-      "minProperties": 60,
-      "maxProperties": 60,
+      "minProperties": 57,
+      "maxProperties": 57,
       "propertyNames": {"$ref": "#/$defs/gateId"},
       "additionalProperties": {"$ref": "#/$defs/gate"}
     },

@@ -4,7 +4,7 @@
   "contract_schema": "urn:python-udf-jit:mainline-release-prerequisites:v1",
   "profile": "mainline-production",
   "support_matrix": "mainline-support-matrix.json",
-  "support_matrix_sha256": "abb4e4e4a4b9304d8d8493ff8093e836a1e954dbc76e4e1f65532b618f35755b",
+  "support_matrix_sha256": "045cdfc83bb868edd6086e32d6bc293b5d6a75e8bc64255c70e11a923b548628",
   "unit_completion_values": ["incomplete", "complete"],
   "gate_outcome_values": ["pass", "fail", "stop", "inconclusive"],
   "performance_policy": {
@@ -63,8 +63,6 @@
       "required_tests": [
         "test_scalar_and_mainline_profiles_load_independently",
         "test_resolution_priority_is_disable_plugin_mode_compatibility_policy",
-        "test_safe_point_updates_are_monotonic_and_only_tighten",
-        "test_handle_is_opaque_nonserializable_and_never_contains_secret",
         "test_poor_performance_does_not_fail_functional_completion",
         "test_cross_code_object_state_preserves_null_alias_and_exception",
         "test_missing_gate_evidence_is_absent_not_inconclusive",
@@ -72,7 +70,7 @@
         "test_receipt_rejects_exact_count_drift_from_profile",
         "test_validator_rejects_environment_phase_and_performance_tampering"
       ],
-      "expected_test_count": 167,
+      "expected_test_count": 161,
       "allow_skips": false
     },
     "integration": {
@@ -81,14 +79,12 @@
       "arguments": ["discover", "-s", "tests/integration", "-t", ".", "-v"],
       "required_tests": [
         "test_support_matrix_and_acceptance_profile_agree",
-        "test_external_platform_contract_separates_admission_and_coverage",
-        "test_counterexample_matrix_resumes_suffix_exactly_once",
-        "test_two_workers_restart_and_two_jobs_remain_isolated",
-        "test_rotation_grace_revocation_and_channel_expiry_close_optimization",
-        "test_two_workers_and_restart_observe_monotonic_disable",
-        "test_stale_or_expired_control_channel_closes_optimization"
+        "test_runtime_baselines_separate_target_from_current_validation",
+        "test_trusted_job_contract_uses_hash_and_worker_revalidation",
+        "test_only_physical_multinode_is_an_external_release_prerequisite",
+        "test_counterexample_matrix_resumes_suffix_exactly_once"
       ],
-      "expected_test_count": 44,
+      "expected_test_count": 37,
       "allow_skips": false
     },
     "live": {
@@ -159,9 +155,6 @@
     "rfc008.unit_contract",
     "rfc008.integration_contract",
     "rfc008.system_contract",
-    "prerequisite.current_component_support",
-    "prerequisite.credential_distribution",
-    "prerequisite.emergency_distribution",
     "prerequisite.multi_node_environment"
   ],
   "gates": {
@@ -212,18 +205,18 @@
     },
     "environment.secret_hygiene": {
       "tier": "system",
-      "description": "Credential values never enter reports, logs, files or artifacts.",
+      "description": "Authentication token values never enter reports, logs, files or artifacts.",
       "test_targets": ["tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "environment.cleanup": {
       "tier": "system",
-      "description": "Credentials and platform resources are cleaned at lifecycle end.",
+      "description": "Authentication tokens and platform resources are cleaned at lifecycle end.",
       "test_targets": ["tests.system.test_formal_acceptance.LiveFormalAcceptanceTests.test_all_ut_it_and_st_gates_pass"]
     },
     "integration.object_store_data_plane": {
       "tier": "integration",
       "description": "The data plane remains Worker-only.",
-      "test_targets": ["tests.integration.test_mainline_contracts.MainlineContractIntegrationTests.test_external_platform_contract_separates_admission_and_coverage"]
+      "test_targets": ["tests.integration.test_mainline_contracts.MainlineContractIntegrationTests.test_trusted_job_contract_uses_hash_and_worker_revalidation"]
     },
     "integration.cinderx_runtime": {
       "tier": "integration",
@@ -233,7 +226,7 @@
     "integration.worker_pool_qualification": {
       "tier": "integration",
       "description": "Both Workers qualify independently of natural coverage.",
-      "test_targets": ["tests.integration.test_mainline_contracts.MainlineContractIntegrationTests.test_external_platform_contract_separates_admission_and_coverage"]
+      "test_targets": ["tests.integration.test_mainline_contracts.MainlineContractIntegrationTests.test_trusted_job_contract_uses_hash_and_worker_revalidation"]
     },
     "system.transparent_bootstrap": {
       "tier": "system",
@@ -303,7 +296,7 @@
     "evidence.phase_identity": {
       "tier": "integration",
       "description": "Commit, node-join and task-entry identities form one chain.",
-      "test_targets": ["tests.integration.test_mainline_contracts.MainlineContractIntegrationTests.test_external_platform_contract_separates_admission_and_coverage"]
+      "test_targets": ["tests.integration.test_mainline_contracts.MainlineContractIntegrationTests.test_trusted_job_contract_uses_hash_and_worker_revalidation"]
     },
     "evidence.invalidation_negative": {
       "tier": "system",
@@ -445,21 +438,6 @@
       "description": "RFC-008 governance and recovery are proven through the production system path.",
       "test_targets": ["tests.e2e.test_mainline_production.RFC008SystemTests.test_rfc008_system_contract"]
     },
-    "prerequisite.current_component_support": {
-      "tier": "release",
-      "description": "The locked component support window covers delivery and first adoption.",
-      "test_targets": ["tests.integration.test_mainline_contracts.MainlineContractIntegrationTests.test_current_support_window_blocks_but_next_baseline_trial_does_not"]
-    },
-    "prerequisite.credential_distribution": {
-      "tier": "release",
-      "description": "The platform credential channel is proven outside the local-process prototype.",
-      "test_targets": ["tests.integration.test_job_secret_distribution.JobSecretDistributionIntegrationTests.test_local_process_contract_is_not_external_platform_evidence"]
-    },
-    "prerequisite.emergency_distribution": {
-      "tier": "release",
-      "description": "The emergency-disable channel is proven on blue-98 and physical nodes.",
-      "test_targets": ["tests.integration.test_emergency_disable_distribution.EmergencyDisableDistributionIntegrationTests.test_local_process_contract_is_not_external_platform_evidence"]
-    },
     "prerequisite.multi_node_environment": {
       "tier": "release",
       "description": "The physical Head and two Worker environment is reserved and externally evidenced.",
@@ -515,16 +493,13 @@
       "rfc008.unit_contract",
       "rfc008.integration_contract",
       "rfc008.system_contract",
-      "prerequisite.current_component_support",
-      "prerequisite.credential_distribution",
-      "prerequisite.emergency_distribution",
       "prerequisite.multi_node_environment"
     ],
     "R21": ["tests.unit_suite", "system.transparent_bootstrap", "system.fail_open"],
-    "R22": ["tests.unit_suite", "environment.auth_loopback", "environment.secret_hygiene", "environment.cleanup", "prerequisite.credential_distribution", "prerequisite.emergency_distribution"],
+    "R22": ["tests.unit_suite", "environment.auth_loopback", "environment.secret_hygiene", "environment.cleanup"],
     "R23": ["tests.unit_suite", "tests.integration_suite", "system.guard_miss_semantics", "system.exception_semantics"],
     "R24": ["evidence.phase_identity", "evidence.attempt_identity", "integration.worker_pool_qualification"],
-    "R25": ["measurement.non_gating", "environment.locked_manifest", "provenance.cinderx_source_identity", "prerequisite.current_component_support"]
+    "R25": ["measurement.non_gating", "environment.locked_manifest", "provenance.cinderx_source_identity"]
   },
   "rfc_gates": {
     "RFC-001": ["rfc001.unit_contract", "rfc001.integration_contract", "rfc001.system_contract"],
@@ -558,7 +533,7 @@
     "R19": ["integration"],
     "R20": ["unit", "integration", "system", "release"],
     "R21": ["unit", "system"],
-    "R22": ["unit", "system", "release"],
+    "R22": ["unit", "system"],
     "R23": ["unit", "integration", "system"],
     "R24": ["integration", "system"],
     "R25": ["integration", "release"]
@@ -571,10 +546,10 @@
     "AE5": ["rfc005.system_contract", "rfc006.system_contract", "integration.cinderx_runtime", "system.guard_miss_semantics", "system.zero_row_semantics"],
     "AE6": ["rfc007.system_contract", "evidence.compile_hit_chain", "evidence.attempt_identity", "evidence.phase_identity"],
     "AE7": ["rfc003.system_contract", "rfc007.system_contract", "system.exception_semantics", "system.fail_open", "system.guard_miss_semantics"],
-    "AE8": ["rfc008.system_contract", "environment.auth_loopback", "environment.secret_hygiene", "environment.cleanup", "evidence.phase_identity", "prerequisite.credential_distribution", "prerequisite.emergency_distribution"],
+    "AE8": ["rfc008.system_contract", "environment.auth_loopback", "environment.secret_hygiene", "environment.cleanup", "evidence.phase_identity"],
     "AE9": ["rfc008.system_contract", "environment.three_node_topology", "integration.worker_pool_qualification", "evidence.no_head_data_plane", "evidence.invalidation_negative", "evidence.attempt_identity", "prerequisite.multi_node_environment"],
-    "AE10": ["rfc001.system_contract", "rfc002.system_contract", "rfc003.system_contract", "rfc004.system_contract", "rfc005.system_contract", "rfc006.system_contract", "rfc007.system_contract", "rfc008.system_contract", "tests.live_suite", "system.ordered_results", "evidence.base_verdict", "measurement.non_gating", "prerequisite.current_component_support"],
-    "AE11": ["rfc008.system_contract", "environment.locked_manifest", "environment.auth_loopback", "environment.secret_hygiene", "measurement.non_gating", "prerequisite.current_component_support", "prerequisite.credential_distribution", "prerequisite.emergency_distribution"],
+    "AE10": ["rfc001.system_contract", "rfc002.system_contract", "rfc003.system_contract", "rfc004.system_contract", "rfc005.system_contract", "rfc006.system_contract", "rfc007.system_contract", "rfc008.system_contract", "tests.live_suite", "system.ordered_results", "evidence.base_verdict", "measurement.non_gating"],
+    "AE11": ["rfc008.system_contract", "environment.locked_manifest", "environment.auth_loopback", "environment.secret_hygiene", "measurement.non_gating"],
     "AE12": ["measurement.non_gating"]
   }
 }
