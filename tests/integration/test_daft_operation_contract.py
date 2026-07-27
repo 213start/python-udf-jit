@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -20,6 +21,9 @@ from python_udf_jit.integration.daft_ray.compatibility import (
     DAFT_V0_7_2_TARGET,
 )
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
+
+
+_CHILD_ENVIRONMENT = "UDFJIT_U2_DAFT_CONTRACT_CHILD"
 
 
 def _projection(value: float) -> float:
@@ -52,6 +56,10 @@ def _raising_projection(value: float) -> float:
 class DaftOperationContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if importlib.util.find_spec("daft") is None:
+            raise unittest.SkipTest("requires Daft 0.7.2")
+        if os.environ.get(_CHILD_ENVIRONMENT) != "1":
+            return
         try:
             import daft
             from daft.dataframe.dataframe import DataFrame
@@ -66,12 +74,36 @@ class DaftOperationContractTest(unittest.TestCase):
         cls.daft.set_runner_native()
 
     def setUp(self):
+        if os.environ.get(_CHILD_ENVIRONMENT) != "1":
+            return
         uninstall_daft_control_hooks(self.Func, self.DataFrame)
         clear_events()
 
     def tearDown(self):
+        if os.environ.get(_CHILD_ENVIRONMENT) != "1":
+            return
         uninstall_daft_control_hooks(self.Func, self.DataFrame)
         clear_events()
+
+    def _delegate_to_fresh_interpreter(self) -> bool:
+        if os.environ.get(_CHILD_ENVIRONMENT) == "1":
+            return False
+        environment = dict(os.environ, **{_CHILD_ENVIRONMENT: "1"})
+        environment.pop("UDFJIT_LIVE_RAY", None)
+        completed = subprocess.run(
+            [sys.executable, "-m", "unittest", "-v", self.id()],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=90,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"{completed.stdout}\n{completed.stderr}",
+        )
+        return True
 
     def _install(self, mode: str):
         registry = CandidateRegistry(
@@ -89,6 +121,8 @@ class DaftOperationContractTest(unittest.TestCase):
         return result, registry
 
     def test_real_where_select_with_columns_preserve_options_and_scalar_semantics(self):
+        if self._delegate_to_fresh_interpreter():
+            return
         result, registry = self._install("observe")
         self.assertEqual(result.status, HookStatus.INSTALLED)
         projection = self.daft.func(
@@ -168,6 +202,8 @@ class DaftOperationContractTest(unittest.TestCase):
         )
 
     def test_off_and_observe_match_without_repeating_side_effects(self):
+        if self._delegate_to_fresh_interpreter():
+            return
         values = [1.0, 2.0, 3.0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -217,6 +253,8 @@ class DaftOperationContractTest(unittest.TestCase):
         self.assertEqual(observations["observe"][2], 1)
 
     def test_off_and_observe_preserve_real_daft_exception_semantics(self):
+        if self._delegate_to_fresh_interpreter():
+            return
         observations = {}
         for mode in ("off", "observe"):
             uninstall_daft_control_hooks(self.Func, self.DataFrame)
@@ -266,6 +304,8 @@ class DaftOperationContractTest(unittest.TestCase):
         self.assertIn("u2-real-daft-error", observations["observe"][1])
 
     def test_explicit_pth_bootstrap_hooks_fresh_driver_and_worker_interpreters(self):
+        if self._delegate_to_fresh_interpreter():
+            return
         script = """
 import json, os, site, sys
 site.addsitedir(os.environ["UDFJIT_TEST_PURELIB"])
