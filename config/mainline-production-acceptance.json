@@ -4,7 +4,7 @@
   "contract_schema": "urn:python-udf-jit:mainline-release-prerequisites:v1",
   "profile": "mainline-production",
   "support_matrix": "mainline-support-matrix.json",
-  "support_matrix_sha256": "7d473dc7266c121a786d2ee4618a470e3714200ae3825c73a59c9eef8cac55ee",
+  "support_matrix_sha256": "abb4e4e4a4b9304d8d8493ff8093e836a1e954dbc76e4e1f65532b618f35755b",
   "unit_completion_values": ["incomplete", "complete"],
   "gate_outcome_values": ["pass", "fail", "stop", "inconclusive"],
   "performance_policy": {

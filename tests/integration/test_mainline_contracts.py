@@ -235,6 +235,47 @@ class MainlineContractIntegrationTests(unittest.TestCase):
             report["gates"]["current_component_support"],
             "pass",
         )
+        credentials = matrix["release_prerequisites"][
+            "credential_distribution"
+        ]
+        credentials.update(
+            {
+                "status": "complete",
+                "gate_outcome": "pass",
+                "owner": "platform-runtime",
+                "channel_provider": "platform-credential-channel",
+                "deadline": "2026-08-01",
+                "external_evidence": "evidence://blue98/credentials",
+            }
+        )
+        emergency = matrix["release_prerequisites"][
+            "emergency_disable_distribution"
+        ]
+        emergency.update(
+            {
+                "status": "complete",
+                "gate_outcome": "pass",
+                "owner": "platform-runtime",
+                "channel_provider": "platform-emergency-channel",
+                "deadline": "2026-08-01",
+                "blue98_evidence": "evidence://blue98/emergency",
+            }
+        )
+
+        u1_report = evaluate_mainline_prerequisites(matrix)
+
+        self.assertEqual(u1_report["unit_completion_status"], "complete")
+        self.assertEqual(
+            u1_report["gates"]["multi_node_environment"],
+            "stop",
+        )
+        self.assertEqual(
+            u1_report["future_blocking"],
+            {
+                "multi_node_environment": "stop",
+                "emergency_physical_multinode_evidence": "stop",
+            },
+        )
 
         invalid = copy.deepcopy(matrix)
         invalid["release_prerequisites"]["current_component_support"][

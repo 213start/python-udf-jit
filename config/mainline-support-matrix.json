@@ -241,7 +241,8 @@
       "local_evidence_scope": "local_process_contract",
       "blue98_evidence": null,
       "physical_multinode_evidence": null,
-      "required_before": "U2"
+      "required_before": "U2",
+      "physical_multinode_required_before": "U7"
     },
     "first_adopter": {
       "status": "incomplete",

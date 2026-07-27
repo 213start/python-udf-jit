@@ -853,7 +853,6 @@ def evaluate_mainline_prerequisites(
             ("channel_provider",),
             ("deadline",),
             ("blue98_evidence",),
-            ("physical_multinode_evidence",),
         ),
     }
     missing: list[str] = []
@@ -956,15 +955,34 @@ def evaluate_mainline_prerequisites(
         raise AcceptanceContractError(
             "next_baseline_trial_must_be_non_blocking"
         )
+    emergency = _mapping(
+        prerequisites.get("emergency_disable_distribution"),
+        "release_prerequisite_emergency_disable_distribution",
+    )
 
     return {
         "unit_completion_status": (
             "complete"
-            if all(outcome == "pass" for outcome in gates.values())
+            if all(
+                gates[name] == "pass"
+                for name in (
+                    "current_component_support",
+                    "credential_distribution",
+                    "emergency_disable_distribution",
+                )
+            )
             else "incomplete"
         ),
         "gates": gates,
         "missing": sorted(missing),
+        "future_blocking": {
+            "multi_node_environment": gates["multi_node_environment"],
+            "emergency_physical_multinode_evidence": (
+                "stop"
+                if emergency.get("physical_multinode_evidence") in {None, ""}
+                else "pass"
+            ),
+        },
         "rollout_ceiling": expected_rollout_ceiling,
         "non_blocking_tracking": {
             "next_baseline_trial": next_baseline.get("status"),
