@@ -10,7 +10,12 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
-from python_udf_jit.diagnostics.evidence import EvidenceRun, aggregate_run_evidence
+from python_udf_jit.diagnostics.evidence import (
+    EvidenceContractError,
+    EvidenceRun,
+    aggregate_run_evidence,
+    sanitize_event,
+)
 from tests.e2e.live_job import (
     _extract_events,
     _join_ray_task_attempts,
@@ -547,6 +552,18 @@ class EvidenceAggregationTests(unittest.TestCase):
 
     def test_raw_event_permissions_whitelist_canary_and_cleanup_on_all_verdicts(self) -> None:
         canary = "CANARY-DO-NOT-LEAK-42"
+        dependency_rejection = _passing_events()[0] | {
+            "reason_code": "unsupported_dependency"
+        }
+        self.assertEqual(
+            sanitize_event(dependency_rejection)["reason_code"],
+            "unsupported_dependency",
+        )
+        with self.assertRaisesRegex(EvidenceContractError, "event_reason_invalid"):
+            sanitize_event(
+                dependency_rejection | {"reason_code": "unregistered_reason"}
+            )
+
         for expected in ("pass", "fail", "inconclusive"):
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as root:
                 evidence = _base_evidence()

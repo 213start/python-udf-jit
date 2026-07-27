@@ -44,6 +44,7 @@ _REASON_CODES = frozenset(
         "compatible_expression_call",
         "with_columns_projection",
         "unsupported_opcode",
+        "unsupported_dependency",
         "opaque_call",
         "unsupported_original_callable",
         "verified",
