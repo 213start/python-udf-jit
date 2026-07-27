@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import importlib
 import functools
+import json
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from python_udf_jit.bootstrap import install_post_import_hook
+from python_udf_jit.compiler.capture import try_capture
 from python_udf_jit.diagnostics.events import clear_events, snapshot_events
 from python_udf_jit.integration.daft_ray.compatibility import (
     callable_fingerprint,
@@ -41,14 +44,36 @@ def daft_affine_method(_instance: object, value: float) -> float:
     return affine(value)
 
 
+class FakePyExpr:
+    def _hash(self):
+        return id(self)
+
+
 class FakeExpression:
     def __init__(self, worker_callable=None):
         self.worker_callable = worker_callable
+        self._expr = FakePyExpr()
+
+
+class FakeComposedExpression(FakeExpression):
+    def __init__(self, child):
+        super().__init__()
+        self.child = child
 
 
 class FakeFunc:
-    def __init__(self, method=add_one):
+    def __init__(
+        self,
+        method=add_one,
+        *,
+        on_error="raise",
+        max_retries=2,
+        use_process=True,
+    ):
         self._method = method
+        self.on_error = on_error
+        self.max_retries = max_retries
+        self.use_process = use_process
         self.original_call_count = 0
 
     def __call__(self, *args, **kwargs):
@@ -64,9 +89,26 @@ class RaisingFakeFunc(FakeFunc):
         raise LookupError("daft-original-error")
 
 
+class RecursiveFakeFunc(FakeFunc):
+    def __init__(self):
+        super().__init__()
+        self.recursing = False
+
+    def __call__(self, *args, **kwargs):
+        if not self.recursing:
+            self.recursing = True
+            try:
+                return self(*args, **kwargs)
+            finally:
+                self.recursing = False
+        return super().__call__(*args, **kwargs)
+
+
 class FakeDataFrame:
     def __init__(self):
         self.original_with_columns_count = 0
+        self.original_where_count = 0
+        self.original_select_count = 0
 
     def schema(self):
         return {"value": "int64"}
@@ -78,10 +120,23 @@ class FakeDataFrame:
         self.original_with_columns_count += 1
         return ("dataframe", columns)
 
+    def where(self, predicate):
+        self.original_where_count += 1
+        return ("where", predicate)
+
+    def select(self, *columns, **projections):
+        self.original_select_count += 1
+        return ("select", columns, projections)
+
 
 class FakeFloatDataFrame(FakeDataFrame):
     def schema(self):
         return {"value": "float64"}
+
+
+class InvalidSchemaDataFrame(FakeDataFrame):
+    def schema(self):
+        return {"value": object()}
 
 
 class BrokenRegistry(CandidateRegistry):
@@ -110,11 +165,13 @@ class ControlHookTest(unittest.TestCase):
     def setUp(self):
         uninstall_daft_control_hooks(FakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RaisingFakeFunc, FakeDataFrame)
+        uninstall_daft_control_hooks(RecursiveFakeFunc, FakeDataFrame)
         clear_events()
 
     def tearDown(self):
         uninstall_daft_control_hooks(FakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RaisingFakeFunc, FakeDataFrame)
+        uninstall_daft_control_hooks(RecursiveFakeFunc, FakeDataFrame)
         clear_events()
 
     def test_off_mode_leaves_framework_methods_untouched(self):
@@ -176,7 +233,69 @@ class ControlHookTest(unittest.TestCase):
         self.assertEqual(dataframe.original_with_columns_count, 1)
         self.assertEqual(registry.finalization_count, 1)
         self.assertEqual(wrapper.usage_context, "projection")
-        self.assertEqual(wrapper.logical_schema, "{'value': 'int64'}")
+        schema = json.loads(wrapper.logical_schema)
+        self.assertEqual(schema["schema_version"], 1)
+        self.assertEqual(
+            schema["fields"][0]["logical_type"],
+            "int64",
+        )
+
+    def test_where_select_and_with_columns_finalize_each_candidate_once(self):
+        _, registry = install()
+        dataframe = FakeDataFrame()
+        projection = FakeFunc()(FakeExpression())
+        predicate = FakeFunc()(FakeExpression())
+        selected = FakeFunc()(FakeExpression())
+
+        dataframe.with_columns({"projected": projection})
+        dataframe.where(predicate)
+        dataframe.select(selected, duplicate=selected)
+
+        self.assertEqual(registry.finalization_count, 3)
+        self.assertEqual(projection.worker_callable.usage_context, "projection")
+        self.assertEqual(predicate.worker_callable.usage_context, "filter")
+        self.assertEqual(selected.worker_callable.usage_context, "selection")
+        self.assertEqual(dataframe.original_with_columns_count, 1)
+        self.assertEqual(dataframe.original_where_count, 1)
+        self.assertEqual(dataframe.original_select_count, 1)
+
+    def test_serialized_expression_lineage_finds_nested_candidate(self):
+        _, registry = install()
+        direct = FakeFunc()(FakeExpression())
+        nested = FakeComposedExpression(direct)
+
+        FakeDataFrame().select(nested)
+
+        self.assertEqual(registry.finalization_count, 1)
+        self.assertEqual(direct.worker_callable.usage_context, "selection")
+
+    def test_udf_options_and_method_are_stable_across_concurrent_calls(self):
+        _, registry = install()
+        func = FakeFunc(on_error="log", max_retries=7, use_process=False)
+        original_method = func._method
+        before = (func.on_error, func.max_retries, func.use_process)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            expressions = list(
+                executor.map(
+                    lambda _index: func(FakeExpression()),
+                    range(32),
+                )
+            )
+
+        self.assertIs(func._method, original_method)
+        self.assertEqual(
+            (func.on_error, func.max_retries, func.use_process),
+            before,
+        )
+        self.assertEqual(registry.registration_count, 1)
+        self.assertEqual(func.original_call_count, 32)
+        self.assertTrue(
+            all(
+                isinstance(expression.worker_callable, FallbackOnlyWrapper)
+                for expression in expressions
+            )
+        )
 
     def test_supported_float64_candidate_finalizes_a_real_inline_artifact(self):
         registry = CandidateRegistry(MANIFEST_SHA256)
@@ -203,6 +322,37 @@ class ControlHookTest(unittest.TestCase):
         finally:
             uninstall_daft_control_hooks(FakeFunc, FakeFloatDataFrame)
 
+    def test_capture_is_deferred_until_operation_schema_is_available(self):
+        registry = CandidateRegistry(MANIFEST_SHA256)
+        target = target_for_objects(
+            SimpleNamespace(__version__="0.7.2"), FakeFunc, FakeFloatDataFrame
+        )
+        result = install_daft_control_hooks(
+            daft_module=SimpleNamespace(__version__="0.7.2"),
+            func_class=FakeFunc,
+            dataframe_class=FakeFloatDataFrame,
+            expression_class=FakeExpression,
+            mode="auto",
+            registry=registry,
+            target=target,
+        )
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        try:
+            func = FakeFunc(daft_affine_method)
+            with mock.patch(
+                "python_udf_jit.integration.daft_ray.registry.try_capture",
+                wraps=try_capture,
+            ) as capture:
+                expression = func(FakeExpression())
+                capture.assert_not_called()
+
+                FakeFloatDataFrame().with_columns({"result": expression})
+
+            capture.assert_called_once()
+            self.assertIs(capture.call_args.args[0].callable_object, func)
+        finally:
+            uninstall_daft_control_hooks(FakeFunc, FakeFloatDataFrame)
+
     def test_registry_failure_calls_original_framework_method_once(self):
         registry = BrokenRegistry(MANIFEST_SHA256)
         install(registry=registry)
@@ -226,6 +376,46 @@ class ControlHookTest(unittest.TestCase):
         self.assertEqual(func.original_call_count, 1)
         self.assertIs(func._method, original_method)
 
+    def test_recursive_hook_entry_uses_original_call_and_restores_method(self):
+        install(func_class=RecursiveFakeFunc)
+        func = RecursiveFakeFunc()
+        original_method = func._method
+
+        expression = func(FakeExpression())
+
+        self.assertIs(func._method, original_method)
+        self.assertIsInstance(expression.worker_callable, FallbackOnlyWrapper)
+        self.assertEqual(func.original_call_count, 1)
+
+    def test_invalid_schema_fails_open_to_original_dataframe_operation(self):
+        registry = CandidateRegistry(MANIFEST_SHA256)
+        target = target_for_objects(
+            SimpleNamespace(__version__="0.7.2"),
+            FakeFunc,
+            InvalidSchemaDataFrame,
+        )
+        result = install_daft_control_hooks(
+            daft_module=SimpleNamespace(__version__="0.7.2"),
+            func_class=FakeFunc,
+            dataframe_class=InvalidSchemaDataFrame,
+            expression_class=FakeExpression,
+            mode="observe",
+            registry=registry,
+            target=target,
+        )
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        try:
+            expression = FakeFunc()(FakeExpression())
+            dataframe = InvalidSchemaDataFrame()
+
+            returned = dataframe.with_columns({"result": expression})
+
+            self.assertEqual(returned[0], "dataframe")
+            self.assertEqual(dataframe.original_with_columns_count, 1)
+            self.assertEqual(registry.finalization_count, 0)
+        finally:
+            uninstall_daft_control_hooks(FakeFunc, InvalidSchemaDataFrame)
+
     def test_events_distinguish_adapter_finalize_and_fallback(self):
         install()
         expression = FakeFunc()(FakeExpression())
@@ -235,6 +425,64 @@ class ControlHookTest(unittest.TestCase):
         stages = [event.stage for event in snapshot_events()]
         self.assertEqual(stages, ["adapter", "adapter", "execute"])
         self.assertNotIn("jit", stages)
+
+    def test_registry_ttl_and_job_cleanup_remove_candidate_lineage(self):
+        now = [0.0]
+        registry = CandidateRegistry(
+            MANIFEST_SHA256,
+            job_namespace="job-a",
+            ttl_seconds=5.0,
+            clock=lambda: now[0],
+        )
+        install(registry=registry)
+        func = FakeFunc()
+        expression = func(FakeExpression())
+
+        now[0] = 6.0
+
+        self.assertEqual(registry.purge_expired(), 1)
+        self.assertEqual(registry.records(), ())
+        self.assertEqual(
+            registry.finalize_operation(
+                FakeDataFrame(),
+                "with_columns",
+                ({"answer": expression},),
+                {},
+            ),
+            0,
+        )
+
+        registry.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            registry.records()
+
+    def test_registry_lru_eviction_removes_expression_lineage(self):
+        registry = CandidateRegistry(MANIFEST_SHA256, max_candidates=1)
+        install(registry=registry)
+        first_func = FakeFunc()
+        first = first_func(FakeExpression())
+        second_func = FakeFunc()
+        second = second_func(FakeExpression())
+
+        self.assertEqual(len(registry.records()), 1)
+        self.assertEqual(
+            registry.finalize_operation(
+                FakeDataFrame(),
+                "with_columns",
+                ({"first": first},),
+                {},
+            ),
+            0,
+        )
+        self.assertEqual(
+            registry.finalize_operation(
+                FakeDataFrame(),
+                "with_columns",
+                ({"second": second},),
+                {},
+            ),
+            1,
+        )
 
 
 class CompatibilityFingerprintTest(unittest.TestCase):

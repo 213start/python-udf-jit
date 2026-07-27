@@ -16,6 +16,7 @@ from python_udf_jit.integration.daft_ray.compatibility import (
     DAFT_V0_7_2_TARGET,
     CompatibilityTarget,
     validate_daft_compatibility,
+    validate_func_instance,
 )
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
 
@@ -24,6 +25,7 @@ _HOOK_MARKER = "__python_udf_jit_u2_hook__"
 _ORIGINAL_METHOD = "__python_udf_jit_original__"
 _INSTALL_LOCK = threading.RLock()
 _CALL_LOCK = threading.RLock()
+_CALL_STATE = threading.local()
 _DEFAULT_REGISTRY: CandidateRegistry | None = None
 
 
@@ -54,6 +56,25 @@ def _emit_fail_open(reason_code: str) -> None:
         pass
 
 
+def _contains_expression(value: Any, expression_class: type[Any]) -> bool:
+    pending = [value]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, expression_class):
+            return True
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+    return False
+
+
 def install_daft_control_hooks(
     *,
     daft_module: Any,
@@ -71,12 +92,18 @@ def install_daft_control_hooks(
 
     with _INSTALL_LOCK:
         func_method = func_class.__call__
-        dataframe_method = dataframe_class.with_columns
+        dataframe_methods = {
+            name: getattr(dataframe_class, name)
+            for name in ("where", "select", "with_columns")
+        }
         func_installed = bool(getattr(func_method, _HOOK_MARKER, False))
-        dataframe_installed = bool(getattr(dataframe_method, _HOOK_MARKER, False))
-        if func_installed and dataframe_installed:
+        operation_installed = {
+            name: bool(getattr(method, _HOOK_MARKER, False))
+            for name, method in dataframe_methods.items()
+        }
+        if func_installed and all(operation_installed.values()):
             return HookResult(HookStatus.ALREADY_INSTALLED, "hooks_already_installed")
-        if func_installed or dataframe_installed:
+        if func_installed or any(operation_installed.values()):
             _emit_fail_open("partial_hook_state")
             return HookResult(HookStatus.ERROR, "partial_hook_state")
 
@@ -88,20 +115,35 @@ def install_daft_control_hooks(
             return HookResult(HookStatus.INCOMPATIBLE, compatibility.reason)
 
         original_func_call = func_method
-        original_with_columns = dataframe_method
 
         @functools.wraps(original_func_call)
         def wrapped_func_call(self, *args, **kwargs):
             expression_values = (*args, *kwargs.values())
-            if not any(isinstance(value, expression_class) for value in expression_values):
+            if not any(
+                _contains_expression(value, expression_class)
+                for value in expression_values
+            ):
+                return original_func_call(self, *args, **kwargs)
+
+            instance_report = validate_func_instance(self, target)
+            if not instance_report.compatible:
+                _emit_fail_open(instance_report.reason)
                 return original_func_call(self, *args, **kwargs)
 
             with _CALL_LOCK:
+                active = getattr(_CALL_STATE, "active_func_ids", set())
+                if id(self) in active:
+                    return original_func_call(self, *args, **kwargs)
+                active = set(active)
+                active.add(id(self))
+                _CALL_STATE.active_func_ids = active
                 original_callable = self._method
                 try:
                     record = registry.register(self, original_callable)
                     self._method = record.wrapper
                 except Exception:
+                    active.remove(id(self))
+                    _CALL_STATE.active_func_ids = active
                     _emit_fail_open("candidate_registration_failed")
                     return original_func_call(self, *args, **kwargs)
 
@@ -109,6 +151,8 @@ def install_daft_control_hooks(
                     expression = original_func_call(self, *args, **kwargs)
                 finally:
                     self._method = original_callable
+                    active.remove(id(self))
+                    _CALL_STATE.active_func_ids = active
 
             try:
                 registry.bind_expression(expression, record)
@@ -116,20 +160,33 @@ def install_daft_control_hooks(
                 _emit_fail_open("expression_binding_failed")
             return expression
 
-        @functools.wraps(original_with_columns)
-        def wrapped_with_columns(self, columns):
-            try:
-                registry.finalize_columns(self, columns)
-            except Exception:
-                _emit_fail_open("operation_finalization_failed")
-            return original_with_columns(self, columns)
-
         setattr(wrapped_func_call, _HOOK_MARKER, True)
         setattr(wrapped_func_call, _ORIGINAL_METHOD, original_func_call)
-        setattr(wrapped_with_columns, _HOOK_MARKER, True)
-        setattr(wrapped_with_columns, _ORIGINAL_METHOD, original_with_columns)
         func_class.__call__ = wrapped_func_call
-        dataframe_class.with_columns = wrapped_with_columns
+        for operation_name, original_operation in dataframe_methods.items():
+            def make_operation_wrapper(name, original):
+                @functools.wraps(original)
+                def wrapped(self, *args, **kwargs):
+                    try:
+                        registry.finalize_operation(
+                            self,
+                            name,
+                            args,
+                            kwargs,
+                        )
+                    except Exception:
+                        _emit_fail_open("operation_finalization_failed")
+                    return original(self, *args, **kwargs)
+
+                setattr(wrapped, _HOOK_MARKER, True)
+                setattr(wrapped, _ORIGINAL_METHOD, original)
+                return wrapped
+
+            setattr(
+                dataframe_class,
+                operation_name,
+                make_operation_wrapper(operation_name, original_operation),
+            )
         return HookResult(HookStatus.INSTALLED, "compatible_hooks_installed")
 
 
@@ -142,9 +199,14 @@ def uninstall_daft_control_hooks(
         func_method = func_class.__call__
         if getattr(func_method, _HOOK_MARKER, False):
             func_class.__call__ = getattr(func_method, _ORIGINAL_METHOD)
-        dataframe_method = dataframe_class.with_columns
-        if getattr(dataframe_method, _HOOK_MARKER, False):
-            dataframe_class.with_columns = getattr(dataframe_method, _ORIGINAL_METHOD)
+        for operation_name in ("where", "select", "with_columns"):
+            dataframe_method = getattr(dataframe_class, operation_name)
+            if getattr(dataframe_method, _HOOK_MARKER, False):
+                setattr(
+                    dataframe_class,
+                    operation_name,
+                    getattr(dataframe_method, _ORIGINAL_METHOD),
+                )
 
 
 def _manifest_sha256_from_environment() -> str | None:
@@ -176,7 +238,13 @@ def install_default_daft_hooks(daft_module: Any) -> HookResult:
         dataframe_module = importlib.import_module("daft.dataframe.dataframe")
         expressions_module = importlib.import_module("daft.expressions.expressions")
         if _DEFAULT_REGISTRY is None:
-            _DEFAULT_REGISTRY = CandidateRegistry(manifest_sha256)
+            _DEFAULT_REGISTRY = CandidateRegistry(
+                manifest_sha256,
+                job_namespace=os.environ.get(
+                    "UDFJIT_JOB_NAMESPACE",
+                    "default-ray-job",
+                ),
+            )
         return install_daft_control_hooks(
             daft_module=daft_module,
             func_class=udf_module.Func,

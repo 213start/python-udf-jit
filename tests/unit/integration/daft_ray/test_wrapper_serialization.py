@@ -7,7 +7,10 @@ import unittest
 from unittest import mock
 
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
-from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
+from python_udf_jit.integration.daft_ray.wrapper import (
+    WRAPPER_SERIALIZATION_VERSION,
+    FallbackOnlyWrapper,
+)
 
 
 class OriginalFailure(RuntimeError):
@@ -68,6 +71,35 @@ class WrapperSerializationTest(unittest.TestCase):
 
         self.assertIs(wrapper._worker_adapter, adapter)
         self.assertIsNone(restored._worker_adapter)
+
+    def test_serialized_state_declares_the_current_version(self):
+        state = make_wrapper().__getstate__()
+
+        self.assertEqual(
+            state["_serialization_version"],
+            WRAPPER_SERIALIZATION_VERSION,
+        )
+
+    def test_deserialization_rejects_missing_or_unsupported_versions(self):
+        state = make_wrapper().__getstate__()
+
+        for version in (
+            None,
+            True,
+            0,
+            WRAPPER_SERIALIZATION_VERSION + 1,
+        ):
+            rejected = dict(state)
+            if version is None:
+                rejected.pop("_serialization_version")
+            else:
+                rejected["_serialization_version"] = version
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "wrapper_serialization_version_unsupported",
+                ):
+                    make_wrapper().__setstate__(rejected)
 
     def test_internal_event_failure_still_calls_original_once(self):
         original = CountingCallable()

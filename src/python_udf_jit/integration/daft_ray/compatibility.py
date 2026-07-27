@@ -10,9 +10,15 @@ from typing import Any, NamedTuple
 class CompatibilityTarget(NamedTuple):
     daft_version: str
     func_call_signature: tuple[tuple[str, str], ...]
+    where_signature: tuple[tuple[str, str], ...]
+    select_signature: tuple[tuple[str, str], ...]
     with_columns_signature: tuple[tuple[str, str], ...]
     func_call_fingerprint: str
+    where_fingerprint: str
+    select_fingerprint: str
     with_columns_fingerprint: str
+    func_private_fields: tuple[str, ...]
+    func_option_fields: tuple[str, ...]
 
 
 class CompatibilityReport(NamedTuple):
@@ -75,9 +81,15 @@ def target_for_objects(
     return CompatibilityTarget(
         daft_version=str(daft_module.__version__),
         func_call_signature=_signature_shape(func_class.__call__),
+        where_signature=_signature_shape(dataframe_class.where),
+        select_signature=_signature_shape(dataframe_class.select),
         with_columns_signature=_signature_shape(dataframe_class.with_columns),
         func_call_fingerprint=callable_fingerprint(func_class.__call__),
+        where_fingerprint=callable_fingerprint(dataframe_class.where),
+        select_fingerprint=callable_fingerprint(dataframe_class.select),
         with_columns_fingerprint=callable_fingerprint(dataframe_class.with_columns),
+        func_private_fields=("_method",),
+        func_option_fields=(),
     )
 
 
@@ -88,12 +100,37 @@ DAFT_V0_7_2_TARGET = CompatibilityTarget(
         ("args", "VAR_POSITIONAL"),
         ("kwargs", "VAR_KEYWORD"),
     ),
+    where_signature=(
+        ("self", "POSITIONAL_OR_KEYWORD"),
+        ("predicate", "POSITIONAL_OR_KEYWORD"),
+    ),
+    select_signature=(
+        ("self", "POSITIONAL_OR_KEYWORD"),
+        ("columns", "VAR_POSITIONAL"),
+        ("projections", "VAR_KEYWORD"),
+    ),
     with_columns_signature=(
         ("self", "POSITIONAL_OR_KEYWORD"),
         ("columns", "POSITIONAL_OR_KEYWORD"),
     ),
     func_call_fingerprint="a00f40a76de03be22da825d350a944f924db94f9e9e76282c67e64ba5e3c2f10",
+    where_fingerprint="c5a026d3a4107af36cbdf27114996bf1ec47f0f320eaecee8905994f53e74255",
+    select_fingerprint="c536214f29d8f081655de1e287108fba75d4139fd13528484e5e77f925db269e",
     with_columns_fingerprint="ef8fda2e61c1a25f9f3d016bae088494556687e4b9af6c22b51755262a75ae6b",
+    func_private_fields=("_cls", "_method"),
+    func_option_fields=(
+        "batch_size",
+        "gpus",
+        "is_async",
+        "is_batch",
+        "is_generator",
+        "max_concurrency",
+        "max_retries",
+        "on_error",
+        "return_dtype",
+        "unnest",
+        "use_process",
+    ),
 )
 
 
@@ -110,12 +147,16 @@ def validate_daft_compatibility(
     checks = (
         ("version", actual.daft_version, target.daft_version),
         ("func_signature", actual.func_call_signature, target.func_call_signature),
+        ("where_signature", actual.where_signature, target.where_signature),
+        ("select_signature", actual.select_signature, target.select_signature),
         (
             "with_columns_signature",
             actual.with_columns_signature,
             target.with_columns_signature,
         ),
         ("func_fingerprint", actual.func_call_fingerprint, target.func_call_fingerprint),
+        ("where_fingerprint", actual.where_fingerprint, target.where_fingerprint),
+        ("select_fingerprint", actual.select_fingerprint, target.select_fingerprint),
         (
             "with_columns_fingerprint",
             actual.with_columns_fingerprint,
@@ -125,4 +166,38 @@ def validate_daft_compatibility(
     for name, actual_value, expected_value in checks:
         if actual_value != expected_value:
             return CompatibilityReport(False, f"{name}_mismatch")
+    return CompatibilityReport(True, "compatible")
+
+
+def validate_func_instance(
+    func: Any,
+    target: CompatibilityTarget = DAFT_V0_7_2_TARGET,
+) -> CompatibilityReport:
+    """Validate the private replacement seam and option-bearing state."""
+
+    try:
+        namespace = object.__getattribute__(func, "__dict__")
+    except (AttributeError, TypeError) as error:
+        return CompatibilityReport(
+            False,
+            f"func_state_unavailable:{type(error).__name__}",
+        )
+    if type(namespace) is not dict:
+        return CompatibilityReport(False, "func_state_nonstandard")
+    private_fields = tuple(
+        sorted(
+            name
+            for name in namespace
+            if name.startswith("_") and not name.startswith("__")
+        )
+    )
+    if private_fields != tuple(sorted(target.func_private_fields)):
+        return CompatibilityReport(False, "func_private_fields_mismatch")
+    missing_options = tuple(
+        field for field in target.func_option_fields if field not in namespace
+    )
+    if missing_options:
+        return CompatibilityReport(False, "func_option_fields_mismatch")
+    if not callable(namespace.get("_method")):
+        return CompatibilityReport(False, "func_method_invalid")
     return CompatibilityReport(True, "compatible")

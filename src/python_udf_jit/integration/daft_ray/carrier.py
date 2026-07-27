@@ -29,6 +29,117 @@ class InlineArtifactHandle:
 
 
 @dataclass(frozen=True)
+class ScalarCallView:
+    """Address-free metadata presented at the Driver/Worker call boundary."""
+
+    schema_version: int
+    candidate_id: str
+    usage_context: str
+    logical_schema_sha256: str
+    carrier_schema_version: int
+    handle_kind: str
+    content_sha256: str
+    size_bytes: int
+
+    @classmethod
+    def from_carrier(
+        cls,
+        *,
+        candidate_id: str,
+        usage_context: str,
+        logical_schema: str,
+        carrier: "ProductionCarrierState",
+    ) -> "ScalarCallView":
+        view = cls(
+            schema_version=1,
+            candidate_id=candidate_id,
+            usage_context=usage_context,
+            logical_schema_sha256=_sha256(logical_schema.encode("utf-8")),
+            carrier_schema_version=carrier.schema_version,
+            handle_kind=carrier.handle.kind,
+            content_sha256=carrier.handle.content_sha256,
+            size_bytes=carrier.handle.size_bytes,
+        )
+        view._validate()
+        return view
+
+    def to_bytes(self) -> bytes:
+        self._validate()
+        return json.dumps(
+            {
+                "candidate_id": self.candidate_id,
+                "carrier_schema_version": self.carrier_schema_version,
+                "content_sha256": self.content_sha256,
+                "handle_kind": self.handle_kind,
+                "logical_schema_sha256": self.logical_schema_sha256,
+                "schema_version": self.schema_version,
+                "size_bytes": self.size_bytes,
+                "usage_context": self.usage_context,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "ScalarCallView":
+        try:
+            document = json.loads(payload.decode("ascii"))
+            expected = {
+                "candidate_id",
+                "carrier_schema_version",
+                "content_sha256",
+                "handle_kind",
+                "logical_schema_sha256",
+                "schema_version",
+                "size_bytes",
+                "usage_context",
+            }
+            if type(document) is not dict or set(document) != expected:
+                raise CarrierContractError(
+                    "scalar call view fields do not match schema v1"
+                )
+            view = cls(
+                schema_version=document["schema_version"],
+                candidate_id=document["candidate_id"],
+                usage_context=document["usage_context"],
+                logical_schema_sha256=document["logical_schema_sha256"],
+                carrier_schema_version=document["carrier_schema_version"],
+                handle_kind=document["handle_kind"],
+                content_sha256=document["content_sha256"],
+                size_bytes=document["size_bytes"],
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
+            raise CarrierContractError(f"invalid scalar call view: {error}") from error
+        view._validate()
+        return view
+
+    def _validate(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or type(self.carrier_schema_version) is not int
+            or self.carrier_schema_version != 1
+        ):
+            raise CarrierContractError("unsupported scalar call view version")
+        if (
+            type(self.candidate_id) is not str
+            or not self.candidate_id
+            or type(self.usage_context) is not str
+            or self.usage_context not in {"filter", "selection", "projection"}
+            or type(self.handle_kind) is not str
+            or self.handle_kind not in {"placeholder", "inline-artifact"}
+            or type(self.size_bytes) is not int
+            or self.size_bytes < 0
+            or type(self.logical_schema_sha256) is not str
+            or type(self.content_sha256) is not str
+        ):
+            raise CarrierContractError("invalid scalar call view")
+        _require_sha256(self.logical_schema_sha256, "logical_schema_sha256")
+        _require_sha256(self.content_sha256, "content_sha256")
+
+
+@dataclass(frozen=True)
 class ProductionCarrierState:
     """Framework-neutral state container reused by later Daft hook/artifact units."""
 

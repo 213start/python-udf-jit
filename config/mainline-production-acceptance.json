@@ -68,9 +68,13 @@
         "test_missing_gate_evidence_is_absent_not_inconclusive",
         "test_named_profiles_and_explicit_json_paths_resolve",
         "test_receipt_rejects_exact_count_drift_from_profile",
-        "test_validator_rejects_environment_phase_and_performance_tampering"
+        "test_validator_rejects_environment_phase_and_performance_tampering",
+        "test_capture_is_deferred_until_operation_schema_is_available",
+        "test_where_select_and_with_columns_finalize_each_candidate_once",
+        "test_deserialization_rejects_missing_or_unsupported_versions",
+        "test_installs_packaged_pth_at_explicit_purelib_root_idempotently"
       ],
-      "expected_test_count": 161,
+      "expected_test_count": 177,
       "allow_skips": false
     },
     "integration": {
@@ -82,19 +86,29 @@
         "test_runtime_baselines_separate_target_from_current_validation",
         "test_trusted_job_contract_uses_hash_and_worker_revalidation",
         "test_only_physical_multinode_is_an_external_release_prerequisite",
-        "test_counterexample_matrix_resumes_suffix_exactly_once"
+        "test_counterexample_matrix_resumes_suffix_exactly_once",
+        "test_real_where_select_with_columns_preserve_options_and_scalar_semantics",
+        "test_off_and_observe_match_without_repeating_side_effects",
+        "test_off_and_observe_preserve_real_daft_exception_semantics",
+        "test_explicit_pth_bootstrap_hooks_fresh_driver_and_worker_interpreters",
+        "test_scalar_call_view_is_address_free_and_stable_across_worker_pickle"
       ],
-      "expected_test_count": 37,
+      "expected_test_count": 43,
       "allow_skips": false
     },
     "live": {
       "gate_id": "python.live",
       "tier": "system",
-      "arguments": ["discover", "-s", "tests/e2e", "-v"],
-      "required_tests": [
-        "test_live_evidence_is_supplied_by_the_external_harness"
+      "arguments": [
+        "tests.e2e.test_scalar_mainline_piercing",
+        "tests.integration.test_per_worker_artifact_qualification",
+        "-v"
       ],
-      "expected_test_count": 14,
+      "required_tests": [
+        "test_live_evidence_is_supplied_by_the_external_harness",
+        "test_same_production_plan_compiles_and_executes_on_each_worker"
+      ],
+      "expected_test_count": 15,
       "allow_skips": false
     }
   },
@@ -321,17 +335,28 @@
     "rfc001.unit_contract": {
       "tier": "unit",
       "description": "RFC-001 unit semantics are implemented by production code.",
-      "test_targets": ["tests.unit.mainline.test_rfc001.RFC001UnitTests.test_rfc001_unit_contract"]
+      "test_targets": [
+        "tests.unit.integration.daft_ray.test_control_hook.ControlHookTest.test_where_select_and_with_columns_finalize_each_candidate_once",
+        "tests.unit.integration.daft_ray.test_wrapper_serialization.WrapperSerializationTest.test_deserialization_rejects_missing_or_unsupported_versions",
+        "tests.unit.test_bootstrap_install.BootstrapInstallTests.test_installs_packaged_pth_at_explicit_purelib_root_idempotently"
+      ]
     },
     "rfc001.integration_contract": {
       "tier": "integration",
       "description": "RFC-001 integration semantics are implemented across the real adapter boundary.",
-      "test_targets": ["tests.integration.test_rfc001_mainline.RFC001IntegrationTests.test_rfc001_integration_contract"]
+      "test_targets": [
+        "tests.integration.test_daft_operation_contract.DaftOperationContractTest.test_real_where_select_with_columns_preserve_options_and_scalar_semantics",
+        "tests.integration.test_daft_operation_contract.DaftOperationContractTest.test_off_and_observe_match_without_repeating_side_effects",
+        "tests.integration.test_daft_operation_contract.DaftOperationContractTest.test_off_and_observe_preserve_real_daft_exception_semantics",
+        "tests.integration.test_daft_scalar_carrier_contract.DaftScalarCarrierContractTest.test_scalar_call_view_is_address_free_and_stable_across_worker_pickle"
+      ]
     },
     "rfc001.system_contract": {
       "tier": "system",
       "description": "RFC-001 is proven through the scalar mainline system path.",
-      "test_targets": ["tests.e2e.test_mainline_production.RFC001SystemTests.test_rfc001_system_contract"]
+      "test_targets": [
+        "tests.integration.test_per_worker_artifact_qualification.PerWorkerArtifactQualificationTests.test_same_production_plan_compiles_and_executes_on_each_worker"
+      ]
     },
     "rfc002.unit_contract": {
       "tier": "unit",

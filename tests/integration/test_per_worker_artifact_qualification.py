@@ -11,6 +11,14 @@ def _qualification_affine(value: float) -> float:
     return value * 2.0 + 3.0
 
 
+def _qualification_positive(value: float) -> bool:
+    return value > 0.0
+
+
+def _qualification_identity(value: float) -> float:
+    return float(value)
+
+
 def _qualification_runtime_report(_value: float) -> str:
     """Unsupported probe that reads only value-free events in the same carrier."""
 
@@ -97,11 +105,25 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
             )
 
             supported = daft.func(_qualification_affine)
+            positive = daft.func(_qualification_positive)
+            identity = daft.func(_qualification_identity)
             report_probe = daft.func(_qualification_runtime_report)
             dataframe = daft.from_pydict({"x": [1.25, 4.0]})
-            dataframe = dataframe.with_column("y", supported(daft.col("x")))
-            dataframe = dataframe.with_column(
-                "qualification_report", report_probe(daft.col("y"))
+            dataframe = dataframe.with_columns(
+                {"y": supported(daft.col("x"))}
+            )
+            dataframe = dataframe.where(positive(daft.col("x")))
+            dataframe = dataframe.select(
+                "x",
+                "y",
+                z=identity(daft.col("x")),
+            )
+            dataframe = dataframe.with_columns(
+                {
+                    "qualification_report": report_probe(
+                        daft.col("y")
+                    )
+                }
             )
 
             context = get_context()
@@ -150,16 +172,23 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
                         zip(
                             document["x"],
                             document["y"],
+                            document["z"],
                             document["qualification_report"],
                             strict=True,
                         )
                     )
                 self.assertEqual(
-                    sorted((x, y) for x, y, _ in rows),
+                    sorted((x, y, z) for x, y, z, _ in rows),
+                    [(1.25, 5.5, 1.25), (4.0, 11.0, 4.0)],
+                )
+                self.assertEqual(
+                    sorted((x, y) for x, y, _, _ in rows),
                     [(1.25, 5.5), (4.0, 11.0)],
                 )
                 self.assertEqual(len(rows), 2)
-                worker_reports = [json.loads(value) for _, _, value in rows]
+                worker_reports = [
+                    json.loads(value) for _, _, _, value in rows
+                ]
                 self.assertTrue(all(report == worker_reports[0] for report in worker_reports))
                 report = worker_reports[0]
                 self.assertEqual(report["node_id"], worker["NodeID"])
@@ -196,7 +225,10 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
                 ).hexdigest()
                 report["qualification_result_digest"] = hashlib.sha256(
                     json.dumps(
-                        sorted((float(x).hex(), float(y).hex()) for x, y, _ in rows),
+                        sorted(
+                            (float(x).hex(), float(y).hex())
+                            for x, y, _, _ in rows
+                        ),
                         separators=(",", ":"),
                     ).encode("ascii")
                 ).hexdigest()

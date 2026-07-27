@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import pickle
 import threading
+import time
 import weakref
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from python_udf_jit.compiler.capture import CaptureIR, CaptureRequest, try_capture
 from python_udf_jit.compiler.core_ir import lower_capture
@@ -13,25 +15,59 @@ from python_udf_jit.compiler.region import form_verified_region
 from python_udf_jit.diagnostics import events
 from python_udf_jit.diagnostics.events import DecisionEvent
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
+from python_udf_jit.integration.daft_ray.schema import canonicalize_schema
 from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
 from python_udf_jit.protocol.artifact import build_artifact
 from python_udf_jit.protocol.codec import encode_artifact
 
 
+_MAX_EXPRESSION_LINEAGE_BYTES = 1024 * 1024
+
+
+class _BoundedPickleSink:
+    """Capture framework expression state without allowing unbounded growth."""
+
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._payload = bytearray()
+
+    def write(self, payload: bytes) -> int:
+        if len(self._payload) + len(payload) > self._limit:
+            raise ValueError("expression_lineage_size_limit")
+        self._payload.extend(payload)
+        return len(payload)
+
+    def getvalue(self) -> bytes:
+        return bytes(self._payload)
+
+
 @dataclass
 class CandidateRecord:
+    registry_key: int
+    func_id: int
     candidate_id: str
     wrapper: FallbackOnlyWrapper
-    expression_id: int | None = None
+    capture_callable: Any
+    job_namespace: str
+    expires_at: float
+    expression_ids: set[int] = field(default_factory=set)
+    pyexpr_hashes: set[int] = field(default_factory=set)
     finalized: bool = False
     capture_ir: CaptureIR | None = None
 
 
-def _candidate_id(func: Any, original_callable: Callable[..., Any]) -> str:
+def _candidate_id(
+    func: Any,
+    original_callable: Callable[..., Any],
+    job_namespace: str,
+    registry_key: int,
+) -> str:
     code = getattr(original_callable, "__code__", None)
     code_bytes = getattr(code, "co_code", b"")
     identity = "\0".join(
         (
+            job_namespace,
+            str(registry_key),
             str(getattr(func, "func_id", "")),
             str(getattr(original_callable, "__module__", "")),
             str(getattr(original_callable, "__qualname__", "")),
@@ -43,28 +79,83 @@ def _candidate_id(func: Any, original_callable: Callable[..., Any]) -> str:
 class CandidateRegistry:
     """Bounded, process-local registry; it is never serialized to a Worker."""
 
-    def __init__(self, manifest_sha256: str, max_candidates: int = 1024):
+    def __init__(
+        self,
+        manifest_sha256: str,
+        max_candidates: int = 1024,
+        *,
+        job_namespace: str = "local-test-job",
+        ttl_seconds: float = 3600.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         if max_candidates <= 0:
             raise ValueError("max_candidates must be positive")
+        if not isinstance(job_namespace, str) or not job_namespace:
+            raise ValueError("job_namespace must not be empty")
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
         self._manifest_sha256 = manifest_sha256
         self._max_candidates = max_candidates
+        self._job_namespace = job_namespace
+        self._ttl_seconds = float(ttl_seconds)
+        self._clock = clock
         self._records: OrderedDict[int, CandidateRecord] = OrderedDict()
+        self._func_records: dict[int, CandidateRecord] = {}
         self._func_refs: dict[int, weakref.ReferenceType[Any] | None] = {}
         self._expression_records: dict[int, CandidateRecord] = {}
+        self._pyexpr_records: dict[int, CandidateRecord] = {}
         self._expression_refs: dict[int, weakref.ReferenceType[Any] | None] = {}
+        self._expression_hashes: dict[int, int] = {}
         self._lock = threading.RLock()
+        self._closed = False
+        self._next_registry_key = 0
         self.registration_count = 0
         self.finalization_count = 0
 
+    def _drop_record_locked(self, registry_key: int) -> CandidateRecord | None:
+        record = self._records.pop(registry_key, None)
+        if record is None:
+            return record
+        if self._func_records.get(record.func_id) is record:
+            self._func_records.pop(record.func_id, None)
+            self._func_refs.pop(record.func_id, None)
+        for expression_id in tuple(record.expression_ids):
+            if self._expression_records.get(expression_id) is record:
+                self._expression_records.pop(expression_id, None)
+            self._expression_refs.pop(expression_id, None)
+            self._expression_hashes.pop(expression_id, None)
+        for pyexpr_hash in tuple(record.pyexpr_hashes):
+            if self._pyexpr_records.get(pyexpr_hash) is record:
+                self._pyexpr_records.pop(pyexpr_hash, None)
+        record.expression_ids.clear()
+        record.pyexpr_hashes.clear()
+        return record
+
     def _drop_func(self, func_id: int) -> None:
         with self._lock:
-            self._records.pop(func_id, None)
-            self._func_refs.pop(func_id, None)
+            record = self._func_records.get(func_id)
+            if record is not None and not record.expression_ids:
+                self._drop_record_locked(record.registry_key)
 
     def _drop_expression(self, expression_id: int) -> None:
         with self._lock:
-            self._expression_records.pop(expression_id, None)
+            record = self._expression_records.pop(expression_id, None)
             self._expression_refs.pop(expression_id, None)
+            pyexpr_hash = self._expression_hashes.pop(expression_id, None)
+            if record is None:
+                return
+            record.expression_ids.discard(expression_id)
+            if pyexpr_hash is not None:
+                record.pyexpr_hashes.discard(pyexpr_hash)
+                if self._pyexpr_records.get(pyexpr_hash) is record:
+                    self._pyexpr_records.pop(pyexpr_hash, None)
+            func_ref = self._func_refs.get(record.func_id)
+            if (
+                not record.expression_ids
+                and func_ref is not None
+                and func_ref() is None
+            ):
+                self._drop_record_locked(record.registry_key)
 
     @staticmethod
     def _weakref_or_none(value: Any, callback) -> weakref.ReferenceType[Any] | None:
@@ -78,12 +169,34 @@ class CandidateRegistry:
     ) -> CandidateRecord:
         func_id = id(func)
         with self._lock:
-            existing = self._records.get(func_id)
+            self._assert_open()
+            self._purge_expired_locked()
+            existing = self._func_records.get(func_id)
+            func_ref = self._func_refs.get(func_id)
+            if (
+                existing is not None
+                and func_ref is not None
+                and func_ref() is not func
+            ):
+                if existing.expression_ids:
+                    self._func_records.pop(func_id, None)
+                    self._func_refs.pop(func_id, None)
+                else:
+                    self._drop_record_locked(existing.registry_key)
+                existing = None
             if existing is not None:
-                self._records.move_to_end(func_id)
+                self._records.move_to_end(existing.registry_key)
+                existing.expires_at = self._clock() + self._ttl_seconds
                 return existing
 
-            candidate_id = _candidate_id(func, original_callable)
+            self._next_registry_key += 1
+            registry_key = self._next_registry_key
+            candidate_id = _candidate_id(
+                func,
+                original_callable,
+                self._job_namespace,
+                registry_key,
+            )
             wrapper = FallbackOnlyWrapper(
                 candidate_id=candidate_id,
                 original_callable=original_callable,
@@ -91,20 +204,24 @@ class CandidateRegistry:
                     candidate_id, self._manifest_sha256
                 ),
             )
-            captured = try_capture(CaptureRequest(func))
             record = CandidateRecord(
-                candidate_id,
-                wrapper,
-                capture_ir=captured.capture_ir if captured.supported else None,
+                registry_key=registry_key,
+                func_id=func_id,
+                candidate_id=candidate_id,
+                wrapper=wrapper,
+                capture_callable=func,
+                job_namespace=self._job_namespace,
+                expires_at=self._clock() + self._ttl_seconds,
             )
-            self._records[func_id] = record
+            self._records[record.registry_key] = record
+            self._func_records[func_id] = record
             self._func_refs[func_id] = self._weakref_or_none(
                 func, lambda _ref, key=func_id: self._drop_func(key)
             )
             self.registration_count += 1
             while len(self._records) > self._max_candidates:
-                evicted_id, _ = self._records.popitem(last=False)
-                self._func_refs.pop(evicted_id, None)
+                evicted_key = next(iter(self._records))
+                self._drop_record_locked(evicted_key)
 
         events.try_emit(
             DecisionEvent(
@@ -119,40 +236,138 @@ class CandidateRegistry:
     def bind_expression(self, expression: Any, record: CandidateRecord) -> None:
         expression_id = id(expression)
         with self._lock:
-            record.expression_id = expression_id
+            self._assert_open()
+            if self._records.get(record.registry_key) is not record:
+                return
+            record.expires_at = self._clock() + self._ttl_seconds
+            pyexpr_hash = self._pyexpr_hash(expression)
+            record.expression_ids.add(expression_id)
             self._expression_records[expression_id] = record
+            if pyexpr_hash is not None:
+                record.pyexpr_hashes.add(pyexpr_hash)
+                self._pyexpr_records[pyexpr_hash] = record
+                self._expression_hashes[expression_id] = pyexpr_hash
             self._expression_refs[expression_id] = self._weakref_or_none(
                 expression,
                 lambda _ref, key=expression_id: self._drop_expression(key),
             )
 
-    def _records_for_expressions(
-        self, expressions: Iterable[Any]
-    ) -> tuple[CandidateRecord, ...]:
-        found: list[CandidateRecord] = []
-        seen: set[str] = set()
-        with self._lock:
-            for expression in expressions:
-                record = self._expression_records.get(id(expression))
-                if record is not None and record.candidate_id not in seen:
-                    found.append(record)
-                    seen.add(record.candidate_id)
+    @staticmethod
+    def _pyexpr_hash(expression: Any) -> int | None:
+        try:
+            namespace = object.__getattribute__(expression, "__dict__")
+        except (AttributeError, TypeError):
+            return None
+        if type(namespace) is not dict:
+            return None
+        pyexpr = namespace.get("_expr")
+        hasher = getattr(pyexpr, "_hash", None)
+        if not callable(hasher):
+            return None
+        try:
+            value = hasher()
+        except Exception:
+            return None
+        return value if type(value) is int else None
+
+    @staticmethod
+    def _walk_values(
+        roots: tuple[Any, ...],
+        *,
+        max_nodes: int = 4096,
+        max_depth: int = 32,
+    ) -> tuple[Any, ...]:
+        pending = [(root, 0) for root in roots]
+        found: list[Any] = []
+        visited: set[int] = set()
+        while pending:
+            value, depth = pending.pop()
+            if depth > max_depth:
+                raise ValueError("operation_expression_depth_limit")
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            if len(visited) > max_nodes:
+                raise ValueError("operation_expression_node_limit")
+            found.append(value)
+            if isinstance(value, dict):
+                pending.extend((item, depth + 1) for item in value.keys())
+                pending.extend((item, depth + 1) for item in value.values())
+            elif isinstance(value, (list, tuple)):
+                pending.extend((item, depth + 1) for item in value)
         return tuple(found)
 
-    def finalize_columns(self, dataframe: Any, columns: Any) -> int:
-        if not isinstance(columns, dict):
-            return 0
-        records = self._records_for_expressions(columns.values())
+    def _records_for_expressions(
+        self,
+        expressions: tuple[Any, ...],
+    ) -> tuple[CandidateRecord, ...]:
+        found: list[CandidateRecord] = []
+        seen: set[int] = set()
+        for expression in expressions:
+            pyexpr_hash = self._pyexpr_hash(expression)
+            with self._lock:
+                record = self._expression_records.get(id(expression))
+                if record is None and pyexpr_hash is not None:
+                    record = self._pyexpr_records.get(pyexpr_hash)
+                if record is not None and record.registry_key not in seen:
+                    found.append(record)
+                    seen.add(record.registry_key)
+                    continue
+            try:
+                sink = _BoundedPickleSink(_MAX_EXPRESSION_LINEAGE_BYTES)
+                pickle.Pickler(sink, protocol=5).dump(expression)
+                payload = sink.getvalue()
+            except Exception:
+                continue
+            with self._lock:
+                for candidate in self._records.values():
+                    if (
+                        candidate.registry_key not in seen
+                        and candidate.candidate_id.encode("ascii") in payload
+                    ):
+                        found.append(candidate)
+                        seen.add(candidate.registry_key)
+        return tuple(found)
+
+    def finalize_operation(
+        self,
+        dataframe: Any,
+        operation: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> int:
+        contexts = {
+            "where": "filter",
+            "select": "selection",
+            "with_columns": "projection",
+        }
+        context = contexts.get(operation)
+        if context is None:
+            raise ValueError("operation_unsupported")
+        with self._lock:
+            self._assert_open()
+            self._purge_expired_locked()
+        expressions = self._walk_values((*args, kwargs))
+        records = self._records_for_expressions(expressions)
         if not records:
             return 0
-        logical_schema = repr(dataframe.schema())
+        logical_schema = canonicalize_schema(dataframe.schema())
         finalized = 0
         for record in records:
             with self._lock:
                 if record.finalized:
                     continue
                 artifact_bytes: bytes | None = None
-                if record.capture_ir is not None and "float64" in logical_schema.lower():
+                if "float64" in logical_schema.lower():
+                    try:
+                        captured = try_capture(CaptureRequest(record.capture_callable))
+                        record.capture_ir = (
+                            captured.capture_ir if captured.supported else None
+                        )
+                    except Exception:
+                        record.capture_ir = None
+                if record.capture_ir is not None:
                     try:
                         module = lower_capture(record.capture_ir)
                         artifact_bytes = encode_artifact(
@@ -165,7 +380,7 @@ class CandidateRegistry:
                     except Exception:
                         artifact_bytes = None
                 if not record.wrapper.finalize(
-                    logical_schema, "projection", artifact_bytes
+                    logical_schema, context, artifact_bytes
                 ):
                     continue
                 record.finalized = True
@@ -175,12 +390,45 @@ class CandidateRegistry:
                 DecisionEvent(
                     stage="adapter",
                     decision="operation_finalized",
-                    reason_code="with_columns_projection",
+                    reason_code=f"{operation}_{context}",
                     candidate_id=record.candidate_id,
                 )
             )
         return finalized
 
+    def _assert_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("candidate_registry_closed")
+
+    def _purge_expired_locked(self) -> int:
+        now = self._clock()
+        expired = [
+            registry_key
+            for registry_key, record in self._records.items()
+            if record.expires_at <= now
+        ]
+        for registry_key in expired:
+            self._drop_record_locked(registry_key)
+        return len(expired)
+
+    def purge_expired(self) -> int:
+        with self._lock:
+            self._assert_open()
+            return self._purge_expired_locked()
+
+    def close(self) -> None:
+        with self._lock:
+            self._records.clear()
+            self._func_records.clear()
+            self._func_refs.clear()
+            self._expression_records.clear()
+            self._expression_refs.clear()
+            self._expression_hashes.clear()
+            self._pyexpr_records.clear()
+            self._closed = True
+
     def records(self) -> tuple[CandidateRecord, ...]:
         with self._lock:
+            self._assert_open()
+            self._purge_expired_locked()
             return tuple(self._records.values())

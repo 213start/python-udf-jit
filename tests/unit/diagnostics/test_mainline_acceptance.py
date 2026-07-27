@@ -221,7 +221,7 @@ class MainlineAcceptanceContractTests(unittest.TestCase):
         self.assertEqual(report["unit_completion_status"], "incomplete")
         self.assertFalse(report["release_ready"])
 
-    def test_real_aggregation_does_not_claim_unimplemented_rfc_gates(
+    def test_real_aggregation_only_claims_implemented_rfc_gates(
         self,
     ) -> None:
         from tests.unit.diagnostics.test_acceptance import (
@@ -249,7 +249,15 @@ class MainlineAcceptanceContractTests(unittest.TestCase):
         self.assertNotIn("incomplete", report["gates"].values())
         self.assertEqual(
             set(report["missing_rfcs"]),
-            {f"RFC-{index:03d}" for index in range(1, 9)},
+            {f"RFC-{index:03d}" for index in range(2, 9)},
+        )
+        self.assertEqual(report["rfcs"]["RFC-001"], "pass")
+        self.assertEqual(
+            {
+                report["gates"][gate]
+                for gate in contract.rfc_gates["RFC-001"]
+            },
+            {"pass"},
         )
         self.assertTrue(
             all(
