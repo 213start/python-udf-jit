@@ -73,9 +73,17 @@
         "test_capture_is_deferred_until_operation_schema_is_available",
         "test_where_select_and_with_columns_finalize_each_candidate_once",
         "test_deserialization_rejects_missing_or_unsupported_versions",
-        "test_installs_packaged_pth_at_explicit_purelib_root_idempotently"
+        "test_installs_packaged_pth_at_explicit_purelib_root_idempotently",
+        "test_rejects_an_unsupported_runtime_format_before_decoding",
+        "test_normalizes_required_opcode_families_without_source_values",
+        "test_decodes_exception_and_location_tables_with_complete_coverage",
+        "test_canonical_encoding_round_trips_and_is_cross_process_stable",
+        "test_rejects_corrupt_location_and_exception_tables",
+        "test_local_join_builds_control_edges_and_local_phi",
+        "test_short_circuit_builds_stack_phi",
+        "test_verifier_rejects_each_structural_layer"
       ],
-      "expected_test_count": 178,
+      "expected_test_count": 195,
       "allow_skips": false
     },
     "integration": {
@@ -92,9 +100,10 @@
         "test_off_and_observe_match_without_repeating_side_effects",
         "test_off_and_observe_preserve_real_daft_exception_semantics",
         "test_explicit_pth_bootstrap_hooks_fresh_driver_and_worker_interpreters",
-        "test_scalar_call_view_is_address_free_and_stable_across_worker_pickle"
+        "test_scalar_call_view_is_address_free_and_stable_across_worker_pickle",
+        "test_driver_frontend_round_trips_in_fresh_worker_process"
       ],
-      "expected_test_count": 43,
+      "expected_test_count": 45,
       "allow_skips": false
     },
     "live": {
@@ -107,9 +116,10 @@
       ],
       "required_tests": [
         "test_live_evidence_is_supplied_by_the_external_harness",
-        "test_same_production_plan_compiles_and_executes_on_each_worker"
+        "test_same_production_plan_compiles_and_executes_on_each_worker",
+        "test_rfc002_frontend_verifies_on_each_worker"
       ],
-      "expected_test_count": 15,
+      "expected_test_count": 16,
       "allow_skips": false
     }
   },
@@ -362,17 +372,30 @@
     "rfc002.unit_contract": {
       "tier": "unit",
       "description": "RFC-002 unit semantics are implemented by production code.",
-      "test_targets": ["tests.unit.mainline.test_rfc002.RFC002UnitTests.test_rfc002_unit_contract"]
+      "test_targets": [
+        "tests.unit.compiler.test_bytecode_decoder.BytecodeDecoderTest.test_rejects_an_unsupported_runtime_format_before_decoding",
+        "tests.unit.compiler.test_bytecode_decoder.BytecodeDecoderTest.test_normalizes_required_opcode_families_without_source_values",
+        "tests.unit.compiler.test_bytecode_decoder.BytecodeDecoderTest.test_decodes_exception_and_location_tables_with_complete_coverage",
+        "tests.unit.compiler.test_bytecode_decoder.BytecodeDecoderTest.test_canonical_encoding_round_trips_and_is_cross_process_stable",
+        "tests.unit.compiler.test_bytecode_decoder.BytecodeDecoderTest.test_rejects_corrupt_location_and_exception_tables",
+        "tests.unit.compiler.test_capture_cfg.CaptureCfgTest.test_local_join_builds_control_edges_and_local_phi",
+        "tests.unit.compiler.test_capture_cfg.CaptureCfgTest.test_short_circuit_builds_stack_phi",
+        "tests.unit.compiler.test_capture_cfg.CaptureCfgTest.test_verifier_rejects_each_structural_layer"
+      ]
     },
     "rfc002.integration_contract": {
       "tier": "integration",
       "description": "RFC-002 integration semantics are implemented across the capture boundary.",
-      "test_targets": ["tests.integration.test_rfc002_mainline.RFC002IntegrationTests.test_rfc002_integration_contract"]
+      "test_targets": [
+        "tests.integration.test_capture_frontend_boundary.CaptureFrontendBoundaryTest.test_driver_frontend_round_trips_in_fresh_worker_process"
+      ]
     },
     "rfc002.system_contract": {
       "tier": "system",
       "description": "RFC-002 is proven through the scalar mainline system path.",
-      "test_targets": ["tests.e2e.test_mainline_production.RFC002SystemTests.test_rfc002_system_contract"]
+      "test_targets": [
+        "tests.integration.test_per_worker_artifact_qualification.PerWorkerArtifactQualificationTests.test_rfc002_frontend_verifies_on_each_worker"
+      ]
     },
     "rfc003.unit_contract": {
       "tier": "unit",
@@ -473,7 +496,14 @@
   "requirements": {
     "R1": ["provenance.clean_source", "provenance.image_identity", "environment.locked_manifest"],
     "R2": ["system.transparent_bootstrap", "system.with_column_semantics", "environment.three_node_topology"],
-    "R3": ["system.transparent_bootstrap", "system.with_column_semantics", "system.with_columns_semantics"],
+    "R3": [
+      "rfc002.unit_contract",
+      "rfc002.integration_contract",
+      "rfc002.system_contract",
+      "system.transparent_bootstrap",
+      "system.with_column_semantics",
+      "system.with_columns_semantics"
+    ],
     "R4": ["tests.unit_suite", "system.with_column_semantics", "system.with_columns_semantics", "system.unsupported_semantics"],
     "R5": ["tests.unit_suite", "system.supported_jit", "system.unsupported_semantics"],
     "R6": ["tests.unit_suite", "tests.integration_suite", "system.fail_open"],
@@ -540,7 +570,7 @@
   "test_tier_mapping": {
     "R1": ["release"],
     "R2": ["system"],
-    "R3": ["system"],
+    "R3": ["unit", "integration", "system"],
     "R4": ["unit", "system"],
     "R5": ["unit", "system"],
     "R6": ["unit", "integration", "system"],

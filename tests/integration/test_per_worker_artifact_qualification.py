@@ -69,6 +69,82 @@ def _qualification_runtime_report(_value: float) -> str:
     "requires the blue-98 three-node Ray final candidate cluster",
 )
 class PerWorkerArtifactQualificationTests(unittest.TestCase):
+    def test_rfc002_frontend_verifies_on_each_worker(self) -> None:
+        import ray
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        from python_udf_jit.compiler.capture_ir import build_capture_frontend
+
+        def branch(value):
+            result = (value, "input")
+            if value > 0.0:
+                result = [value, "positive"]
+            return result
+
+        frontend = build_capture_frontend(branch.__code__)
+        payload = frontend.canonical_bytes()
+        expected_hash = hashlib.sha256(payload).hexdigest()
+
+        @ray.remote(num_cpus=0.01)
+        def verify_on_worker(encoded: bytes) -> dict[str, str]:
+            import hashlib as _hashlib
+            import json as _json
+
+            import ray as _ray
+
+            from python_udf_jit.compiler.capture_ir import (
+                CaptureFrontend as _CaptureFrontend,
+            )
+
+            restored = _CaptureFrontend.from_document(_json.loads(encoded))
+            return {
+                "frontend_hash": _hashlib.sha256(
+                    restored.canonical_bytes()
+                ).hexdigest(),
+                "node_id": _ray.get_runtime_context().get_node_id(),
+            }
+
+        ray.init(address="auto")
+        try:
+            alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+            head = [
+                node
+                for node in alive_nodes
+                if node.get("NodeName") == "ray-head-driver"
+            ]
+            workers = sorted(
+                (
+                    node
+                    for node in alive_nodes
+                    if node.get("NodeName") in {"ray-worker-1", "ray-worker-2"}
+                ),
+                key=lambda node: node["NodeName"],
+            )
+            self.assertEqual(len(head), 1)
+            self.assertEqual(head[0].get("Resources", {}).get("CPU", 0), 0)
+            self.assertEqual(len(workers), 2)
+            reports = ray.get(
+                [
+                    verify_on_worker.options(
+                        scheduling_strategy=NodeAffinitySchedulingStrategy(
+                            node_id=worker["NodeID"],
+                            soft=False,
+                        )
+                    ).remote(payload)
+                    for worker in workers
+                ]
+            )
+            self.assertEqual(
+                {report["node_id"] for report in reports},
+                {worker["NodeID"] for worker in workers},
+            )
+            self.assertEqual(
+                {report["frontend_hash"] for report in reports},
+                {expected_hash},
+            )
+        finally:
+            ray.shutdown()
+
     def test_same_production_plan_compiles_and_executes_on_each_worker(self) -> None:
         import daft
         import ray
