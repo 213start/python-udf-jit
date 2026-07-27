@@ -12,6 +12,7 @@ htmlcov/
 .pyright/
 .ruff_cache/
 .hypothesis/
+.codegraph/
 
 # Packaging and native build output
 build/

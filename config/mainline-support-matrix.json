@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "profile": "mainline-production",
+  "execution_contract": {
+    "provider": "scalar_python",
+    "jit_runtime": "cinderx_same_cpython_runtime",
+    "fallback": "interpreter_continuation",
+    "vector_enabled": false,
+    "arrow_enabled": false,
+    "mixed_provider_enabled": false,
+    "continuation_recovery_scope": "region",
+    "unproven_continuation": "whole_function_interpreter_before_region_entry"
+  },
+  "locked_components": {
+    "python": "3.14.3",
+    "cinderx_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
+    "cinderx_soabi": "cpython-314-aarch64-linux-gnu",
+    "daft": "0.7.2",
+    "ray": "2.55.0",
+    "lance": "7.0.0",
+    "pyarrow": "22.0.0"
+  },
+  "support_windows": {
+    "current_locked_baseline": {
+      "state": "must_be_supported_and_maintained",
+      "components": [
+        "python",
+        "cinderx",
+        "daft",
+        "ray",
+        "lance",
+        "pyarrow"
+      ],
+      "unsupported_or_expired_is_release_blocker": true
+    },
+    "next_baseline_trial": {
+      "state": "trial_only",
+      "qualification": "not_yet_release_evidence",
+      "release_blocking": false,
+      "u2_blocking": false
+    }
+  },
+  "scalar_semantics": {
+    "primitive_numeric_region": "production_target",
+    "nullable_live_values": "interpreter_continuation",
+    "branch_merge": "interpreter_continuation",
+    "python_object_identity_and_aliasing": "interpreter_continuation",
+    "borrow_and_keepalive": "interpreter_continuation",
+    "active_exception_state": "interpreter_continuation",
+    "side_effect_commit_boundary": "required",
+    "suffix_execution": "exactly_once"
+  },
+  "advanced_rfc_state": {
+    "RFC-009": "disabled",
+    "RFC-010": "disabled",
+    "RFC-011": "disabled",
+    "RFC-012": "disabled"
+  },
+  "external_platform_contract": {
+    "credential_scope": "job",
+    "trust_domain": "same_job",
+    "artifact_authentication": {
+      "schema_version": 1,
+      "algorithm": "hmac-sha256",
+      "tag_size_bytes": 32,
+      "domain_separator": "python-udf-jit/artifact/v2",
+      "covered_fields": [
+        "artifact_schema_version",
+        "artifact_content_sha256",
+        "manifest_sha256",
+        "job_id",
+        "tenant_id",
+        "key_id",
+        "key_generation",
+        "issued_at_ns",
+        "expires_at_ns"
+      ],
+      "key_scope": "job_and_tenant",
+      "key_material_transport": "credential_handle_only",
+      "rotation_grace": "previous_generation_until_explicit_deadline",
+      "revocation": "monotonic_generation_safe_point",
+      "downgrade": "forbidden"
+    },
+    "admission": {
+      "commit": {
+        "requires": [
+          "clean_source",
+          "locked_manifest",
+          "unit_and_integration_receipts"
+        ],
+        "failure": "stop"
+      },
+      "node_join": {
+        "requires": [
+          "component_fingerprint_match",
+          "policy_generation_current",
+          "credential_generation_current"
+        ],
+        "failure": "stop"
+      },
+      "task_entry": {
+        "requires": [
+          "same_job_trust_domain",
+          "worker_qualified",
+          "emergency_safe_point_enabled"
+        ],
+        "failure": "interpreter_only"
+      }
+    },
+    "worker_qualification": {
+      "required_workers": 2,
+      "purpose": "deployment_qualification",
+      "must_not_be_inferred_from_natural_coverage": true
+    },
+    "natural_business_coverage": {
+      "minimum_workers": 1,
+      "maximum_workers": 2,
+      "scheduler_selected": true,
+      "purpose": "observed_business_execution"
+    }
+  },
+  "mode_contract": {
+    "precedence": [
+      "UDFJIT_DISABLE",
+      "plugin_enable",
+      "requested_mode",
+      "compatibility",
+      "policy"
+    ],
+    "requested_modes": [
+      "off",
+      "observe",
+      "auto"
+    ],
+    "observe_shadow_compile_default": false,
+    "emergency_updates_at_safe_points": true,
+    "grayscale_requires_independent_authorization": true
+  },
+  "release_prerequisites": {
+    "current_component_support": {
+      "status": "incomplete",
+      "gate_outcome": "stop",
+      "reason_code": "current_support_window_unverified",
+      "delivery_window": {
+        "starts_on": null,
+        "ends_on": null
+      },
+      "first_adoption_window": {
+        "starts_on": null,
+        "ends_on": null
+      },
+      "remaining_support_days": null,
+      "minimum_remaining_support_days": null,
+      "lifecycle_owner": null,
+      "verified_on": null,
+      "component_evidence": {
+        "python": {
+          "support_ends_on": null,
+          "remaining_support_days": null,
+          "verified_on": null,
+          "source": null
+        },
+        "cinderx": {
+          "support_ends_on": null,
+          "remaining_support_days": null,
+          "verified_on": null,
+          "source": null
+        },
+        "daft": {
+          "support_ends_on": null,
+          "remaining_support_days": null,
+          "verified_on": null,
+          "source": null
+        },
+        "ray": {
+          "support_ends_on": null,
+          "remaining_support_days": null,
+          "verified_on": null,
+          "source": null
+        },
+        "lance": {
+          "support_ends_on": null,
+          "remaining_support_days": null,
+          "verified_on": null,
+          "source": null
+        },
+        "pyarrow": {
+          "support_ends_on": null,
+          "remaining_support_days": null,
+          "verified_on": null,
+          "source": null
+        }
+      }
+    },
+    "next_baseline_trial": {
+      "status": "incomplete",
+      "reason_code": "trial_baseline_not_scheduled",
+      "maintenance_owner": null,
+      "budget_hours": null,
+      "deadline": null,
+      "candidate_baseline": null,
+      "rebase_evidence": null,
+      "patch_narrowing_or_upstream_plan": null,
+      "blocks_u2": false,
+      "blocks_current_functional_work": false
+    },
+    "multi_node_environment": {
+      "status": "incomplete",
+      "gate_outcome": "stop",
+      "reason_code": "physical_multinode_not_reserved",
+      "owner": null,
+      "reservation": {
+        "state": "not_reserved",
+        "reservation_id": null,
+        "scheduled_for": null
+      },
+      "deadline": null,
+      "network_owner": null,
+      "identity_owner": null,
+      "external_evidence": null,
+      "required_before": "U7"
+    },
+    "credential_distribution": {
+      "status": "incomplete",
+      "gate_outcome": "stop",
+      "reason_code": "platform_credential_channel_unverified",
+      "owner": null,
+      "channel_provider": null,
+      "deadline": null,
+      "local_evidence_scope": "local_process_contract",
+      "external_evidence": null,
+      "required_before": "U2"
+    },
+    "emergency_disable_distribution": {
+      "status": "incomplete",
+      "gate_outcome": "stop",
+      "reason_code": "platform_emergency_channel_unverified",
+      "owner": null,
+      "channel_provider": null,
+      "deadline": null,
+      "local_evidence_scope": "local_process_contract",
+      "blue98_evidence": null,
+      "physical_multinode_evidence": null,
+      "required_before": "U2"
+    },
+    "first_adopter": {
+      "status": "incomplete",
+      "rollout_ceiling": "observe-ready",
+      "reason_code": "named_first_adopter_not_bound",
+      "business_owner": null,
+      "named_job": null,
+      "job_fingerprint": null,
+      "target_cluster": null,
+      "off_baseline_evidence": null,
+      "scalar_matrix_coverage": null,
+      "verified_on": null,
+      "blocks_functional_completion": false
+    }
+  },
+  "maintenance_risks": {
+    "current_locked_baseline": {
+      "risk": "component_support_window_expired_or_unmaintained",
+      "release_blocking": true,
+      "disposition": "stop_release_until_current_window_is_supported"
+    },
+    "next_baseline_trial": {
+      "risk": "future_component_compatibility_unknown",
+      "release_blocking": false,
+      "u2_blocking": false,
+      "disposition": "track_without_blocking_u2"
+    }
+  }
+}

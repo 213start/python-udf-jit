@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:python-udf-jit:mainline-profile:v1",
+  "title": "Python UDF JIT scalar mainline phase profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile",
+    "run_id",
+    "environment",
+    "correctness_sha256",
+    "functional_status",
+    "phase_timings",
+    "hotspots",
+    "performance"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "profile": {"const": "mainline-production"},
+    "run_id": {"type": "string", "minLength": 1},
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "python_version",
+        "cinderx_commit",
+        "cinderx_soabi",
+        "daft_version",
+        "ray_version",
+        "lance_version",
+        "pyarrow_version",
+        "machine",
+        "cpu_model",
+        "support_matrix_sha256",
+        "policy_version",
+        "fingerprint_sha256"
+      ],
+      "properties": {
+        "python_version": {"type": "string", "minLength": 1},
+        "cinderx_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "cinderx_soabi": {"type": "string", "minLength": 1},
+        "daft_version": {"type": "string", "minLength": 1},
+        "ray_version": {"type": "string", "minLength": 1},
+        "lance_version": {"type": "string", "minLength": 1},
+        "pyarrow_version": {"type": "string", "minLength": 1},
+        "machine": {"type": "string", "minLength": 1},
+        "cpu_model": {"type": "string", "minLength": 1},
+        "support_matrix_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "policy_version": {"type": "string", "minLength": 1},
+        "fingerprint_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "correctness_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "functional_status": {"enum": ["pass", "fail"]},
+    "phase_timings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "phase",
+          "samples_ns",
+          "sample_count",
+          "total_ns",
+          "median_ns"
+        ],
+        "properties": {
+          "phase": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$"},
+          "samples_ns": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "integer", "minimum": 0}
+          },
+          "sample_count": {"type": "integer", "minimum": 1},
+          "total_ns": {"type": "integer", "minimum": 0},
+          "median_ns": {"type": "number", "minimum": 0}
+        }
+      }
+    },
+    "hotspots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phase", "total_ns", "sample_count"],
+        "properties": {
+          "phase": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$"},
+          "total_ns": {"type": "integer", "minimum": 0},
+          "sample_count": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "status",
+        "baseline_ns",
+        "candidate_ns",
+        "speedup",
+        "reference_target_speedup",
+        "conclusion_scope",
+        "blocks_functional_completion"
+      ],
+      "properties": {
+        "mode": {"const": "directional"},
+        "status": {
+          "enum": ["not_measured", "directional_recorded"]
+        },
+        "baseline_ns": {"type": ["integer", "null"], "minimum": 1},
+        "candidate_ns": {"type": ["integer", "null"], "minimum": 1},
+        "speedup": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "reference_target_speedup": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "conclusion_scope": {"const": "directional_only"},
+        "blocks_functional_completion": {"const": false}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"status": {"const": "not_measured"}},
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "mode": {"const": "directional"},
+              "baseline_ns": {"const": null},
+              "candidate_ns": {"const": null},
+              "speedup": {"const": null}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"mode": {"const": "directional"}},
+            "required": ["mode"]
+          },
+          "then": {
+            "properties": {
+              "status": {
+                "enum": ["not_measured", "directional_recorded"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {"const": "directional_recorded"}
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "baseline_ns": {"type": "integer", "minimum": 1},
+              "candidate_ns": {"type": "integer", "minimum": 1},
+              "speedup": {"type": "number", "exclusiveMinimum": 0}
+            }
+          }
+        }
+      ]
+    }
+  }
+}
