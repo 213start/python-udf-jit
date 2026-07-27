@@ -6,8 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "python-udf-jit"
 version = "0.1.0"
 description = "Transparent scalar Python UDF JIT piercing"
-requires-python = ">=3.14"
+requires-python = ">=3.11,<3.15"
 dependencies = []
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"python_udf_jit.resources" = ["*.pth"]
