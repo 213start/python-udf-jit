@@ -7,7 +7,7 @@ import subprocess
 import sys
 import unittest
 
-from python_udf_jit.compiler.capture_ir import build_capture_frontend
+from python_udf_jit.compiler.abstract_interpreter import analyze_function
 
 
 def _rich_control_flow(value):
@@ -22,23 +22,24 @@ def _rich_control_flow(value):
 
 class CaptureFrontendBoundaryTest(unittest.TestCase):
     def test_driver_frontend_round_trips_in_fresh_worker_process(self):
-        frontend = build_capture_frontend(_rich_control_flow.__code__)
-        payload = frontend.canonical_bytes()
+        program = analyze_function(_rich_control_flow)
+        payload = program.canonical_bytes()
         expected_hash = hashlib.sha256(payload).hexdigest()
         script = """
 import hashlib
 import json
 import sys
-from python_udf_jit.compiler.capture_ir import CaptureFrontend
+from python_udf_jit.compiler.abstract_interpreter import CapturedProgram
 
 payload = sys.stdin.buffer.read()
-frontend = CaptureFrontend.from_document(json.loads(payload))
+program = CapturedProgram.from_document(json.loads(payload))
 print(json.dumps({
-    "capabilities": list(frontend.required_capabilities),
-    "hash": hashlib.sha256(frontend.canonical_bytes()).hexdigest(),
+    "capabilities": list(program.frontend.required_capabilities),
+    "hash": hashlib.sha256(program.canonical_bytes()).hexdigest(),
+    "python_regions": len(program.analysis.python_regions),
     "python_region_instructions": sum(
         instruction.capability == "python_region"
-        for instruction in frontend.decoded_bytecode.instructions
+        for instruction in program.frontend.decoded_bytecode.instructions
     ),
 }, sort_keys=True))
 """
@@ -62,6 +63,7 @@ print(json.dumps({
             self.assertIn("python_region", document["capabilities"])
             self.assertIn("readonly_list", document["capabilities"])
             self.assertIn("readonly_tuple", document["capabilities"])
+            self.assertGreater(document["python_regions"], 0)
             self.assertGreater(document["python_region_instructions"], 0)
 
 

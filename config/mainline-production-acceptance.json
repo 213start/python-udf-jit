@@ -81,9 +81,24 @@
         "test_rejects_corrupt_location_and_exception_tables",
         "test_local_join_builds_control_edges_and_local_phi",
         "test_short_circuit_builds_stack_phi",
-        "test_verifier_rejects_each_structural_layer"
+        "test_verifier_rejects_each_structural_layer",
+        "test_straight_line_numeric_function_needs_no_python_region",
+        "test_opaque_call_forms_side_effect_region_with_exact_resume",
+        "test_controlled_calls_and_readonly_aggregates_stay_python_regions",
+        "test_exception_regions_retain_handler_state",
+        "test_small_function_is_modeled_but_remains_a_python_region",
+        "test_analysis_never_executes_the_user_function",
+        "test_program_encoding_round_trips_without_source_or_names",
+        "test_two_opaque_calls_have_stable_nonoverlapping_regions",
+        "test_verifier_rejects_resume_live_and_coverage_corruption",
+        "test_static_capture_does_not_change_cpython_results",
+        "test_code_and_dependencies_are_separate",
+        "test_global_and_default_changes_only_dependency_fingerprint",
+        "test_opaque_dependency_rejects_without_repr_or_address",
+        "test_identity_is_cross_process_stable",
+        "test_capture_cache_is_job_scoped_ttl_and_lru_bounded"
       ],
-      "expected_test_count": 195,
+      "expected_test_count": 210,
       "allow_skips": false
     },
     "integration": {
@@ -380,7 +395,22 @@
         "tests.unit.compiler.test_bytecode_decoder.BytecodeDecoderTest.test_rejects_corrupt_location_and_exception_tables",
         "tests.unit.compiler.test_capture_cfg.CaptureCfgTest.test_local_join_builds_control_edges_and_local_phi",
         "tests.unit.compiler.test_capture_cfg.CaptureCfgTest.test_short_circuit_builds_stack_phi",
-        "tests.unit.compiler.test_capture_cfg.CaptureCfgTest.test_verifier_rejects_each_structural_layer"
+        "tests.unit.compiler.test_capture_cfg.CaptureCfgTest.test_verifier_rejects_each_structural_layer",
+        "tests.unit.compiler.test_abstract_interpreter.AbstractInterpreterTest.test_straight_line_numeric_function_needs_no_python_region",
+        "tests.unit.compiler.test_abstract_interpreter.AbstractInterpreterTest.test_opaque_call_forms_side_effect_region_with_exact_resume",
+        "tests.unit.compiler.test_abstract_interpreter.AbstractInterpreterTest.test_controlled_calls_and_readonly_aggregates_stay_python_regions",
+        "tests.unit.compiler.test_abstract_interpreter.AbstractInterpreterTest.test_exception_regions_retain_handler_state",
+        "tests.unit.compiler.test_abstract_interpreter.AbstractInterpreterTest.test_small_function_is_modeled_but_remains_a_python_region",
+        "tests.unit.compiler.test_abstract_interpreter.AbstractInterpreterTest.test_analysis_never_executes_the_user_function",
+        "tests.unit.compiler.test_abstract_interpreter.AbstractInterpreterTest.test_program_encoding_round_trips_without_source_or_names",
+        "tests.unit.compiler.test_graph_break.GraphBreakTest.test_two_opaque_calls_have_stable_nonoverlapping_regions",
+        "tests.unit.compiler.test_graph_break.GraphBreakTest.test_verifier_rejects_resume_live_and_coverage_corruption",
+        "tests.unit.compiler.test_graph_break.GraphBreakTest.test_static_capture_does_not_change_cpython_results",
+        "tests.unit.compiler.test_code_identity.CodeIdentityTest.test_code_and_dependencies_are_separate",
+        "tests.unit.compiler.test_code_identity.CodeIdentityTest.test_global_and_default_changes_only_dependency_fingerprint",
+        "tests.unit.compiler.test_code_identity.CodeIdentityTest.test_opaque_dependency_rejects_without_repr_or_address",
+        "tests.unit.compiler.test_code_identity.CodeIdentityTest.test_identity_is_cross_process_stable",
+        "tests.unit.compiler.test_code_identity.CodeIdentityTest.test_capture_cache_is_job_scoped_ttl_and_lru_bounded"
       ]
     },
     "rfc002.integration_contract": {
@@ -504,8 +534,23 @@
       "system.with_column_semantics",
       "system.with_columns_semantics"
     ],
-    "R4": ["tests.unit_suite", "system.with_column_semantics", "system.with_columns_semantics", "system.unsupported_semantics"],
-    "R5": ["tests.unit_suite", "system.supported_jit", "system.unsupported_semantics"],
+    "R4": [
+      "rfc002.unit_contract",
+      "rfc002.integration_contract",
+      "rfc002.system_contract",
+      "tests.unit_suite",
+      "system.with_column_semantics",
+      "system.with_columns_semantics",
+      "system.unsupported_semantics"
+    ],
+    "R5": [
+      "rfc002.unit_contract",
+      "rfc002.integration_contract",
+      "rfc002.system_contract",
+      "tests.unit_suite",
+      "system.supported_jit",
+      "system.unsupported_semantics"
+    ],
     "R6": ["tests.unit_suite", "tests.integration_suite", "system.fail_open"],
     "R7": ["provenance.cinderx_source_identity", "integration.cinderx_runtime"],
     "R8": ["integration.cinderx_runtime", "system.supported_jit", "evidence.compile_hit_chain"],
@@ -571,8 +616,8 @@
     "R1": ["release"],
     "R2": ["system"],
     "R3": ["unit", "integration", "system"],
-    "R4": ["unit", "system"],
-    "R5": ["unit", "system"],
+    "R4": ["unit", "integration", "system"],
+    "R5": ["unit", "integration", "system"],
     "R6": ["unit", "integration", "system"],
     "R7": ["integration"],
     "R8": ["integration", "system"],

@@ -73,7 +73,9 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
         import ray
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-        from python_udf_jit.compiler.capture_ir import build_capture_frontend
+        from python_udf_jit.compiler.abstract_interpreter import (
+            analyze_function,
+        )
 
         def branch(value):
             result = (value, "input")
@@ -81,8 +83,8 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
                 result = [value, "positive"]
             return result
 
-        frontend = build_capture_frontend(branch.__code__)
-        payload = frontend.canonical_bytes()
+        program = analyze_function(branch)
+        payload = program.canonical_bytes()
         expected_hash = hashlib.sha256(payload).hexdigest()
 
         @ray.remote(num_cpus=0.01)
@@ -92,16 +94,19 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
 
             import ray as _ray
 
-            from python_udf_jit.compiler.capture_ir import (
-                CaptureFrontend as _CaptureFrontend,
+            from python_udf_jit.compiler.abstract_interpreter import (
+                CapturedProgram as _CapturedProgram,
             )
 
-            restored = _CaptureFrontend.from_document(_json.loads(encoded))
+            restored = _CapturedProgram.from_document(_json.loads(encoded))
             return {
-                "frontend_hash": _hashlib.sha256(
+                "program_hash": _hashlib.sha256(
                     restored.canonical_bytes()
                 ).hexdigest(),
                 "node_id": _ray.get_runtime_context().get_node_id(),
+                "python_region_count": str(
+                    len(restored.analysis.python_regions)
+                ),
             }
 
         ray.init(address="auto")
@@ -139,8 +144,11 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
                 {worker["NodeID"] for worker in workers},
             )
             self.assertEqual(
-                {report["frontend_hash"] for report in reports},
+                {report["program_hash"] for report in reports},
                 {expected_hash},
+            )
+            self.assertTrue(
+                all(int(report["python_region_count"]) > 0 for report in reports)
             )
         finally:
             ray.shutdown()
