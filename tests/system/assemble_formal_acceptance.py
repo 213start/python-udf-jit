@@ -6,8 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from python_udf_jit.diagnostics.acceptance import (
+    CompletionStatus,
     aggregate_formal_acceptance,
     load_acceptance_contract,
+    load_mainline_prerequisite_report,
 )
 from tests.system.private_output import write_private_json
 
@@ -28,6 +30,7 @@ def assemble(
     source_path: Path,
     infrastructure_path: Path,
     measurement_path: Path,
+    unit_completion_status: str | CompletionStatus | None = None,
 ) -> dict[str, object]:
     base_report = _load(base_report_path)
     off = _load(black_box_off_path)
@@ -48,9 +51,19 @@ def assemble(
         "infrastructure": _load(infrastructure_path),
         "measurement": _load(measurement_path),
     }
-    return aggregate_formal_acceptance(
-        load_acceptance_contract(contract_path), evidence
-    )
+    if unit_completion_status is not None:
+        evidence["unit_completion_status"] = CompletionStatus(
+            unit_completion_status
+        ).value
+    contract = load_acceptance_contract(contract_path)
+    if contract.support_matrix_sha256:
+        evidence["mainline_prerequisites"] = (
+            load_mainline_prerequisite_report(
+                contract_path,
+                contract=contract,
+            )
+        )
+    return aggregate_formal_acceptance(contract, evidence)
 
 
 def write_output(path: Path, document: dict[str, object]) -> None:
@@ -66,6 +79,10 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--infrastructure", type=Path, required=True)
     parser.add_argument("--measurement", type=Path, required=True)
+    parser.add_argument(
+        "--unit-completion-status",
+        choices=tuple(status.value for status in CompletionStatus),
+    )
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     report = assemble(
@@ -76,6 +93,7 @@ def main() -> None:
         source_path=arguments.source,
         infrastructure_path=arguments.infrastructure,
         measurement_path=arguments.measurement,
+        unit_completion_status=arguments.unit_completion_status,
     )
     write_output(arguments.output, report)
     print(report["verdict"])

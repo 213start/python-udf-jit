@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "u13-formal-scalar-mainline-acceptance": {
+      "test_suites": {
+        "unit": {
+          "gate_id": "python.unit",
+          "tier": "unit",
+          "arguments": [
+            "tests.unit.compiler.test_capture",
+            "tests.unit.compiler.test_core_ir",
+            "tests.unit.compiler.test_verifier",
+            "tests.unit.diagnostics.test_acceptance",
+            "tests.unit.diagnostics.test_cinderx_evidence",
+            "tests.unit.diagnostics.test_environment_evidence",
+            "tests.unit.diagnostics.test_invalidation_evidence",
+            "tests.unit.diagnostics.test_test_evidence",
+            "tests.unit.integration.daft_ray.test_control_hook",
+            "tests.unit.integration.daft_ray.test_worker_runtime",
+            "tests.unit.integration.daft_ray.test_wrapper_serialization",
+            "tests.unit.protocol.test_artifact_codec",
+            "tests.unit.provider.scalar_python.test_capability",
+            "tests.unit.provider.scalar_python.test_compiler_template",
+            "tests.unit.provider.scalar_python.test_executor",
+            "tests.unit.runtime.test_descriptor_guards",
+            "tests.unit.runtime.test_guards",
+            "tests.unit.runtime.test_layout",
+            "tests.unit.runtime.test_variant",
+            "tests.unit.system.test_assemble_infrastructure_evidence",
+            "tests.unit.system.test_candidate_manifest",
+            "tests.unit.system.test_cleanup_probe",
+            "tests.unit.system.test_firewalld_bridge",
+            "tests.unit.system.test_hygiene_evidence",
+            "tests.unit.system.test_loopback_http",
+            "tests.unit.system.test_private_output",
+            "tests.unit.system.test_probe_environment",
+            "tests.unit.system.test_source_identity",
+            "tests.unit.system.test_transparent_user_job",
+            "-v"
+          ],
+          "required_tests": [
+            "test_black_box_observes_framework_order_without_sorting",
+            "test_contract_traces_every_requirement_and_acceptance_example",
+            "test_down_attempts_network_cleanup_after_container_removal_failure",
+            "test_each_invoke_freezes_one_ray_task_identity_for_all_events",
+            "test_existing_parent_permissions_are_not_changed",
+            "test_exact_static_runtime_and_python_gates_produce_proof",
+            "test_failure_scrub_removes_all_payloads_but_preserves_run_root",
+            "test_fixture_never_imports_or_calls_plugin_internals",
+            "test_manifest_binds_installed_cinderx_wheel_and_base_image",
+            "test_only_numeric_loopback_hosts_are_accepted",
+            "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
+            "test_rejects_non_internal_data_plane",
+            "test_request_disables_proxies_and_installs_redirect_rejection",
+            "test_restart_baseline_is_captured_after_live_suite",
+            "test_root_environment_discards_inherited_execution_controls",
+            "test_runtime_binding_is_exact_and_reversible",
+            "test_successful_compose_down_still_verifies_no_resources_remain"
+          ],
+          "expected_test_count": 134,
+          "allow_skips": false
+        },
+        "integration": {
+          "gate_id": "python.integration",
+          "tier": "integration",
+          "arguments": [
+            "tests.integration.test_daft_ray_baseline",
+            "tests.integration.test_driver_worker_artifact_roundtrip",
+            "tests.integration.test_driver_worker_carrier_probe",
+            "tests.integration.test_driver_worker_isolation",
+            "tests.integration.test_environment_contract",
+            "tests.integration.test_per_worker_artifact_qualification",
+            "tests.integration.test_ray_cinderx_scalar_slot_smoke",
+            "tests.integration.test_ray_object_store_data_plane",
+            "tests.integration.test_ray_three_node_topology",
+            "-v"
+          ],
+          "required_tests": [
+            "test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip",
+            "test_exact_live_topology_is_accepted",
+            "test_partitioned_float_projection_runs_only_on_worker_nodes",
+            "test_head_owned_object_ref_reaches_both_workers",
+            "test_both_workers_execute_region_driven_cinderx_scalar_load",
+            "test_same_production_plan_compiles_and_executes_on_each_worker"
+          ],
+          "expected_test_count": 29,
+          "allow_skips": false
+        },
+        "live": {
+          "gate_id": "python.live",
+          "tier": "system",
+          "arguments": [
+            "tests.e2e.test_scalar_mainline_piercing",
+            "-v"
+          ],
+          "required_tests": [
+            "test_ae1_to_ae8_pass_and_keep_natural_coverage_separate",
+            "test_live_evidence_is_supplied_by_the_external_harness",
+            "test_ray_state_join_never_starts_a_query_after_budget_expires",
+            "test_zero_row_counts_are_derived_from_observed_runtime_events"
+          ],
+          "expected_test_count": 14,
+          "allow_skips": false
+        }
+      }
+    }
+  }
+}

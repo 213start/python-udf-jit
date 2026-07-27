@@ -9,11 +9,6 @@ from pathlib import Path
 
 from python_udf_jit.diagnostics.acceptance import (
     AcceptanceContractError,
-    INTEGRATION_TEST_COUNT,
-    LIVE_REQUIRED_TESTS,
-    LIVE_TEST_COUNT,
-    UNIT_TEST_COUNT,
-    UNIT_REQUIRED_TESTS,
     aggregate_formal_acceptance,
     load_acceptance_contract,
 )
@@ -24,6 +19,7 @@ from python_udf_jit.diagnostics.environment_evidence import (
 
 ROOT = Path(__file__).resolve().parents[3]
 CONTRACT_PATH = ROOT / "config/scalar-piercing-acceptance.json"
+SCALAR_CONTRACT = load_acceptance_contract(CONTRACT_PATH)
 HEX_64 = "a" * 64
 IMAGE_DIGEST = f"sha256:{'b' * 64}"
 CINDERX_COMMIT = "f" * 40
@@ -398,27 +394,40 @@ def _evidence() -> dict[str, object]:
                 "unit": _test_proof(
                     gate_id="python.unit",
                     tier="unit",
-                    required_tests=list(UNIT_REQUIRED_TESTS),
-                    test_count=UNIT_TEST_COUNT,
+                    required_tests=list(
+                        SCALAR_CONTRACT.test_suites["unit"].required_tests
+                    ),
+                    test_count=(
+                        SCALAR_CONTRACT.test_suites[
+                            "unit"
+                        ].expected_test_count
+                    ),
                 ),
                 "integration": _test_proof(
                     gate_id="python.integration",
                     tier="integration",
-                    required_tests=[
-                        "test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip",
-                        "test_exact_live_topology_is_accepted",
-                        "test_partitioned_float_projection_runs_only_on_worker_nodes",
-                        "test_head_owned_object_ref_reaches_both_workers",
-                        "test_both_workers_execute_region_driven_cinderx_scalar_load",
-                        "test_same_production_plan_compiles_and_executes_on_each_worker",
-                    ],
-                    test_count=INTEGRATION_TEST_COUNT,
+                    required_tests=list(
+                        SCALAR_CONTRACT.test_suites[
+                            "integration"
+                        ].required_tests
+                    ),
+                    test_count=(
+                        SCALAR_CONTRACT.test_suites[
+                            "integration"
+                        ].expected_test_count
+                    ),
                 ),
                 "live": _test_proof(
                     gate_id="python.live",
                     tier="system",
-                    required_tests=list(LIVE_REQUIRED_TESTS),
-                    test_count=LIVE_TEST_COUNT,
+                    required_tests=list(
+                        SCALAR_CONTRACT.test_suites["live"].required_tests
+                    ),
+                    test_count=(
+                        SCALAR_CONTRACT.test_suites[
+                            "live"
+                        ].expected_test_count
+                    ),
                 ),
             },
         },

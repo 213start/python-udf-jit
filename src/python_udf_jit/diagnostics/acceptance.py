@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import date
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -27,49 +30,46 @@ from python_udf_jit.diagnostics.test_evidence import (
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _STATUSES = frozenset({"pass", "fail", "inconclusive", "incomplete", "stop"})
-_TIERS = frozenset({"unit", "integration", "system"})
+_GATE_TIERS = frozenset({"unit", "integration", "system", "release"})
+_TIER_ORDER = ("unit", "integration", "system", "release")
 _EXPECTED_REQUIREMENTS = frozenset(f"R{index}" for index in range(1, 21))
+_EXPECTED_MAINLINE_REQUIREMENTS = frozenset(
+    f"R{index}" for index in range(1, 26)
+)
 _EXPECTED_ACCEPTANCE_EXAMPLES = frozenset(f"AE{index}" for index in range(1, 9))
-UNIT_REQUIRED_TESTS = (
-    "test_black_box_observes_framework_order_without_sorting",
-    "test_contract_traces_every_requirement_and_acceptance_example",
-    "test_down_attempts_network_cleanup_after_container_removal_failure",
-    "test_each_invoke_freezes_one_ray_task_identity_for_all_events",
-    "test_existing_parent_permissions_are_not_changed",
-    "test_exact_static_runtime_and_python_gates_produce_proof",
-    "test_failure_scrub_removes_all_payloads_but_preserves_run_root",
-    "test_fixture_never_imports_or_calls_plugin_internals",
-    "test_manifest_binds_installed_cinderx_wheel_and_base_image",
-    "test_only_numeric_loopback_hosts_are_accepted",
-    "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
-    "test_rejects_non_internal_data_plane",
-    "test_request_disables_proxies_and_installs_redirect_rejection",
-    "test_restart_baseline_is_captured_after_live_suite",
-    "test_root_environment_discards_inherited_execution_controls",
-    "test_runtime_binding_is_exact_and_reversible",
-    "test_successful_compose_down_still_verifies_no_resources_remain",
+_EXPECTED_MAINLINE_ACCEPTANCE_EXAMPLES = frozenset(
+    f"AE{index}" for index in range(1, 13)
 )
-INTEGRATION_REQUIRED_TESTS = (
-    "test_inline_artifact_bytes_survive_the_wrapper_worker_roundtrip",
-    "test_exact_live_topology_is_accepted",
-    "test_partitioned_float_projection_runs_only_on_worker_nodes",
-    "test_head_owned_object_ref_reaches_both_workers",
-    "test_both_workers_execute_region_driven_cinderx_scalar_load",
-    "test_same_production_plan_compiles_and_executes_on_each_worker",
+_EXPECTED_MAINLINE_RFCS = frozenset(
+    f"RFC-{index:03d}" for index in range(1, 9)
 )
-LIVE_REQUIRED_TESTS = (
-    "test_ae1_to_ae8_pass_and_keep_natural_coverage_separate",
-    "test_live_evidence_is_supplied_by_the_external_harness",
-    "test_ray_state_join_never_starts_a_query_after_budget_expires",
-    "test_zero_row_counts_are_derived_from_observed_runtime_events",
+_DISABLED_ADVANCED_RFCS = tuple(
+    f"RFC-{index:03d}" for index in range(9, 13)
 )
-UNIT_TEST_COUNT = 134
-INTEGRATION_TEST_COUNT = 29
-LIVE_TEST_COUNT = 14
+_SUPPORT_COMPONENTS = frozenset(
+    {"python", "cinderx", "daft", "ray", "lance", "pyarrow"}
+)
+_SCALAR_PROFILE = "u13-formal-scalar-mainline-acceptance"
+_MAINLINE_PROFILE = "mainline-production"
+_SCALAR_SCHEMA = "urn:python-udf-jit:scalar-piercing-acceptance:v1"
+_MAINLINE_SCHEMA = "urn:python-udf-jit:mainline-release-prerequisites:v1"
+_SUITE_INVENTORY_FILE = "acceptance-suite-inventories.json"
 
 
 class AcceptanceContractError(ValueError):
     """Formal acceptance input was malformed or outside the locked contract."""
+
+
+class CompletionStatus(StrEnum):
+    INCOMPLETE = "incomplete"
+    COMPLETE = "complete"
+
+
+class GateOutcome(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+    STOP = "stop"
+    INCONCLUSIVE = "inconclusive"
 
 
 @dataclass(frozen=True)
@@ -80,11 +80,28 @@ class AcceptanceGate:
 
 
 @dataclass(frozen=True)
+class TestSuiteContract:
+    gate_id: str
+    tier: str
+    arguments: tuple[str, ...]
+    required_tests: tuple[str, ...]
+    expected_test_count: int
+    allow_skips: bool
+
+
+@dataclass(frozen=True)
 class AcceptanceContract:
+    schema_id: str
     profile: str
     gates: Mapping[str, AcceptanceGate]
     requirements: Mapping[str, tuple[str, ...]]
     acceptance_examples: Mapping[str, tuple[str, ...]]
+    rfc_gates: Mapping[str, tuple[str, ...]]
+    disabled_rfcs: tuple[str, ...]
+    test_suites: Mapping[str, TestSuiteContract]
+    test_tier_mapping: Mapping[str, tuple[str, ...]]
+    support_matrix_sha256: str
+    separates_unit_lifecycle: bool
 
 
 def _string(value: object, field: str) -> str:
@@ -115,28 +132,227 @@ def _identifier_map(
             not isinstance(raw_gates, list)
             or not raw_gates
             or not all(isinstance(gate, str) and gate in gates for gate in raw_gates)
+            or len(set(raw_gates)) != len(raw_gates)
         ):
             raise AcceptanceContractError(f"{field}_{identifier}_gates_invalid")
         result[str(identifier)] = tuple(raw_gates)
     return MappingProxyType(result)
 
 
-def load_acceptance_contract(path: str | Path) -> AcceptanceContract:
-    document = json.loads(Path(path).read_text(encoding="utf-8"))
-    if document.get("schema_version") != 1:
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise AcceptanceContractError(f"duplicate_key:{key}")
+        document[key] = value
+    return document
+
+
+def _load_document(path: Path, field: str) -> dict[str, Any]:
+    try:
+        document = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_object,
+        )
+    except AcceptanceContractError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise AcceptanceContractError(f"{field}_unreadable") from error
+    if not isinstance(document, dict):
+        raise AcceptanceContractError(f"{field}_invalid")
+    return document
+
+
+def _strings(
+    value: object,
+    field: str,
+    *,
+    require_unique: bool,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item for item in value)
+        or (require_unique and len(set(value)) != len(value))
+    ):
+        raise AcceptanceContractError(f"{field}_invalid")
+    return tuple(value)
+
+
+def _test_suite_contracts(
+    value: object,
+) -> Mapping[str, TestSuiteContract]:
+    suites = _mapping(value, "test_suites")
+    if set(suites) != {"unit", "integration", "live"}:
+        raise AcceptanceContractError("test_suites_invalid")
+    result: dict[str, TestSuiteContract] = {}
+    expected_tiers = {
+        "unit": "unit",
+        "integration": "integration",
+        "live": "system",
+    }
+    for name, raw_suite in suites.items():
+        suite = _mapping(raw_suite, f"test_suite_{name}")
+        if set(suite) != {
+            "gate_id",
+            "tier",
+            "arguments",
+            "required_tests",
+            "expected_test_count",
+            "allow_skips",
+        }:
+            raise AcceptanceContractError(
+                f"test_suite_{name}_fields_invalid"
+            )
+        expected_count = suite.get("expected_test_count")
+        allow_skips = suite.get("allow_skips")
+        if type(expected_count) is not int or expected_count < 1:
+            raise AcceptanceContractError(
+                f"test_suite_{name}_expected_test_count_invalid"
+            )
+        if type(allow_skips) is not bool:
+            raise AcceptanceContractError(
+                f"test_suite_{name}_allow_skips_invalid"
+            )
+        tier = _string(suite.get("tier"), f"test_suite_{name}_tier")
+        if tier != expected_tiers[name]:
+            raise AcceptanceContractError(f"test_suite_{name}_tier_invalid")
+        required_tests = _strings(
+            suite.get("required_tests"),
+            f"test_suite_{name}_required_tests",
+            require_unique=True,
+        )
+        if expected_count < len(required_tests):
+            raise AcceptanceContractError(
+                f"test_suite_{name}_expected_test_count_invalid"
+            )
+        result[str(name)] = TestSuiteContract(
+            gate_id=_string(
+                suite.get("gate_id"),
+                f"test_suite_{name}_gate_id",
+            ),
+            tier=tier,
+            arguments=_strings(
+                suite.get("arguments"),
+                f"test_suite_{name}_arguments",
+                require_unique=False,
+            ),
+            required_tests=required_tests,
+            expected_test_count=expected_count,
+            allow_skips=allow_skips,
+        )
+    return MappingProxyType(result)
+
+
+def _profile_suite_inventory(
+    contract_path: Path,
+    profile: str,
+) -> Mapping[str, TestSuiteContract]:
+    inventory = _load_document(
+        contract_path.parent / _SUITE_INVENTORY_FILE,
+        "suite_inventory",
+    )
+    if (
+        set(inventory) != {"schema_version", "profiles"}
+        or inventory.get("schema_version") != 1
+    ):
+        raise AcceptanceContractError("suite_inventory_schema_version_invalid")
+    profiles = _mapping(inventory.get("profiles"), "suite_inventory_profiles")
+    if set(profiles) != {_SCALAR_PROFILE}:
+        raise AcceptanceContractError("suite_inventory_profiles_invalid")
+    selected = _mapping(
+        profiles.get(profile),
+        "suite_inventory_profile",
+    )
+    return _test_suite_contracts(selected.get("test_suites"))
+
+
+def load_acceptance_contract(
+    path: str | Path,
+    *,
+    expected_profile: str | None = None,
+    schema_path: str | Path | None = None,
+) -> AcceptanceContract:
+    contract_path = Path(path)
+    document = _load_document(contract_path, "contract")
+    profile = _string(document.get("profile"), "contract_profile")
+    profile_schemas = {
+        _SCALAR_PROFILE: _SCALAR_SCHEMA,
+        _MAINLINE_PROFILE: _MAINLINE_SCHEMA,
+    }
+    if profile not in profile_schemas:
+        raise AcceptanceContractError("contract_profile_unknown")
+    if expected_profile is not None and profile != expected_profile:
+        raise AcceptanceContractError("contract_profile_mismatch")
+    schema_id = document.get("contract_schema")
+    if schema_id is None and profile == _SCALAR_PROFILE:
+        schema_id = _SCALAR_SCHEMA
+    if schema_id != profile_schemas[profile]:
+        raise AcceptanceContractError("contract_schema_unknown")
+    expected_schema_version = 1 if profile == _SCALAR_PROFILE else 2
+    if document.get("schema_version") != expected_schema_version:
         raise AcceptanceContractError("contract_schema_version_invalid")
+    if schema_path is not None:
+        schema = _load_document(Path(schema_path), "contract_schema")
+        if schema.get("$id") != schema_id:
+            raise AcceptanceContractError("contract_schema_identity_mismatch")
+    if profile == _MAINLINE_PROFILE and document.get("$schema") != (
+        "mainline-release-prerequisites.schema.json"
+    ):
+        raise AcceptanceContractError("contract_schema_reference_invalid")
+    expected_fields = (
+        {
+            "schema_version",
+            "profile",
+            "gates",
+            "requirements",
+            "acceptance_examples",
+        }
+        if profile == _SCALAR_PROFILE
+        else {
+            "$schema",
+            "schema_version",
+            "contract_schema",
+            "profile",
+            "support_matrix",
+            "support_matrix_sha256",
+            "unit_completion_values",
+            "gate_outcome_values",
+            "performance_policy",
+            "performance_baseline",
+            "formal_performance_qualification",
+            "disabled_rfcs",
+            "test_suites",
+            "required_gates",
+            "gates",
+            "requirements",
+            "rfc_gates",
+            "test_tier_mapping",
+            "acceptance_examples",
+        }
+    )
+    if set(document) != expected_fields:
+        raise AcceptanceContractError("contract_fields_invalid")
+
     raw_gates = _mapping(document.get("gates"), "contract_gates")
+    if not raw_gates:
+        raise AcceptanceContractError("contract_gates_invalid")
     gates: dict[str, AcceptanceGate] = {}
     for gate_id, raw_gate in raw_gates.items():
+        if not isinstance(gate_id, str) or not gate_id:
+            raise AcceptanceContractError("gate_id_invalid")
         gate = _mapping(raw_gate, f"gate_{gate_id}")
+        if set(gate) != {"tier", "description", "test_targets"}:
+            raise AcceptanceContractError(f"gate_{gate_id}_fields_invalid")
         tier = _string(gate.get("tier"), f"gate_{gate_id}_tier")
-        if tier not in _TIERS:
+        if tier not in _GATE_TIERS:
             raise AcceptanceContractError(f"gate_{gate_id}_tier_invalid")
         targets = gate.get("test_targets")
         if (
             not isinstance(targets, list)
             or not targets
             or not all(isinstance(target, str) and target for target in targets)
+            or len(set(targets)) != len(targets)
         ):
             raise AcceptanceContractError(f"gate_{gate_id}_targets_invalid")
         gates[str(gate_id)] = AcceptanceGate(
@@ -147,16 +363,44 @@ def load_acceptance_contract(path: str | Path) -> AcceptanceContract:
             test_targets=tuple(targets),
         )
     frozen_gates = MappingProxyType(gates)
+    expected_requirements = (
+        _EXPECTED_REQUIREMENTS
+        if profile == _SCALAR_PROFILE
+        else _EXPECTED_MAINLINE_REQUIREMENTS
+    )
+    if profile == _MAINLINE_PROFILE:
+        required_gates = _strings(
+            document.get("required_gates"),
+            "required_gates",
+            require_unique=True,
+        )
+        if set(required_gates) != set(frozen_gates):
+            raise AcceptanceContractError("required_gates_invalid")
+        raw_rfc_gates = _mapping(document.get("rfc_gates"), "rfc_gates")
+        disabled_rfcs = _strings(
+            document.get("disabled_rfcs"),
+            "disabled_rfcs",
+            require_unique=True,
+        )
+        if (
+            disabled_rfcs != _DISABLED_ADVANCED_RFCS
+            or set(raw_rfc_gates) & set(_DISABLED_ADVANCED_RFCS)
+        ):
+            raise AcceptanceContractError("advanced_rfcs_must_be_disabled")
     requirements = _identifier_map(
         document.get("requirements"),
         field="requirements",
-        expected=_EXPECTED_REQUIREMENTS,
+        expected=expected_requirements,
         gates=frozen_gates,
     )
     acceptance_examples = _identifier_map(
         document.get("acceptance_examples"),
         field="acceptance_examples",
-        expected=_EXPECTED_ACCEPTANCE_EXAMPLES,
+        expected=(
+            _EXPECTED_ACCEPTANCE_EXAMPLES
+            if profile == _SCALAR_PROFILE
+            else _EXPECTED_MAINLINE_ACCEPTANCE_EXAMPLES
+        ),
         gates=frozen_gates,
     )
     used_gates = {
@@ -166,12 +410,593 @@ def load_acceptance_contract(path: str | Path) -> AcceptanceContract:
     }
     if used_gates != set(frozen_gates):
         raise AcceptanceContractError("contract_contains_unmapped_gates")
+    if profile == _MAINLINE_PROFILE:
+        rfc_gates = _identifier_map(
+            raw_rfc_gates,
+            field="rfc_gates",
+            expected=_EXPECTED_MAINLINE_RFCS,
+            gates=frozen_gates,
+        )
+        raw_tiers = _mapping(
+            document.get("test_tier_mapping"),
+            "test_tier_mapping",
+        )
+        if set(raw_tiers) != expected_requirements:
+            raise AcceptanceContractError("test_tier_mapping_identifiers_invalid")
+        tiers: dict[str, tuple[str, ...]] = {}
+        for identifier, raw_values in raw_tiers.items():
+            values = _strings(
+                raw_values,
+                f"test_tier_mapping_{identifier}",
+                require_unique=True,
+            )
+            expected_tiers = tuple(
+                tier
+                for tier in _TIER_ORDER
+                if tier
+                in {
+                    frozen_gates[gate].tier
+                    for gate in requirements[str(identifier)]
+                }
+            )
+            if (
+                not set(values) <= _GATE_TIERS
+                or values != expected_tiers
+            ):
+                raise AcceptanceContractError(
+                    f"test_tier_mapping_{identifier}_invalid"
+                )
+            tiers[str(identifier)] = values
+        test_tier_mapping: Mapping[str, tuple[str, ...]] = MappingProxyType(
+            tiers
+        )
+        support_matrix_sha256 = _string(
+            document.get("support_matrix_sha256"),
+            "support_matrix_sha256",
+        )
+        if _SHA256.fullmatch(support_matrix_sha256) is None:
+            raise AcceptanceContractError("support_matrix_sha256_invalid")
+        if document.get("support_matrix") != "mainline-support-matrix.json":
+            raise AcceptanceContractError("support_matrix_reference_invalid")
+        if document.get("unit_completion_values") != [
+            "incomplete",
+            "complete",
+        ]:
+            raise AcceptanceContractError("unit_completion_values_invalid")
+        if document.get("gate_outcome_values") != [
+            "pass",
+            "fail",
+            "stop",
+            "inconclusive",
+        ]:
+            raise AcceptanceContractError("gate_outcome_values_invalid")
+        performance = _mapping(
+            document.get("performance_policy"),
+            "performance_policy",
+        )
+        if (
+            set(performance)
+            != {
+                "target_speedup",
+                "default_mode",
+                "target_applies_to",
+                "blocks_functional_completion",
+                "below_target_disposition",
+            }
+            or performance.get("blocks_functional_completion") is not False
+            or performance.get("below_target_disposition")
+            != "record_non_blocking_result"
+            or performance.get("default_mode") != "directional"
+            or performance.get("target_applies_to") != "formal_only"
+            or not isinstance(
+                performance.get("target_speedup"),
+                (int, float),
+            )
+            or isinstance(performance.get("target_speedup"), bool)
+            or float(performance["target_speedup"]) <= 0
+        ):
+            raise AcceptanceContractError("performance_policy_invalid")
+        baseline = _mapping(
+            document.get("performance_baseline"),
+            "performance_baseline",
+        )
+        baseline_source = _mapping(
+            baseline.get("baseline"),
+            "performance_baseline_source",
+        )
+        baseline_candidate = _mapping(
+            baseline.get("candidate"),
+            "performance_baseline_candidate",
+        )
+        if (
+            set(baseline)
+            != {
+                "mode",
+                "workload",
+                "approximate_rows",
+                "baseline",
+                "candidate",
+                "environment_constraint",
+                "off_runs",
+                "auto_runs",
+                "conclusion_scope",
+                "correctness",
+                "blocks_functional_completion",
+            }
+            or set(baseline_source) != {"mode", "execution"}
+            or set(baseline_candidate)
+            != {"mode", "enabled_rfcs", "disabled_rfcs"}
+            or baseline.get("workload") != "tpch_sf10_lineitem_scalar_q6"
+            or type(baseline.get("approximate_rows")) is not int
+            or baseline["approximate_rows"] <= 0
+            or baseline_source.get("mode") != "off"
+            or baseline_source.get("execution")
+            != "original_daft_scalar_udf"
+            or baseline_candidate.get("mode") != "auto"
+            or baseline_candidate.get("enabled_rfcs")
+            != [f"RFC-{index:03d}" for index in range(1, 9)]
+            or baseline_candidate.get("disabled_rfcs")
+            != list(_DISABLED_ADVANCED_RFCS)
+            or baseline.get("mode") != "directional"
+            or baseline.get("environment_constraint") != "same_environment"
+            or baseline.get("off_runs") != 1
+            or baseline.get("auto_runs") != 1
+            or baseline.get("conclusion_scope") != "directional_only"
+            or baseline.get("correctness")
+            != "ordered_result_and_aggregate_hash_equal"
+            or baseline.get("blocks_functional_completion") is not False
+        ):
+            raise AcceptanceContractError("performance_baseline_invalid")
+        formal = _mapping(
+            document.get("formal_performance_qualification"),
+            "formal_performance_qualification",
+        )
+        if (
+            set(formal)
+            != {
+                "mode",
+                "cli_flag",
+                "warmup_runs",
+                "alternating_measured_runs",
+                "statistic",
+                "stability_metrics",
+                "target_speedup",
+                "fallback_minimum_ratio",
+                "blocks_functional_completion",
+            }
+            or formal.get("mode") != "formal"
+            or formal.get("cli_flag") != "--formal"
+            or formal.get("warmup_runs") != 1
+            or formal.get("alternating_measured_runs") != 5
+            or formal.get("statistic") != "median"
+            or formal.get("stability_metrics") != ["mad", "drift"]
+            or formal.get("target_speedup")
+            != performance.get("target_speedup")
+            or formal.get("fallback_minimum_ratio") != 0.98
+            or formal.get("blocks_functional_completion") is not False
+        ):
+            raise AcceptanceContractError(
+                "formal_performance_qualification_invalid"
+            )
+        separates_unit_lifecycle = True
+    else:
+        rfc_gates = MappingProxyType({})
+        disabled_rfcs = ()
+        test_tier_mapping = MappingProxyType({})
+        support_matrix_sha256 = ""
+        separates_unit_lifecycle = False
+    test_suites = (
+        _test_suite_contracts(document.get("test_suites"))
+        if "test_suites" in document
+        else _profile_suite_inventory(contract_path, profile)
+    )
     return AcceptanceContract(
-        profile=_string(document.get("profile"), "contract_profile"),
+        schema_id=str(schema_id),
+        profile=profile,
         gates=frozen_gates,
         requirements=requirements,
         acceptance_examples=acceptance_examples,
+        rfc_gates=rfc_gates,
+        disabled_rfcs=disabled_rfcs,
+        test_suites=test_suites,
+        test_tier_mapping=test_tier_mapping,
+        support_matrix_sha256=support_matrix_sha256,
+        separates_unit_lifecycle=separates_unit_lifecycle,
     )
+
+
+def _missing_prerequisite_paths(
+    section: Mapping[str, Any],
+    *,
+    prefix: str,
+    required_paths: tuple[tuple[str, ...], ...],
+) -> list[str]:
+    missing: list[str] = []
+    for path in required_paths:
+        value: object = section
+        for component in path:
+            if not isinstance(value, Mapping) or component not in value:
+                value = None
+                break
+            value = value[component]
+        if value is None or value == "":
+            missing.append(".".join((prefix, *path)))
+    return missing
+
+
+def _prerequisite_date(
+    value: object,
+    *,
+    field: str,
+    issues: list[str],
+) -> date | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        issues.append(f"{field}:date_invalid")
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        issues.append(f"{field}:date_invalid")
+        return None
+
+
+def _prerequisite_nonnegative_int(
+    value: object,
+    *,
+    field: str,
+    issues: list[str],
+    allow_zero: bool,
+) -> int | None:
+    if value is None:
+        return None
+    minimum = 0 if allow_zero else 1
+    if type(value) is not int or value < minimum:
+        issues.append(f"{field}:integer_invalid")
+        return None
+    return value
+
+
+def _current_support_issues(
+    section: Mapping[str, Any],
+    *,
+    expected_components: set[str],
+) -> list[str]:
+    issues: list[str] = []
+    delivery = _mapping(
+        section.get("delivery_window"),
+        "current_component_support_delivery_window",
+    )
+    adoption = _mapping(
+        section.get("first_adoption_window"),
+        "current_component_support_first_adoption_window",
+    )
+    delivery_start = _prerequisite_date(
+        delivery.get("starts_on"),
+        field="current_component_support.delivery_window.starts_on",
+        issues=issues,
+    )
+    delivery_end = _prerequisite_date(
+        delivery.get("ends_on"),
+        field="current_component_support.delivery_window.ends_on",
+        issues=issues,
+    )
+    adoption_start = _prerequisite_date(
+        adoption.get("starts_on"),
+        field="current_component_support.first_adoption_window.starts_on",
+        issues=issues,
+    )
+    adoption_end = _prerequisite_date(
+        adoption.get("ends_on"),
+        field="current_component_support.first_adoption_window.ends_on",
+        issues=issues,
+    )
+    verified_on = _prerequisite_date(
+        section.get("verified_on"),
+        field="current_component_support.verified_on",
+        issues=issues,
+    )
+    remaining = _prerequisite_nonnegative_int(
+        section.get("remaining_support_days"),
+        field="current_component_support.remaining_support_days",
+        issues=issues,
+        allow_zero=True,
+    )
+    minimum = _prerequisite_nonnegative_int(
+        section.get("minimum_remaining_support_days"),
+        field="current_component_support.minimum_remaining_support_days",
+        issues=issues,
+        allow_zero=False,
+    )
+    if (
+        delivery_start is not None
+        and delivery_end is not None
+        and delivery_start > delivery_end
+    ):
+        issues.append(
+            "current_component_support.delivery_window:range_invalid"
+        )
+    if (
+        adoption_start is not None
+        and adoption_end is not None
+        and adoption_start > adoption_end
+    ):
+        issues.append(
+            "current_component_support.first_adoption_window:range_invalid"
+        )
+    if (
+        delivery_start is not None
+        and adoption_start is not None
+        and adoption_start < delivery_start
+    ):
+        issues.append(
+            "current_component_support.first_adoption_window:"
+            "starts_before_delivery"
+        )
+    if (
+        remaining is not None
+        and minimum is not None
+        and remaining < minimum
+    ):
+        issues.append(
+            "current_component_support.remaining_support_days:"
+            "below_minimum"
+        )
+
+    component_evidence = _mapping(
+        section.get("component_evidence"),
+        "current_component_support_component_evidence",
+    )
+    component_remaining: list[int] = []
+    for component in sorted(expected_components):
+        evidence = _mapping(
+            component_evidence.get(component),
+            f"current_component_support_component_{component}",
+        )
+        prefix = f"current_component_support.component_evidence.{component}"
+        support_end = _prerequisite_date(
+            evidence.get("support_ends_on"),
+            field=f"{prefix}.support_ends_on",
+            issues=issues,
+        )
+        component_verified = _prerequisite_date(
+            evidence.get("verified_on"),
+            field=f"{prefix}.verified_on",
+            issues=issues,
+        )
+        component_days = _prerequisite_nonnegative_int(
+            evidence.get("remaining_support_days"),
+            field=f"{prefix}.remaining_support_days",
+            issues=issues,
+            allow_zero=True,
+        )
+        if (
+            support_end is not None
+            and component_verified is not None
+            and component_days is not None
+            and component_days != (support_end - component_verified).days
+        ):
+            issues.append(f"{prefix}.remaining_support_days:mismatch")
+        if (
+            component_verified is not None
+            and verified_on is not None
+            and component_verified != verified_on
+        ):
+            issues.append(f"{prefix}.verified_on:snapshot_mismatch")
+        if (
+            support_end is not None
+            and adoption_end is not None
+            and support_end < adoption_end
+        ):
+            issues.append(f"{prefix}.support_ends_on:before_adoption_end")
+        if (
+            component_days is not None
+            and minimum is not None
+            and component_days < minimum
+        ):
+            issues.append(f"{prefix}.remaining_support_days:below_minimum")
+        if component_days is not None:
+            component_remaining.append(component_days)
+    if (
+        remaining is not None
+        and len(component_remaining) == len(expected_components)
+        and remaining != min(component_remaining)
+    ):
+        issues.append(
+            "current_component_support.remaining_support_days:"
+            "component_minimum_mismatch"
+        )
+    return issues
+
+
+def evaluate_mainline_prerequisites(
+    matrix: Mapping[str, Any],
+) -> dict[str, object]:
+    """Evaluate declared external prerequisites without inventing evidence."""
+
+    root = _mapping(matrix, "support_matrix")
+    if root.get("profile") != _MAINLINE_PROFILE:
+        raise AcceptanceContractError("support_matrix_profile_invalid")
+    prerequisites = _mapping(
+        root.get("release_prerequisites"),
+        "release_prerequisites",
+    )
+    blocking_requirements = {
+        "current_component_support": (
+            ("delivery_window", "starts_on"),
+            ("delivery_window", "ends_on"),
+            ("first_adoption_window", "starts_on"),
+            ("first_adoption_window", "ends_on"),
+            ("remaining_support_days",),
+            ("minimum_remaining_support_days",),
+            ("lifecycle_owner",),
+            ("verified_on",),
+        ),
+        "multi_node_environment": (
+            ("owner",),
+            ("reservation", "reservation_id"),
+            ("reservation", "scheduled_for"),
+            ("deadline",),
+            ("network_owner",),
+            ("identity_owner",),
+            ("external_evidence",),
+        ),
+        "credential_distribution": (
+            ("owner",),
+            ("channel_provider",),
+            ("deadline",),
+            ("external_evidence",),
+        ),
+        "emergency_disable_distribution": (
+            ("owner",),
+            ("channel_provider",),
+            ("deadline",),
+            ("blue98_evidence",),
+            ("physical_multinode_evidence",),
+        ),
+    }
+    missing: list[str] = []
+    gates: dict[str, str] = {}
+    for name, required_paths in blocking_requirements.items():
+        section = _mapping(
+            prerequisites.get(name),
+            f"release_prerequisite_{name}",
+        )
+        if name == "current_component_support":
+            component_evidence = _mapping(
+                section.get("component_evidence"),
+                "current_component_support_component_evidence",
+            )
+            if set(component_evidence) != _SUPPORT_COMPONENTS:
+                raise AcceptanceContractError(
+                    "current_component_support_components_invalid"
+                )
+            required_paths = (
+                *required_paths,
+                *(
+                    ("component_evidence", component, field)
+                    for component in sorted(_SUPPORT_COMPONENTS)
+                    for field in (
+                        "support_ends_on",
+                        "remaining_support_days",
+                        "verified_on",
+                        "source",
+                    )
+                ),
+            )
+        section_missing = _missing_prerequisite_paths(
+            section,
+            prefix=name,
+            required_paths=required_paths,
+        )
+        semantic_issues = (
+            _current_support_issues(
+                section,
+                expected_components=set(_SUPPORT_COMPONENTS),
+            )
+            if name == "current_component_support"
+            else []
+        )
+        blockers = [*section_missing, *semantic_issues]
+        expected_status = "incomplete" if blockers else "complete"
+        expected_outcome = "stop" if blockers else "pass"
+        if (
+            section.get("status") != expected_status
+            or section.get("gate_outcome") != expected_outcome
+        ):
+            raise AcceptanceContractError(
+                f"release_prerequisite_false_claim:{name}"
+            )
+        missing.extend(blockers)
+        gates[name] = expected_outcome
+
+    adopter = _mapping(
+        prerequisites.get("first_adopter"),
+        "release_prerequisite_first_adopter",
+    )
+    adopter_missing = _missing_prerequisite_paths(
+        adopter,
+        prefix="first_adopter",
+        required_paths=(
+            ("business_owner",),
+            ("named_job",),
+            ("job_fingerprint",),
+            ("target_cluster",),
+            ("off_baseline_evidence",),
+            ("scalar_matrix_coverage",),
+            ("verified_on",),
+        ),
+    )
+    expected_adopter_status = (
+        "incomplete" if adopter_missing else "complete"
+    )
+    # Registration alone never authorizes optimized canary execution.
+    # Observe/shadow evidence, a rollback plan, and change authorization are
+    # separate U11/U13 gates.
+    expected_rollout_ceiling = "observe-ready"
+    if (
+        adopter.get("status") != expected_adopter_status
+        or adopter.get("rollout_ceiling") != expected_rollout_ceiling
+        or adopter.get("blocks_functional_completion") is not False
+    ):
+        raise AcceptanceContractError(
+            "release_prerequisite_false_claim:first_adopter"
+        )
+    missing.extend(adopter_missing)
+
+    next_baseline = _mapping(
+        prerequisites.get("next_baseline_trial"),
+        "release_prerequisite_next_baseline_trial",
+    )
+    if (
+        next_baseline.get("blocks_u2") is not False
+        or next_baseline.get("blocks_current_functional_work") is not False
+    ):
+        raise AcceptanceContractError(
+            "next_baseline_trial_must_be_non_blocking"
+        )
+
+    return {
+        "unit_completion_status": (
+            "complete"
+            if all(outcome == "pass" for outcome in gates.values())
+            else "incomplete"
+        ),
+        "gates": gates,
+        "missing": sorted(missing),
+        "rollout_ceiling": expected_rollout_ceiling,
+        "non_blocking_tracking": {
+            "next_baseline_trial": next_baseline.get("status"),
+            "first_adopter": expected_adopter_status,
+        },
+    }
+
+
+def load_mainline_prerequisite_report(
+    contract_path: str | Path,
+    *,
+    contract: AcceptanceContract | None = None,
+) -> dict[str, object]:
+    """Load the hash-bound support matrix and evaluate external prerequisites."""
+
+    path = Path(contract_path)
+    selected = contract or load_acceptance_contract(path)
+    if selected.profile != _MAINLINE_PROFILE:
+        raise AcceptanceContractError(
+            "mainline_prerequisites_require_mainline_profile"
+        )
+    matrix_path = path.parent / "mainline-support-matrix.json"
+    try:
+        payload = matrix_path.read_bytes()
+    except OSError as error:
+        raise AcceptanceContractError(
+            "support_matrix_unreadable"
+        ) from error
+    if hashlib.sha256(payload).hexdigest() != selected.support_matrix_sha256:
+        raise AcceptanceContractError("support_matrix_hash_mismatch")
+    matrix = _load_document(matrix_path, "support_matrix")
+    return evaluate_mainline_prerequisites(matrix)
 
 
 def _external_boolean(document: Mapping[str, Any], field: str) -> str:
@@ -483,6 +1308,7 @@ def _cinderx_test_status(infrastructure: Mapping[str, Any]) -> str:
 
 
 def _python_test_statuses(
+    contract: AcceptanceContract,
     infrastructure: Mapping[str, Any],
     *,
     run_id: str,
@@ -497,38 +1323,44 @@ def _python_test_statuses(
         or _GIT_COMMIT.fullmatch(source_git_commit) is None
     ):
         return "fail", "fail", "fail"
+    unit_contract = contract.test_suites["unit"]
+    integration_contract = contract.test_suites["integration"]
+    live_contract = contract.test_suites["live"]
     unit = validate_unittest_evidence(
         proofs.get("unit"),
-        gate_id="python.unit",
-        tier="unit",
+        gate_id=unit_contract.gate_id,
+        tier=unit_contract.tier,
         run_id=run_id,
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
-        required_tests=UNIT_REQUIRED_TESTS,
-        minimum_test_count=UNIT_TEST_COUNT,
-        allow_skips=False,
+        required_tests=unit_contract.required_tests,
+        minimum_test_count=unit_contract.expected_test_count,
+        expected_test_count=unit_contract.expected_test_count,
+        allow_skips=unit_contract.allow_skips,
     )
     integration = validate_unittest_evidence(
         proofs.get("integration"),
-        gate_id="python.integration",
-        tier="integration",
+        gate_id=integration_contract.gate_id,
+        tier=integration_contract.tier,
         run_id=run_id,
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
-        required_tests=INTEGRATION_REQUIRED_TESTS,
-        minimum_test_count=INTEGRATION_TEST_COUNT,
-        allow_skips=False,
+        required_tests=integration_contract.required_tests,
+        minimum_test_count=integration_contract.expected_test_count,
+        expected_test_count=integration_contract.expected_test_count,
+        allow_skips=integration_contract.allow_skips,
     )
     live = validate_unittest_evidence(
         proofs.get("live"),
-        gate_id="python.live",
-        tier="system",
+        gate_id=live_contract.gate_id,
+        tier=live_contract.tier,
         run_id=run_id,
         cluster_epoch=cluster_epoch,
         source_git_commit=source_git_commit,
-        required_tests=LIVE_REQUIRED_TESTS,
-        minimum_test_count=LIVE_TEST_COUNT,
-        allow_skips=False,
+        required_tests=live_contract.required_tests,
+        minimum_test_count=live_contract.expected_test_count,
+        expected_test_count=live_contract.expected_test_count,
+        allow_skips=live_contract.allow_skips,
     )
     return unit, integration, live
 
@@ -638,6 +1470,7 @@ def _gate_statuses(
         source, base, infrastructure
     )
     unit_tests, integration_tests, live_tests = _python_test_statuses(
+        contract,
         infrastructure,
         run_id=run_id,
         cluster_epoch=cluster_epoch,
@@ -735,8 +1568,60 @@ def _gate_statuses(
         "evidence.permissions_cleanup": permissions_cleanup,
         "measurement.non_gating": measurement_gate,
     }
-    if set(statuses) != set(contract.gates):
+    raw_prerequisites = evidence.get("mainline_prerequisites")
+    if raw_prerequisites is not None:
+        prerequisites = _mapping(
+            raw_prerequisites,
+            "mainline_prerequisites",
+        )
+        prerequisite_gates = _mapping(
+            prerequisites.get("gates"),
+            "mainline_prerequisite_gates",
+        )
+        prerequisite_mapping = {
+            "current_component_support":
+                "prerequisite.current_component_support",
+            "credential_distribution":
+                "prerequisite.credential_distribution",
+            "emergency_disable_distribution":
+                "prerequisite.emergency_distribution",
+        }
+        for source_name, gate_id in prerequisite_mapping.items():
+            raw_status = prerequisite_gates.get(source_name)
+            if raw_status not in {"pass", "stop"}:
+                raise AcceptanceContractError(
+                    f"mainline_prerequisite_outcome_invalid:{source_name}"
+                )
+            if gate_id in contract.gates:
+                statuses[gate_id] = str(raw_status)
+    unexpected = set(statuses) - set(contract.gates)
+    if unexpected:
         raise AcceptanceContractError("aggregator_contract_gate_drift")
+    suite_statuses = {
+        "unit": unit_tests,
+        "integration": integration_tests,
+        "system": live_tests,
+    }
+    suite_names = {
+        "unit": "unit",
+        "integration": "integration",
+        "system": "live",
+    }
+    for gate_id in sorted(set(contract.gates) - set(statuses)):
+        gate = contract.gates[gate_id]
+        if gate.tier == "release":
+            statuses[gate_id] = "incomplete"
+            continue
+        suite = contract.test_suites[suite_names[gate.tier]]
+        required_names = set(suite.required_tests)
+        target_names = {
+            target.rsplit(".", 1)[-1] for target in gate.test_targets
+        }
+        statuses[gate_id] = (
+            suite_statuses[gate.tier]
+            if target_names <= required_names
+            else "incomplete"
+        )
     return statuses
 
 
@@ -749,12 +1634,177 @@ def _mapped_status(
     }
 
 
+def _combine_outcomes(*statuses: GateOutcome) -> GateOutcome:
+    for status in (
+        GateOutcome.STOP,
+        GateOutcome.FAIL,
+        GateOutcome.INCONCLUSIVE,
+    ):
+        if status in statuses:
+            return status
+    return GateOutcome.PASS
+
+
+def aggregate_profile_outcomes(
+    contract: AcceptanceContract,
+    gate_outcomes: Mapping[str, str | GateOutcome],
+    *,
+    unit_completion_status: str | CompletionStatus,
+) -> dict[str, object]:
+    """Summarize release gates without treating unit lifecycle as an outcome."""
+
+    if not set(gate_outcomes) <= set(contract.gates):
+        raise AcceptanceContractError("gate_outcomes_identifiers_invalid")
+    outcomes: dict[str, GateOutcome] = {}
+    for gate, raw_status in gate_outcomes.items():
+        try:
+            outcomes[gate] = GateOutcome(raw_status)
+        except ValueError as error:
+            raise AcceptanceContractError(
+                f"gate_outcome_invalid:{gate}"
+            ) from error
+    try:
+        completion = CompletionStatus(unit_completion_status)
+    except ValueError as error:
+        raise AcceptanceContractError(
+            "unit_completion_status_invalid"
+        ) from error
+    missing_gates = sorted(set(contract.gates) - set(outcomes))
+    if missing_gates:
+        completion = CompletionStatus.INCOMPLETE
+    executed_verdict = (
+        _combine_outcomes(*outcomes.values())
+        if outcomes
+        else None
+    )
+    verdict = None if missing_gates else executed_verdict
+    reason_prefixes = {
+        GateOutcome.FAIL: "gate_failed",
+        GateOutcome.INCONCLUSIVE: "gate_inconclusive",
+        GateOutcome.STOP: "gate_stopped",
+    }
+    reasons = [
+        f"{reason_prefixes[status]}:{gate}"
+        for gate, status in sorted(outcomes.items())
+        if status is not GateOutcome.PASS
+    ]
+
+    def mapped(
+        mappings: Mapping[str, tuple[str, ...]],
+    ) -> tuple[dict[str, str], dict[str, list[str]]]:
+        executed: dict[str, str] = {}
+        missing: dict[str, list[str]] = {}
+        for identifier, gates in mappings.items():
+            absent = sorted(set(gates) - set(outcomes))
+            if absent:
+                missing[identifier] = absent
+            else:
+                executed[identifier] = _combine_outcomes(
+                    *(outcomes[gate] for gate in gates)
+                ).value
+        return executed, missing
+
+    requirements, missing_requirements = mapped(contract.requirements)
+    acceptance_examples, missing_acceptance_examples = mapped(
+        contract.acceptance_examples
+    )
+    rfcs, missing_rfcs = mapped(contract.rfc_gates)
+    lifecycle_reasons = (
+        []
+        if completion is CompletionStatus.COMPLETE
+        else ["unit_completion_incomplete"]
+    )
+    lifecycle_reasons.extend(
+        f"required_gate_not_executed:{gate}" for gate in missing_gates
+    )
+
+    return {
+        "profile": contract.profile,
+        "contract_schema": contract.schema_id,
+        "unit_completion_status": completion.value,
+        "verdict": None if verdict is None else verdict.value,
+        "executed_gate_verdict": (
+            None if executed_verdict is None else executed_verdict.value
+        ),
+        "release_ready": (
+            completion is CompletionStatus.COMPLETE
+            and verdict is GateOutcome.PASS
+            and not missing_gates
+        ),
+        "reason_codes": reasons,
+        "lifecycle_reason_codes": lifecycle_reasons,
+        "required_gate_count": len(contract.gates),
+        "executed_gate_count": len(outcomes),
+        "missing_gates": missing_gates,
+        "missing_gate_reasons": {
+            gate: "required_evidence_missing_or_not_executed"
+            for gate in missing_gates
+        },
+        "gates": {
+            gate: status.value for gate, status in outcomes.items()
+        },
+        "requirements": requirements,
+        "missing_requirements": missing_requirements,
+        "acceptance_examples": acceptance_examples,
+        "missing_acceptance_examples": missing_acceptance_examples,
+        "rfcs": rfcs,
+        "missing_rfcs": missing_rfcs,
+        "disabled_rfcs": list(contract.disabled_rfcs),
+    }
+
+
 def aggregate_formal_acceptance(
     contract: AcceptanceContract, evidence: Mapping[str, Any]
 ) -> dict[str, object]:
     """Aggregate U13 UT/IT/ST proof; absent proof is never treated as pass."""
 
     gate_statuses = _gate_statuses(contract, evidence)
+    if contract.separates_unit_lifecycle:
+        outcomes = {
+            gate: GateOutcome(status)
+            for gate, status in gate_statuses.items()
+            if status != "incomplete"
+        }
+        report = aggregate_profile_outcomes(
+            contract,
+            outcomes,
+            unit_completion_status=evidence.get(
+                "unit_completion_status",
+                CompletionStatus.INCOMPLETE,
+            ),
+        )
+        report.update(
+            {
+                "schema_version": 2,
+                "run_id": evidence["run_id"],
+                "cluster_epoch": evidence["cluster_epoch"],
+                "source": {
+                    "git_commit": evidence["source"].get("git_commit", ""),
+                    "cinderx_commit": evidence["source"].get(
+                        "cinderx_commit", ""
+                    ),
+                    "cinderx_source_tree_sha256": evidence["source"].get(
+                        "cinderx_source_tree_sha256", ""
+                    ),
+                    "cinderx_patch_sha256": evidence["source"].get(
+                        "cinderx_patch_sha256", ""
+                    ),
+                    "cinderx_wheel_sha256": evidence["source"].get(
+                        "cinderx_wheel_sha256", ""
+                    ),
+                    "cinderx_base_image_digest": evidence["source"].get(
+                        "cinderx_base_image_digest", ""
+                    ),
+                    "image_digest": evidence["source"].get(
+                        "image_digest", ""
+                    ),
+                    "udf_jit_wheel_sha256": evidence["source"].get(
+                        "udf_jit_wheel_sha256", ""
+                    ),
+                },
+            }
+        )
+        return report
     verdict = _combine(*gate_statuses.values())
     reason_prefixes = {
         "fail": "gate_failed",

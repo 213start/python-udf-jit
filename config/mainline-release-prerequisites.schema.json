@@ -1,0 +1,320 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:python-udf-jit:mainline-release-prerequisites:v1",
+  "title": "Python UDF JIT scalar mainline release prerequisites",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "contract_schema",
+    "profile",
+    "support_matrix",
+    "support_matrix_sha256",
+    "unit_completion_values",
+    "gate_outcome_values",
+    "performance_policy",
+    "performance_baseline",
+    "formal_performance_qualification",
+    "disabled_rfcs",
+    "test_suites",
+    "required_gates",
+    "gates",
+    "requirements",
+    "rfc_gates",
+    "test_tier_mapping",
+    "acceptance_examples"
+  ],
+  "properties": {
+    "$schema": {"const": "mainline-release-prerequisites.schema.json"},
+    "schema_version": {"const": 2},
+    "contract_schema": {
+      "const": "urn:python-udf-jit:mainline-release-prerequisites:v1"
+    },
+    "profile": {"const": "mainline-production"},
+    "support_matrix": {"const": "mainline-support-matrix.json"},
+    "support_matrix_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "unit_completion_values": {
+      "const": ["incomplete", "complete"]
+    },
+    "gate_outcome_values": {
+      "const": ["pass", "fail", "stop", "inconclusive"]
+    },
+    "performance_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_speedup",
+        "default_mode",
+        "target_applies_to",
+        "blocks_functional_completion",
+        "below_target_disposition"
+      ],
+      "properties": {
+        "target_speedup": {"type": "number", "exclusiveMinimum": 0},
+        "default_mode": {"const": "directional"},
+        "target_applies_to": {"const": "formal_only"},
+        "blocks_functional_completion": {"const": false},
+        "below_target_disposition": {
+          "const": "record_non_blocking_result"
+        }
+      }
+    },
+    "performance_baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "workload",
+        "approximate_rows",
+        "baseline",
+        "candidate",
+        "environment_constraint",
+        "off_runs",
+        "auto_runs",
+        "conclusion_scope",
+        "correctness",
+        "blocks_functional_completion"
+      ],
+      "properties": {
+        "mode": {"const": "directional"},
+        "workload": {"const": "tpch_sf10_lineitem_scalar_q6"},
+        "approximate_rows": {"type": "integer", "minimum": 1},
+        "baseline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "execution"],
+          "properties": {
+            "mode": {"const": "off"},
+            "execution": {"const": "original_daft_scalar_udf"}
+          }
+        },
+        "candidate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "enabled_rfcs", "disabled_rfcs"],
+          "properties": {
+            "mode": {"const": "auto"},
+            "enabled_rfcs": {
+              "type": "array",
+              "minItems": 8,
+              "maxItems": 8,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^RFC-00[1-8]$"
+              }
+            },
+            "disabled_rfcs": {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^RFC-0(?:09|10|11|12)$"
+              }
+            }
+          }
+        },
+        "environment_constraint": {"const": "same_environment"},
+        "off_runs": {"const": 1},
+        "auto_runs": {"const": 1},
+        "conclusion_scope": {"const": "directional_only"},
+        "correctness": {
+          "const": "ordered_result_and_aggregate_hash_equal"
+        },
+        "blocks_functional_completion": {"const": false}
+      }
+    },
+    "formal_performance_qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "cli_flag",
+        "warmup_runs",
+        "alternating_measured_runs",
+        "statistic",
+        "stability_metrics",
+        "target_speedup",
+        "fallback_minimum_ratio",
+        "blocks_functional_completion"
+      ],
+      "properties": {
+        "mode": {"const": "formal"},
+        "cli_flag": {"const": "--formal"},
+        "warmup_runs": {"const": 1},
+        "alternating_measured_runs": {"const": 5},
+        "statistic": {"const": "median"},
+        "stability_metrics": {
+          "const": ["mad", "drift"]
+        },
+        "target_speedup": {"type": "number", "exclusiveMinimum": 0},
+        "fallback_minimum_ratio": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "blocks_functional_completion": {"const": false}
+      }
+    },
+    "disabled_rfcs": {
+      "type": "array",
+      "prefixItems": [
+        {"const": "RFC-009"},
+        {"const": "RFC-010"},
+        {"const": "RFC-011"},
+        {"const": "RFC-012"}
+      ],
+      "items": false,
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "test_suites": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "integration", "live"],
+      "properties": {
+        "unit": {"$ref": "#/$defs/testSuite"},
+        "integration": {"$ref": "#/$defs/testSuite"},
+        "live": {"$ref": "#/$defs/testSuite"}
+      }
+    },
+    "required_gates": {
+      "type": "array",
+      "minItems": 60,
+      "maxItems": 60,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/gateId"}
+    },
+    "gates": {
+      "type": "object",
+      "minProperties": 60,
+      "maxProperties": 60,
+      "propertyNames": {"$ref": "#/$defs/gateId"},
+      "additionalProperties": {"$ref": "#/$defs/gate"}
+    },
+    "requirements": {
+      "type": "object",
+      "minProperties": 25,
+      "maxProperties": 25,
+      "propertyNames": {
+        "pattern": "^R(?:[1-9]|1[0-9]|2[0-5])$"
+      },
+      "additionalProperties": {"$ref": "#/$defs/gateList"}
+    },
+    "rfc_gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "RFC-001",
+        "RFC-002",
+        "RFC-003",
+        "RFC-004",
+        "RFC-005",
+        "RFC-006",
+        "RFC-007",
+        "RFC-008"
+      ],
+      "properties": {
+        "RFC-001": {"$ref": "#/$defs/gateList"},
+        "RFC-002": {"$ref": "#/$defs/gateList"},
+        "RFC-003": {"$ref": "#/$defs/gateList"},
+        "RFC-004": {"$ref": "#/$defs/gateList"},
+        "RFC-005": {"$ref": "#/$defs/gateList"},
+        "RFC-006": {"$ref": "#/$defs/gateList"},
+        "RFC-007": {"$ref": "#/$defs/gateList"},
+        "RFC-008": {"$ref": "#/$defs/gateList"}
+      }
+    },
+    "test_tier_mapping": {
+      "type": "object",
+      "minProperties": 25,
+      "maxProperties": 25,
+      "propertyNames": {
+        "pattern": "^R(?:[1-9]|1[0-9]|2[0-5])$"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+          "enum": ["unit", "integration", "system", "release"]
+        }
+      }
+    },
+    "acceptance_examples": {
+      "type": "object",
+      "minProperties": 12,
+      "maxProperties": 12,
+      "propertyNames": {
+        "pattern": "^AE(?:[1-9]|1[0-2])$"
+      },
+      "additionalProperties": {"$ref": "#/$defs/gateList"}
+    }
+  },
+  "$defs": {
+    "gateId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(?:[.][a-z][a-z0-9_]*)+$"
+    },
+    "gateList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/gateId"}
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tier", "description", "test_targets"],
+      "properties": {
+        "tier": {
+          "enum": ["unit", "integration", "system", "release"]
+        },
+        "description": {"type": "string", "minLength": 1},
+        "test_targets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "testSuite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_id",
+        "tier",
+        "arguments",
+        "required_tests",
+        "expected_test_count",
+        "allow_skips"
+      ],
+      "properties": {
+        "gate_id": {
+          "type": "string",
+          "pattern": "^python[.][a-z]+$"
+        },
+        "tier": {"enum": ["unit", "integration", "system"]},
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "required_tests": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^test_[a-z0-9_]+$"}
+        },
+        "expected_test_count": {"type": "integer", "minimum": 1},
+        "allow_skips": {"type": "boolean"}
+      }
+    }
+  }
+}

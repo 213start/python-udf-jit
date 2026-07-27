@@ -17,12 +17,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from python_udf_jit.diagnostics.acceptance import (
-    INTEGRATION_TEST_COUNT,
-    INTEGRATION_REQUIRED_TESTS,
-    LIVE_TEST_COUNT,
-    LIVE_REQUIRED_TESTS,
-    UNIT_TEST_COUNT,
-    UNIT_REQUIRED_TESTS,
+    CompletionStatus,
+    TestSuiteContract,
+    load_acceptance_contract,
 )
 from python_udf_jit.diagnostics.cinderx_evidence import (
     build_cinderx_evidence,
@@ -196,7 +193,7 @@ class Commands:
 
 
 def _announce(message: str) -> None:
-    print(f"[u13] {message}", flush=True)
+    print(f"[acceptance] {message}", flush=True)
 
 
 def _sha256(path: Path) -> str:
@@ -739,33 +736,27 @@ def _restart_worker_and_capture(
 
 def _test_receipt(
     *,
-    gate_id: str,
-    tier: str,
+    suite: TestSuiteContract,
     run_id: str,
     cluster_epoch: str,
     git_commit: str,
     argv: list[str],
-    required_tests: tuple[str, ...],
-    expected_count: int,
     log_path: Path,
     output: Path,
 ) -> dict[str, object]:
     proof = build_unittest_evidence(
-        gate_id=gate_id,
-        tier=tier,
+        gate_id=suite.gate_id,
+        tier=suite.tier,
         run_id=run_id,
         cluster_epoch=cluster_epoch,
         source_git_commit=git_commit,
         argv=argv,
-        required_tests=required_tests,
-        minimum_test_count=expected_count,
-        allow_skips=False,
+        required_tests=suite.required_tests,
+        minimum_test_count=suite.expected_test_count,
+        expected_test_count=suite.expected_test_count,
+        allow_skips=suite.allow_skips,
         log_path=log_path,
     )
-    if proof.get("test_count") != expected_count:
-        raise AcceptanceRunError(
-            f"{gate_id}_test_count_drift:{proof.get('test_count')}"
-        )
     _write_private_json(output, proof)
     return proof
 
@@ -873,12 +864,83 @@ def _down(
         )
 
 
+def _resolve_acceptance_profile(
+    repository: Path,
+    selection: str | os.PathLike[str] | None,
+) -> Path:
+    value = "scalar-piercing" if selection is None else os.fspath(selection)
+    named_profiles = {
+        "scalar-piercing": "scalar-piercing-acceptance.json",
+        "mainline-production": "mainline-production-acceptance.json",
+    }
+    if value in named_profiles:
+        return repository / "config" / named_profiles[value]
+    candidate = Path(value)
+    if candidate.suffix.lower() != ".json":
+        raise AcceptanceRunError(f"acceptance_profile_unknown:{value}")
+    resolved = (
+        candidate
+        if candidate.is_absolute()
+        else repository / candidate
+    ).resolve()
+    if not resolved.is_file():
+        raise AcceptanceRunError(
+            f"acceptance_profile_path_unreadable:{resolved}"
+        )
+    return resolved
+
+
+def _acceptance_report_passes(
+    report: Mapping[str, object],
+    *,
+    require_release_ready: bool,
+) -> bool:
+    if require_release_ready:
+        return (
+            report.get("verdict") == "pass"
+            and report.get("release_ready") is True
+        )
+    return report.get(
+        "executed_gate_verdict",
+        report.get("verdict"),
+    ) == "pass"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the complete U13 formal acceptance on blue-98."
     )
     parser.add_argument("--repository", type=Path, default=Path.cwd())
     parser.add_argument("--run-root", type=Path)
+    parser.add_argument(
+        "--acceptance-profile",
+        default="scalar-piercing",
+        help=(
+            "scalar-piercing or mainline-production; an explicit JSON "
+            "path is accepted for compatibility"
+        ),
+    )
+    parser.add_argument(
+        "--acceptance-schema",
+        type=Path,
+        help="optional JSON schema whose $id must match the selected profile",
+    )
+    parser.add_argument(
+        "--unit-completion-status",
+        choices=tuple(status.value for status in CompletionStatus),
+        default=CompletionStatus.INCOMPLETE.value,
+        help=(
+            "implementation lifecycle, reported separately from gate outcomes"
+        ),
+    )
+    parser.add_argument(
+        "--require-release-ready",
+        action="store_true",
+        help=(
+            "fail unless the selected production profile has complete "
+            "lifecycle evidence; milestone runs leave this unset"
+        ),
+    )
     parser.add_argument(
         "--cinderx-base-image",
         default="cinderx-pyperf-realenv:arm64",
@@ -1020,6 +1082,25 @@ def run(arguments: argparse.Namespace) -> Path:
         raise AcceptanceRunError("blue98_acceptance_requires_root")
     trusted_tools = _install_trusted_root_environment()
     repository = arguments.repository.resolve()
+    contract_path = _resolve_acceptance_profile(
+        repository,
+        getattr(arguments, "acceptance_profile", None),
+    )
+    schema_path = getattr(arguments, "acceptance_schema", None)
+    contract = load_acceptance_contract(
+        contract_path,
+        schema_path=schema_path.resolve() if schema_path is not None else None,
+    )
+    unit_completion_status = CompletionStatus(
+        getattr(
+            arguments,
+            "unit_completion_status",
+            CompletionStatus.INCOMPLETE.value,
+        )
+    )
+    unit_suite = contract.test_suites["unit"]
+    integration_suite = contract.test_suites["integration"]
+    live_suite = contract.test_suites["live"]
     commands = Commands()
     commit = _git_identity(commands, repository)
     docker = preflight_docker()
@@ -1466,10 +1547,7 @@ def run(arguments: argparse.Namespace) -> Path:
                 "python",
                 "-m",
                 "unittest",
-                "discover",
-                "-s",
-                "tests/unit",
-                "-v",
+                *unit_suite.arguments,
             ],
             environment=live_environment,
         )
@@ -1477,14 +1555,11 @@ def run(arguments: argparse.Namespace) -> Path:
         commands.log(unit_argv, unit_log, timeout=300)
         unit_path = layout.evidence / "python-unit-proof.json"
         unit_proof = _test_receipt(
-            gate_id="python.unit",
-            tier="unit",
+            suite=unit_suite,
             run_id=run_id,
             cluster_epoch=cluster_epoch,
             git_commit=commit,
             argv=unit_argv,
-            required_tests=UNIT_REQUIRED_TESTS,
-            expected_count=UNIT_TEST_COUNT,
             log_path=unit_log,
             output=unit_path,
         )
@@ -1495,12 +1570,7 @@ def run(arguments: argparse.Namespace) -> Path:
                 "python",
                 "-m",
                 "unittest",
-                "discover",
-                "-s",
-                "tests/integration",
-                "-t",
-                ".",
-                "-v",
+                *integration_suite.arguments,
             ],
             environment=live_environment,
         )
@@ -1514,14 +1584,11 @@ def run(arguments: argparse.Namespace) -> Path:
             layout.evidence / "python-integration-proof.json"
         )
         integration_proof = _test_receipt(
-            gate_id="python.integration",
-            tier="integration",
+            suite=integration_suite,
             run_id=run_id,
             cluster_epoch=cluster_epoch,
             git_commit=commit,
             argv=integration_argv,
-            required_tests=INTEGRATION_REQUIRED_TESTS,
-            expected_count=INTEGRATION_TEST_COUNT,
             log_path=integration_log,
             output=integration_path,
         )
@@ -1639,10 +1706,7 @@ def run(arguments: argparse.Namespace) -> Path:
                 "python",
                 "-m",
                 "unittest",
-                "discover",
-                "-s",
-                "tests/e2e",
-                "-v",
+                *live_suite.arguments,
             ],
             environment={
                 **live_environment,
@@ -1653,18 +1717,17 @@ def run(arguments: argparse.Namespace) -> Path:
         commands.log(live_argv, live_log, timeout=600)
         live_path = layout.evidence / "python-live-proof.json"
         live_proof = _test_receipt(
-            gate_id="python.live",
-            tier="system",
+            suite=live_suite,
             run_id=run_id,
             cluster_epoch=cluster_epoch,
             git_commit=commit,
             argv=live_argv,
-            required_tests=LIVE_REQUIRED_TESTS,
-            expected_count=LIVE_TEST_COUNT,
             log_path=live_log,
             output=live_path,
         )
-        _announce(f"{LIVE_TEST_COUNT}/{LIVE_TEST_COUNT} live ST tests passed")
+        _announce(
+            f"{live_proof['test_count']} profile-selected live ST tests passed"
+        )
 
         e2e_snapshot_path = layout.evidence / "e2e-snapshot-before.json"
         _capture_snapshot(
@@ -1945,21 +2008,27 @@ def run(arguments: argparse.Namespace) -> Path:
         )
         _write_private_json(infrastructure_path, infrastructure)
         formal_report = assemble_formal_acceptance(
-            contract_path=(
-                repository / "config/scalar-piercing-acceptance.json"
-            ),
+            contract_path=contract_path,
             base_report_path=base_report_path,
             black_box_off_path=black_box_paths["off"],
             black_box_auto_path=black_box_paths["auto"],
             source_path=source_path,
             infrastructure_path=infrastructure_path,
             measurement_path=measurement_path,
+            unit_completion_status=unit_completion_status,
         )
         formal_path = layout.evidence / "formal-acceptance-report.json"
         _write_private_json(formal_path, formal_report)
-        if formal_report.get("verdict") != "pass":
+        if not _acceptance_report_passes(
+            formal_report,
+            require_release_ready=bool(
+                getattr(arguments, "require_release_ready", False)
+            ),
+        ):
             raise AcceptanceRunError(
-                f"formal_acceptance_failed:{formal_report.get('reason_codes')}"
+                "formal_acceptance_failed:"
+                f"{formal_report.get('reason_codes')}:"
+                f"{formal_report.get('lifecycle_reason_codes', [])}"
             )
 
         formal_container_path = "/evidence/evidence/formal-acceptance-report.json"
@@ -2020,6 +2089,10 @@ def run(arguments: argparse.Namespace) -> Path:
         summary = {
             "schema_version": 1,
             "status": "pass",
+            "profile": contract.profile,
+            "contract_schema": contract.schema_id,
+            "unit_completion_status": unit_completion_status.value,
+            "release_ready": formal_report.get("release_ready"),
             "run_id": run_id,
             "cluster_epoch": cluster_epoch,
             "git_commit": commit,

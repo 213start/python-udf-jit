@@ -60,6 +60,7 @@ def build_unittest_evidence(
     minimum_test_count: int,
     allow_skips: bool,
     log_path: Path,
+    expected_test_count: int | None = None,
 ) -> dict[str, object]:
     """Build a receipt only when a private unittest log proves the gate."""
 
@@ -77,6 +78,15 @@ def build_unittest_evidence(
         or minimum_test_count < 1
     ):
         raise TestEvidenceError("minimum_test_count_invalid")
+    if (
+        expected_test_count is not None
+        and (
+            isinstance(expected_test_count, bool)
+            or not isinstance(expected_test_count, int)
+            or expected_test_count < minimum_test_count
+        )
+    ):
+        raise TestEvidenceError("expected_test_count_invalid")
     command = _canonical_strings(argv, "argv", require_unique=False)
     required = _canonical_strings(
         required_tests,
@@ -103,6 +113,14 @@ def build_unittest_evidence(
     )
     if final is None or "FAILED (" in text or test_count < minimum_test_count:
         raise TestEvidenceError("unittest_result_invalid")
+    if (
+        expected_test_count is not None
+        and test_count != expected_test_count
+    ):
+        raise TestEvidenceError(
+            "unittest_test_count_mismatch:"
+            f"expected={expected_test_count}:actual={test_count}"
+        )
     skipped = int(final.group(1) or 0)
     if not allow_skips and skipped != 0:
         raise TestEvidenceError("unittest_unexpected_skip")
@@ -166,6 +184,7 @@ def validate_unittest_evidence(
     required_tests: Iterable[str],
     minimum_test_count: int,
     allow_skips: bool,
+    expected_test_count: int | None = None,
 ) -> str:
     """Return pass/fail/incomplete for a previously built unittest receipt."""
 
@@ -230,6 +249,10 @@ def validate_unittest_evidence(
         and isinstance(proof["test_count"], int)
         and not isinstance(proof["test_count"], bool)
         and proof["test_count"] >= minimum_test_count
+        and (
+            expected_test_count is None
+            or proof["test_count"] == expected_test_count
+        )
         and isinstance(proof["skipped"], int)
         and not isinstance(proof["skipped"], bool)
         and proof["skipped"] >= 0
