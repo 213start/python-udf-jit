@@ -450,6 +450,28 @@ class EvidenceAggregationTests(unittest.TestCase):
         self.assertEqual(report["checks"]["supported_hit"], "pass")
         self.assertEqual(report["checks"]["guard_miss"], "pass")
         self.assertEqual(report["checks"]["unsupported"], "pass")
+
+        dependency_rejection = _base_evidence()
+        dependency_rejection["scenarios"]["unsupported"]["reason_code"] = (
+            "unsupported_dependency"
+        )
+        dependency_report = aggregate_run_evidence(
+            dependency_rejection,
+            _passing_events(),
+        )
+        self.assertEqual(dependency_report["verdict"], "pass")
+        self.assertEqual(dependency_report["checks"]["unsupported"], "pass")
+
+        unregistered_rejection = _base_evidence()
+        unregistered_rejection["scenarios"]["unsupported"]["reason_code"] = (
+            "unregistered_reason"
+        )
+        unregistered_report = aggregate_run_evidence(
+            unregistered_rejection,
+            _passing_events(),
+        )
+        self.assertEqual(unregistered_report["verdict"], "fail")
+        self.assertEqual(unregistered_report["checks"]["unsupported"], "fail")
         self.assertEqual(report["checks"]["fail_open"], "pass")
         self.assertEqual(report["checks"]["zero_row"], "pass")
         self.assertEqual(report["checks"]["evidence_identity"], "pass")

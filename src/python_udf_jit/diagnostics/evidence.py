@@ -458,7 +458,8 @@ def aggregate_run_evidence(
     unsupported = _scenario(evidence, "unsupported")
     if not (
         _same_digest(unsupported)
-        and unsupported.get("reason_code") in {"unsupported_opcode", "opaque_call"}
+        and unsupported.get("reason_code")
+        in {"unsupported_opcode", "unsupported_dependency", "opaque_call"}
         and unsupported.get("row_count") == unsupported.get("off_callable_calls")
         and unsupported.get("off_callable_calls") == unsupported.get("auto_callable_calls")
         and unsupported.get("auto_callable_calls") == unsupported.get("side_effect_count")
