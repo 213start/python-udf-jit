@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import inspect
-import json
 import platform
 import types
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from python_udf_jit.compiler.abstract_interpreter import (
+    CapturedProgram,
+    analyze_function,
+)
 from python_udf_jit.compiler.bytecode_decoder import (
     BytecodeDecodeError,
     DecodeRejectCode,
@@ -17,13 +19,19 @@ from python_udf_jit.compiler.capture_ir import (
     CaptureFrontend,
     build_capture_frontend,
 )
+from python_udf_jit.compiler.capture_cache import (
+    CaptureCache,
+    CaptureCacheKey,
+)
 from python_udf_jit.compiler.cfg import CfgBuildError, CfgRejectCode
+from python_udf_jit.compiler.identity import (
+    IdentityError,
+    capture_identities,
+)
 
 
 FLOAT64 = "float64"
 LOCKED_TARGET_PYTHON = "3.14.3"
-MAX_IDENTITY_DOCUMENT_BYTES = 1 << 20
-MAX_IDENTITY_SEQUENCE_ITEMS = 65_536
 
 
 class CaptureRejectCode(StrEnum):
@@ -43,6 +51,7 @@ class CaptureRejectCode(StrEnum):
     INVALID_BYTECODE = "invalid_bytecode"
     INVALID_EXCEPTION_TABLE = "invalid_exception_table"
     INVALID_LOCATION_TABLE = "invalid_location_table"
+    UNSUPPORTED_DEPENDENCY = "unsupported_dependency"
 
 
 class CaptureRejected(ValueError):
@@ -95,6 +104,11 @@ class CaptureRequest:
     input_types: tuple[str, ...] = (FLOAT64,)
     output_type: str = FLOAT64
     target_python: str = LOCKED_TARGET_PYTHON
+    job_namespace: str = ""
+    schema_sha256: str = ""
+    adapter_abi_sha256: str = ""
+    policy_sha256: str = ""
+    capture_cache: CaptureCache | None = None
 
 
 @dataclass(frozen=True)
@@ -113,7 +127,11 @@ class CaptureIR:
     capture_runtime_python: str
     instructions: tuple[CaptureInstruction, ...]
     fallback_identity: FallbackIdentity
-    frontend: CaptureFrontend
+    program: CapturedProgram
+
+    @property
+    def frontend(self) -> CaptureFrontend:
+        return self.program.frontend
 
 
 @dataclass(frozen=True)
@@ -148,74 +166,6 @@ def _resolve_user_function(callable_object: Any) -> types.FunctionType:
     return wrapped
 
 
-def _safe_constant_document(value: object, *, depth: int = 0) -> object:
-    if depth > 16:
-        _reject(CaptureRejectCode.INVALID_CONSTANT, "nested_constant")
-    value_type = type(value)
-    if value is None:
-        return ["none", None]
-    if value is Ellipsis:
-        return ["ellipsis", None]
-    if value_type is bool:
-        return ["bool", value]
-    if value_type is int:
-        if value.bit_length() > MAX_IDENTITY_DOCUMENT_BYTES * 8:
-            _reject(CaptureRejectCode.INVALID_CONSTANT, "integer_budget")
-        return ["int", str(value)]
-    if value_type is float:
-        return ["float", value.hex()]
-    if value_type is complex:
-        return ["complex", value.real.hex(), value.imag.hex()]
-    if value_type is str:
-        if len(value) > MAX_IDENTITY_DOCUMENT_BYTES:
-            _reject(CaptureRejectCode.INVALID_CONSTANT, "string_budget")
-        return ["str", value]
-    if value_type is bytes:
-        if len(value) > MAX_IDENTITY_DOCUMENT_BYTES:
-            _reject(CaptureRejectCode.INVALID_CONSTANT, "bytes_budget")
-        return ["bytes", value.hex()]
-    if value_type is tuple:
-        if len(value) > MAX_IDENTITY_SEQUENCE_ITEMS:
-            _reject(CaptureRejectCode.INVALID_CONSTANT, "tuple_budget")
-        return [
-            "tuple",
-            [_safe_constant_document(item, depth=depth + 1) for item in value],
-        ]
-    if value_type is frozenset:
-        if len(value) > MAX_IDENTITY_SEQUENCE_ITEMS:
-            _reject(CaptureRejectCode.INVALID_CONSTANT, "frozenset_budget")
-        encoded = [
-            _safe_constant_document(item, depth=depth + 1) for item in value
-        ]
-        return [
-            "frozenset",
-            sorted(
-                encoded,
-                key=lambda item: json.dumps(
-                    item,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=True,
-                    allow_nan=False,
-                ),
-            ),
-        ]
-    _reject(CaptureRejectCode.INVALID_CONSTANT, "unsupported_exact_type")
-
-
-def _code_identity(function: types.FunctionType) -> str:
-    constants = [
-        _safe_constant_document(value) for value in function.__code__.co_consts
-    ]
-    document = json.dumps(constants, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    if len(document) > MAX_IDENTITY_DOCUMENT_BYTES:
-        _reject(CaptureRejectCode.INVALID_CONSTANT, "identity_document_budget")
-    digest = hashlib.sha256()
-    digest.update(function.__code__.co_code)
-    digest.update(document.encode("ascii"))
-    return digest.hexdigest()
-
-
 def _validate_request_before_callable(request: CaptureRequest) -> None:
     if request.input_types != (FLOAT64,) or request.output_type != FLOAT64:
         _reject(CaptureRejectCode.SCHEMA_MISMATCH)
@@ -248,7 +198,35 @@ def capture(request: CaptureRequest) -> CaptureIR:
         _reject(CaptureRejectCode.CLOSURE_DEPENDENCY)
 
     try:
-        frontend = build_capture_frontend(code)
+        identities = capture_identities(
+            function,
+            namespace_salt=(
+                request.job_namespace or "python-udf-jit"
+            ),
+        )
+        if request.capture_cache is None:
+            program = analyze_function(
+                function,
+                identities=identities,
+            )
+        else:
+            key = CaptureCacheKey(
+                request.job_namespace,
+                identities.code.sha256,
+                identities.dependency.sha256,
+                identities.source.namespace_sha256,
+                request.schema_sha256,
+                request.adapter_abi_sha256,
+                request.policy_sha256,
+            )
+            program = request.capture_cache.get(key)
+            if program is None:
+                program = analyze_function(
+                    function,
+                    identities=identities,
+                )
+                request.capture_cache.put(key, program)
+        frontend = program.frontend
     except BytecodeDecodeError as error:
         code_map = {
             DecodeRejectCode.UNSUPPORTED_FORMAT: CaptureRejectCode.UNSUPPORTED_BYTECODE_FORMAT,
@@ -264,6 +242,8 @@ def capture(request: CaptureRequest) -> CaptureIR:
             CfgRejectCode.STACK_IMBALANCE: CaptureRejectCode.INVALID_STACK,
         }
         _reject(code_map.get(error.code, CaptureRejectCode.CONTROL_FLOW), error.detail)
+    except IdentityError as error:
+        _reject(CaptureRejectCode.UNSUPPORTED_DEPENDENCY, error.code.value)
 
     instructions = frontend.decoded_bytecode.instructions
     if any(instruction.jump_target is not None for instruction in instructions):
@@ -329,9 +309,11 @@ def capture(request: CaptureRequest) -> CaptureIR:
         capture_runtime_python=platform.python_version(),
         instructions=tuple(captured),
         fallback_identity=FallbackIdentity(
-            function.__module__, function.__qualname__, _code_identity(function)
+            function.__module__,
+            function.__qualname__,
+            program.identities.code.sha256,
         ),
-        frontend=frontend,
+        program=program,
     )
 
 
@@ -340,6 +322,13 @@ def capture_frontend(callable_object: Any) -> CaptureFrontend:
 
     function = _resolve_user_function(callable_object)
     return build_capture_frontend(function.__code__)
+
+
+def capture_program(callable_object: Any) -> CapturedProgram:
+    """Analyze supported and opaque regions without executing the callable."""
+
+    function = _resolve_user_function(callable_object)
+    return analyze_function(function)
 
 
 def try_capture(request: CaptureRequest) -> CaptureResult:

@@ -27,6 +27,10 @@ def comparison(value):
     return value > 0.0
 
 
+def comparison_less_equal(value):
+    return value <= 0.0
+
+
 def local_branch(value):
     result = 1.0
     if value > 0.0:
@@ -99,6 +103,7 @@ class BytecodeDecoderTest(unittest.TestCase):
         cases = {
             arithmetic: {"binary.multiply", "binary.add"},
             comparison: {"compare.greater"},
+            comparison_less_equal: {"compare.less_equal"},
             local_branch: {"local.store", "branch.if_false"},
             exception_path: {"exception.push", "exception.match", "exception.reraise"},
             fixed_field: {"field.load"},

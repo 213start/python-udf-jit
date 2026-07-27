@@ -201,7 +201,10 @@ class CaptureTest(unittest.TestCase):
 
         with self.assertRaises(CaptureRejected) as raised:
             capture(CaptureRequest(function))
-        self.assertEqual(raised.exception.code, CaptureRejectCode.INVALID_CONSTANT)
+        self.assertEqual(
+            raised.exception.code,
+            CaptureRejectCode.UNSUPPORTED_DEPENDENCY,
+        )
         self.assertEqual(repr_calls, 0)
 
 

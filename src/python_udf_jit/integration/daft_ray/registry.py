@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from python_udf_jit.compiler.capture import CaptureIR, CaptureRequest, try_capture
+from python_udf_jit.compiler.capture_cache import CaptureCache
 from python_udf_jit.compiler.core_ir import lower_capture
 from python_udf_jit.compiler.region import form_verified_region
 from python_udf_jit.diagnostics import events
@@ -99,6 +100,11 @@ class CandidateRegistry:
         self._job_namespace = job_namespace
         self._ttl_seconds = float(ttl_seconds)
         self._clock = clock
+        self._capture_cache = CaptureCache(
+            capacity=max_candidates,
+            ttl_seconds=ttl_seconds,
+            clock=clock,
+        )
         self._records: OrderedDict[int, CandidateRecord] = OrderedDict()
         self._func_records: dict[int, CandidateRecord] = {}
         self._func_refs: dict[int, weakref.ReferenceType[Any] | None] = {}
@@ -361,7 +367,22 @@ class CandidateRegistry:
                 artifact_bytes: bytes | None = None
                 if "float64" in logical_schema.lower():
                     try:
-                        captured = try_capture(CaptureRequest(record.capture_callable))
+                        captured = try_capture(
+                            CaptureRequest(
+                                record.capture_callable,
+                                job_namespace=self._job_namespace,
+                                schema_sha256=hashlib.sha256(
+                                    logical_schema.encode("utf-8")
+                                ).hexdigest(),
+                                adapter_abi_sha256=hashlib.sha256(
+                                    b"daft-0.7.2-capture-v2"
+                                ).hexdigest(),
+                                policy_sha256=hashlib.sha256(
+                                    b"python-3.14.3-float64-scalar"
+                                ).hexdigest(),
+                                capture_cache=self._capture_cache,
+                            )
+                        )
                         record.capture_ir = (
                             captured.capture_ir if captured.supported else None
                         )
@@ -418,6 +439,7 @@ class CandidateRegistry:
 
     def close(self) -> None:
         with self._lock:
+            self._capture_cache.clear_job(self._job_namespace)
             self._records.clear()
             self._func_records.clear()
             self._func_refs.clear()

@@ -448,7 +448,7 @@ def _normal_operation(opname: str, argument: int | None) -> str:
     if opname == "COMPARE_OP":
         if argument is None:
             _fail(DecodeRejectCode.INVALID_ARGUMENT, "COMPARE_OP")
-        comparison_index = argument & 0xF
+        comparison_index = argument >> 5
         if comparison_index >= len(dis.cmp_op):
             _fail(DecodeRejectCode.INVALID_ARGUMENT, "COMPARE_OP")
         return {
