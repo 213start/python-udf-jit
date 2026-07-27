@@ -10,6 +10,7 @@ from python_udf_jit.compiler.capture import (
     CaptureRejected,
     CaptureRequest,
     capture,
+    capture_frontend,
     try_capture,
 )
 
@@ -43,6 +44,10 @@ class CaptureTest(unittest.TestCase):
         )
         self.assertEqual(captured.target_python, "3.14.3")
         self.assertEqual(captured.capture_runtime_python, platform.python_version())
+        self.assertEqual(
+            captured.frontend.decoded_bytecode.bytecode_format.decoder_id,
+            "cpython-3.14-wordcode-v1",
+        )
 
     def test_accepts_a_single_daft_style_wrapping_layer(self):
         @functools.wraps(affine)
@@ -150,6 +155,54 @@ class CaptureTest(unittest.TestCase):
                 with self.assertRaises(CaptureRejected) as raised:
                     capture(CaptureRequest(function))
                 self.assertEqual(raised.exception.code, code)
+
+    def test_rich_frontend_is_available_without_widening_legacy_lowering(self):
+        def branch(x):
+            if x > 0.0:
+                return (x, "positive")
+            return [x, "nonpositive"]
+
+        frontend = capture_frontend(branch)
+        operations = {
+            instruction.operation
+            for instruction in frontend.decoded_bytecode.instructions
+        }
+
+        self.assertIn("branch.if_false", operations)
+        self.assertIn("aggregate.tuple", operations)
+        self.assertIn("aggregate.list", operations)
+        self.assertIn("controlled_str", frontend.required_capabilities)
+        self.assertIn("python_region", frontend.required_capabilities)
+        with self.assertRaises(CaptureRejected) as raised:
+            capture(CaptureRequest(branch))
+        self.assertEqual(raised.exception.code, CaptureRejectCode.CONTROL_FLOW)
+
+    def test_identity_rejects_opaque_constant_without_calling_repr(self):
+        repr_calls = 0
+
+        class HostileConstant:
+            def __repr__(self):
+                nonlocal repr_calls
+                repr_calls += 1
+                raise AssertionError("repr must not be called")
+
+        def constant_function(x):
+            return x
+
+        hostile = HostileConstant()
+        code = constant_function.__code__.replace(
+            co_consts=(hostile,),
+        )
+        function = type(constant_function)(
+            code,
+            constant_function.__globals__,
+            constant_function.__name__,
+        )
+
+        with self.assertRaises(CaptureRejected) as raised:
+            capture(CaptureRequest(function))
+        self.assertEqual(raised.exception.code, CaptureRejectCode.INVALID_CONSTANT)
+        self.assertEqual(repr_calls, 0)
 
 
 if __name__ == "__main__":

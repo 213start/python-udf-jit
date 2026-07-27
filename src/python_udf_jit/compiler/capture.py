@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dis
 import hashlib
 import inspect
 import json
@@ -10,9 +9,21 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from python_udf_jit.compiler.bytecode_decoder import (
+    BytecodeDecodeError,
+    DecodeRejectCode,
+)
+from python_udf_jit.compiler.capture_ir import (
+    CaptureFrontend,
+    build_capture_frontend,
+)
+from python_udf_jit.compiler.cfg import CfgBuildError, CfgRejectCode
+
 
 FLOAT64 = "float64"
 LOCKED_TARGET_PYTHON = "3.14.3"
+MAX_IDENTITY_DOCUMENT_BYTES = 1 << 20
+MAX_IDENTITY_SEQUENCE_ITEMS = 65_536
 
 
 class CaptureRejectCode(StrEnum):
@@ -28,6 +39,10 @@ class CaptureRejectCode(StrEnum):
     UNSUPPORTED_OPCODE = "unsupported_opcode"
     INVALID_CONSTANT = "invalid_constant"
     INVALID_STACK = "invalid_stack"
+    UNSUPPORTED_BYTECODE_FORMAT = "unsupported_bytecode_format"
+    INVALID_BYTECODE = "invalid_bytecode"
+    INVALID_EXCEPTION_TABLE = "invalid_exception_table"
+    INVALID_LOCATION_TABLE = "invalid_location_table"
 
 
 class CaptureRejected(ValueError):
@@ -98,6 +113,7 @@ class CaptureIR:
     capture_runtime_python: str
     instructions: tuple[CaptureInstruction, ...]
     fallback_identity: FallbackIdentity
+    frontend: CaptureFrontend
 
 
 @dataclass(frozen=True)
@@ -132,16 +148,68 @@ def _resolve_user_function(callable_object: Any) -> types.FunctionType:
     return wrapped
 
 
+def _safe_constant_document(value: object, *, depth: int = 0) -> object:
+    if depth > 16:
+        _reject(CaptureRejectCode.INVALID_CONSTANT, "nested_constant")
+    value_type = type(value)
+    if value is None:
+        return ["none", None]
+    if value is Ellipsis:
+        return ["ellipsis", None]
+    if value_type is bool:
+        return ["bool", value]
+    if value_type is int:
+        if value.bit_length() > MAX_IDENTITY_DOCUMENT_BYTES * 8:
+            _reject(CaptureRejectCode.INVALID_CONSTANT, "integer_budget")
+        return ["int", str(value)]
+    if value_type is float:
+        return ["float", value.hex()]
+    if value_type is complex:
+        return ["complex", value.real.hex(), value.imag.hex()]
+    if value_type is str:
+        if len(value) > MAX_IDENTITY_DOCUMENT_BYTES:
+            _reject(CaptureRejectCode.INVALID_CONSTANT, "string_budget")
+        return ["str", value]
+    if value_type is bytes:
+        if len(value) > MAX_IDENTITY_DOCUMENT_BYTES:
+            _reject(CaptureRejectCode.INVALID_CONSTANT, "bytes_budget")
+        return ["bytes", value.hex()]
+    if value_type is tuple:
+        if len(value) > MAX_IDENTITY_SEQUENCE_ITEMS:
+            _reject(CaptureRejectCode.INVALID_CONSTANT, "tuple_budget")
+        return [
+            "tuple",
+            [_safe_constant_document(item, depth=depth + 1) for item in value],
+        ]
+    if value_type is frozenset:
+        if len(value) > MAX_IDENTITY_SEQUENCE_ITEMS:
+            _reject(CaptureRejectCode.INVALID_CONSTANT, "frozenset_budget")
+        encoded = [
+            _safe_constant_document(item, depth=depth + 1) for item in value
+        ]
+        return [
+            "frozenset",
+            sorted(
+                encoded,
+                key=lambda item: json.dumps(
+                    item,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                ),
+            ),
+        ]
+    _reject(CaptureRejectCode.INVALID_CONSTANT, "unsupported_exact_type")
+
+
 def _code_identity(function: types.FunctionType) -> str:
-    constants = []
-    for value in function.__code__.co_consts:
-        if value is None:
-            constants.append(["none", None])
-        elif type(value) is float:
-            constants.append(["float", value.hex()])
-        else:
-            constants.append([type(value).__name__, repr(value)])
+    constants = [
+        _safe_constant_document(value) for value in function.__code__.co_consts
+    ]
     document = json.dumps(constants, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(document) > MAX_IDENTITY_DOCUMENT_BYTES:
+        _reject(CaptureRejectCode.INVALID_CONSTANT, "identity_document_budget")
     digest = hashlib.sha256()
     digest.update(function.__code__.co_code)
     digest.update(document.encode("ascii"))
@@ -164,7 +232,12 @@ def capture(request: CaptureRequest) -> CaptureIR:
     _validate_request_before_callable(request)
     function = _resolve_user_function(request.callable_object)
     code = function.__code__
-    forbidden_flags = inspect.CO_VARARGS | inspect.CO_VARKEYWORDS | inspect.CO_GENERATOR | inspect.CO_COROUTINE
+    forbidden_flags = (
+        inspect.CO_VARARGS
+        | inspect.CO_VARKEYWORDS
+        | inspect.CO_GENERATOR
+        | inspect.CO_COROUTINE
+    )
     if (
         code.co_argcount != 1
         or code.co_kwonlyargcount != 0
@@ -174,42 +247,69 @@ def capture(request: CaptureRequest) -> CaptureIR:
     if code.co_freevars or code.co_cellvars:
         _reject(CaptureRejectCode.CLOSURE_DEPENDENCY)
 
-    instructions = tuple(dis.get_instructions(code, show_caches=False))
-    if any(instruction.opcode in dis.hasjabs or instruction.opcode in dis.hasjrel for instruction in instructions):
+    try:
+        frontend = build_capture_frontend(code)
+    except BytecodeDecodeError as error:
+        code_map = {
+            DecodeRejectCode.UNSUPPORTED_FORMAT: CaptureRejectCode.UNSUPPORTED_BYTECODE_FORMAT,
+            DecodeRejectCode.UNKNOWN_OPCODE: CaptureRejectCode.UNSUPPORTED_OPCODE,
+            DecodeRejectCode.INVALID_EXCEPTION_TABLE: CaptureRejectCode.INVALID_EXCEPTION_TABLE,
+            DecodeRejectCode.INVALID_LOCATION_TABLE: CaptureRejectCode.INVALID_LOCATION_TABLE,
+        }
+        _reject(code_map.get(error.code, CaptureRejectCode.INVALID_BYTECODE), error.detail)
+    except CfgBuildError as error:
+        code_map = {
+            CfgRejectCode.STACK_UNDERFLOW: CaptureRejectCode.INVALID_STACK,
+            CfgRejectCode.STACK_OVERFLOW: CaptureRejectCode.INVALID_STACK,
+            CfgRejectCode.STACK_IMBALANCE: CaptureRejectCode.INVALID_STACK,
+        }
+        _reject(code_map.get(error.code, CaptureRejectCode.CONTROL_FLOW), error.detail)
+
+    instructions = frontend.decoded_bytecode.instructions
+    if any(instruction.jump_target is not None for instruction in instructions):
         _reject(CaptureRejectCode.CONTROL_FLOW)
-    if any(instruction.opname in {"CALL", "CALL_KW", "CALL_FUNCTION_EX"} for instruction in instructions):
+    if any(instruction.operation == "call.opaque" for instruction in instructions):
         _reject(CaptureRejectCode.OPAQUE_CALL)
-    if any(instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"} for instruction in instructions):
+    if any(instruction.operation == "global.load" for instruction in instructions):
         _reject(CaptureRejectCode.GLOBAL_DEPENDENCY)
-    if any(instruction.opname in {"COMPARE_OP", "IS_OP", "CONTAINS_OP"} for instruction in instructions):
+    if any(instruction.operation.startswith("compare.") for instruction in instructions):
         _reject(CaptureRejectCode.UNSUPPORTED_OPERATOR)
 
     captured: list[CaptureInstruction] = []
     stack_depth = 0
     returned = False
     for instruction in instructions:
-        opname = instruction.opname
+        opname = instruction.opcode_name
         if opname == "RESUME":
             continue
-        if opname in {"LOAD_FAST", "LOAD_FAST_BORROW"}:
-            if instruction.arg != 0:
+        if instruction.operation == "local.load":
+            if instruction.argument != 0:
                 _reject(CaptureRejectCode.UNSUPPORTED_SIGNATURE)
             captured.append(CaptureInstruction("arg.load"))
             stack_depth += 1
-        elif opname == "LOAD_CONST":
-            if type(instruction.argval) is not float:
-                _reject(CaptureRejectCode.INVALID_CONSTANT, type(instruction.argval).__name__)
-            captured.append(CaptureInstruction("const.f64", instruction.argval))
+        elif instruction.operation == "constant.load":
+            assert instruction.argument is not None
+            value = code.co_consts[instruction.argument]
+            if type(value) is not float:
+                _reject(
+                    CaptureRejectCode.INVALID_CONSTANT,
+                    instruction.constant_kind or "unsupported_constant_type",
+                )
+            captured.append(CaptureInstruction("const.f64", value))
             stack_depth += 1
-        elif opname == "BINARY_OP":
-            operation = {"+": "add.f64", "-": "sub.f64", "*": "mul.f64"}.get(instruction.argrepr)
+        elif instruction.operation.startswith("binary."):
+            operation = {
+                "binary.add": "add.f64",
+                "binary.subtract": "sub.f64",
+                "binary.multiply": "mul.f64",
+            }.get(instruction.operation)
             if operation is None:
-                _reject(CaptureRejectCode.UNSUPPORTED_OPERATOR, instruction.argrepr)
+                _reject(CaptureRejectCode.UNSUPPORTED_OPERATOR, instruction.operation)
             if stack_depth < 2:
                 _reject(CaptureRejectCode.INVALID_STACK)
             captured.append(CaptureInstruction(operation))
             stack_depth -= 1
-        elif opname == "RETURN_VALUE":
+        elif instruction.operation == "return.value":
             if returned or stack_depth != 1:
                 _reject(CaptureRejectCode.INVALID_STACK)
             captured.append(CaptureInstruction("return"))
@@ -231,7 +331,15 @@ def capture(request: CaptureRequest) -> CaptureIR:
         fallback_identity=FallbackIdentity(
             function.__module__, function.__qualname__, _code_identity(function)
         ),
+        frontend=frontend,
     )
+
+
+def capture_frontend(callable_object: Any) -> CaptureFrontend:
+    """Build the versioned static frontend without applying legacy lowering gates."""
+
+    function = _resolve_user_function(callable_object)
+    return build_capture_frontend(function.__code__)
 
 
 def try_capture(request: CaptureRequest) -> CaptureResult:

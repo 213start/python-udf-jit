@@ -136,6 +136,8 @@ class CoreUdfModule:
 
 
 def lower_capture(captured: CaptureIR) -> CoreUdfModule:
+    if not captured.instructions:
+        raise ValueError("capture has no legacy F64 lowering")
     stack: list[str] = []
     nodes: list[CoreNode] = []
     next_value = 0
