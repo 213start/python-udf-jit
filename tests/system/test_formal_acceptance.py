@@ -7,6 +7,43 @@ import unittest
 from pathlib import Path
 
 
+def assert_accepted_gate_scope(report: dict[str, object]) -> None:
+    release_ready = report.get("release_ready") is True
+    if release_ready:
+        if report.get("verdict") != "pass":
+            raise AssertionError(report.get("reason_codes"))
+        if report.get("missing_gates"):
+            raise AssertionError("release-ready report has missing gates")
+    else:
+        if report.get("unit_completion_status") != "incomplete":
+            raise AssertionError("milestone report must remain incomplete")
+        if report.get("verdict") is not None:
+            raise AssertionError("milestone report cannot claim a final verdict")
+        if report.get("executed_gate_verdict") != "pass":
+            raise AssertionError(report.get("reason_codes"))
+        if not report.get("missing_gates"):
+            raise AssertionError("milestone report must name future gates")
+    for gate, status in dict(report["gates"]).items():
+        if status != "pass":
+            raise AssertionError(f"{gate}:{status}")
+
+
+def assert_accepted_mapping_scope(
+    report: dict[str, object],
+    collection: str,
+) -> None:
+    executed = dict(report[collection])
+    missing = dict(report[f"missing_{collection}"])
+    overlap = set(executed) & set(missing)
+    if overlap:
+        raise AssertionError(f"{collection}_scope_overlap:{sorted(overlap)}")
+    for identifier, status in executed.items():
+        if status != "pass":
+            raise AssertionError(f"{collection}:{identifier}:{status}")
+    if report.get("release_ready") is True and missing:
+        raise AssertionError(f"release-ready report has missing {collection}")
+
+
 @unittest.skipUnless(
     os.environ.get("UDFJIT_FORMAL_ACCEPTANCE") == "1",
     "requires a completed blue-98 U13 formal acceptance run",
@@ -38,20 +75,11 @@ class LiveFormalAcceptanceTests(unittest.TestCase):
         )
 
     def test_all_ut_it_and_st_gates_pass(self) -> None:
-        self.assertEqual(
-            self.report["verdict"],
-            "pass",
-            self.report.get("reason_codes"),
-        )
-        for gate, status in self.report["gates"].items():
-            with self.subTest(gate=gate):
-                self.assertEqual(status, "pass")
+        assert_accepted_gate_scope(self.report)
 
     def test_every_requirement_and_acceptance_example_passes(self) -> None:
         for collection in ("requirements", "acceptance_examples"):
-            for identifier, status in self.report[collection].items():
-                with self.subTest(collection=collection, identifier=identifier):
-                    self.assertEqual(status, "pass")
+            assert_accepted_mapping_scope(self.report, collection)
 
 
 if __name__ == "__main__":

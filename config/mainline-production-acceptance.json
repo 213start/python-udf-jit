@@ -69,12 +69,13 @@
         "test_named_profiles_and_explicit_json_paths_resolve",
         "test_receipt_rejects_exact_count_drift_from_profile",
         "test_validator_rejects_environment_phase_and_performance_tampering",
+        "test_formal_self_check_accepts_milestone_scope_without_claiming_release",
         "test_capture_is_deferred_until_operation_schema_is_available",
         "test_where_select_and_with_columns_finalize_each_candidate_once",
         "test_deserialization_rejects_missing_or_unsupported_versions",
         "test_installs_packaged_pth_at_explicit_purelib_root_idempotently"
       ],
-      "expected_test_count": 177,
+      "expected_test_count": 178,
       "allow_skips": false
     },
     "integration": {

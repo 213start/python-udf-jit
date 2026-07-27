@@ -16,9 +16,42 @@ from tests.system.run_blue98_acceptance import (
     _resolve_acceptance_profile,
     _test_receipt,
 )
+from tests.system.test_formal_acceptance import (
+    assert_accepted_gate_scope,
+    assert_accepted_mapping_scope,
+)
 
 
 class Blue98AcceptanceProfileTests(unittest.TestCase):
+    def test_formal_self_check_accepts_milestone_scope_without_claiming_release(
+        self,
+    ) -> None:
+        report = {
+            "verdict": None,
+            "executed_gate_verdict": "pass",
+            "release_ready": False,
+            "unit_completion_status": "incomplete",
+            "reason_codes": [],
+            "gates": {"rfc001.unit_contract": "pass"},
+            "missing_gates": ["rfc002.unit_contract"],
+            "requirements": {"R1": "pass"},
+            "missing_requirements": {"R2": ["rfc002.unit_contract"]},
+            "acceptance_examples": {"AE1": "pass"},
+            "missing_acceptance_examples": {
+                "AE2": ["rfc002.unit_contract"]
+            },
+        }
+
+        assert_accepted_gate_scope(report)
+        assert_accepted_mapping_scope(report, "requirements")
+        assert_accepted_mapping_scope(report, "acceptance_examples")
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "milestone report cannot claim",
+        ):
+            assert_accepted_gate_scope({**report, "verdict": "pass"})
+
     def test_milestone_run_does_not_claim_or_require_release_readiness(
         self,
     ) -> None:
