@@ -11,6 +11,19 @@ from typing import Any, Mapping
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_TARGETED_UDF_TERMINAL = re.compile(
+    r"(?:\A|\n)7 passed, 22 subtests passed in "
+    r"[0-9]+(?:\.[0-9]+)?s"
+    r"(?:\n\[exit status=0\])?\n?\Z"
+)
+_TARGETED_UDF_FAILURE = re.compile(
+    r"(?m)^(?:FAILED|ERROR)(?:\s|:|$)"
+    r"|^Traceback \(most recent call last\):"
+    r"|^[1-9][0-9]* (?:failed|errors?)(?:\s|,|$)"
+)
+_TARGETED_UDF_NONZERO_EXIT = re.compile(
+    r"(?m)^\[exit status=(?!0\]$)[^\]\n]+\]$"
+)
 EXPECTED_RUNTIME_TOTALS = (1180, 67, 130)
 EXPECTED_UDF_RUNTIME_CASES = (
     "UdfDataIntrinsicTest.RuntimeHelpersCoverTypedNullableLifecycle",
@@ -21,7 +34,7 @@ EXPECTED_UDF_RUNTIME_CASES = (
     "UdfDataIntrinsicHIRTest.ParserPrinterAndOutputTypesPreserveTypedReadsAndWrites",
     "UdfDescriptorFuzzTest.DeterministicLifecycleAndTypeMatrix",
     "UdfContinuationTest.NativeDeoptScopeRejectsCrossCodeRecovery",
-    "UdfContinuationTest.RuntimePayloadPreservesTypedValuesAndAliases",
+    "UdfContinuationTest.GuardDeoptReturnsVersionedSideExitPayload",
     "UdfContinuationTest.RuntimePayloadRejectsUnsafeResumeMatrix",
 )
 
@@ -203,11 +216,11 @@ def _python_tests(
     if "All 26 tests OK." not in official_log:
         raise CinderXEvidenceError("official_skip_libtest_log_invalid")
 
-    targeted = re.search(
-        r"(^|\n)7 passed, 22 subtests passed in [0-9.]+s(?:\n|$)",
-        targeted_log,
-    )
-    if targeted is None:
+    if (
+        _TARGETED_UDF_TERMINAL.search(targeted_log) is None
+        or _TARGETED_UDF_FAILURE.search(targeted_log) is not None
+        or _TARGETED_UDF_NONZERO_EXIT.search(targeted_log) is not None
+    ):
         raise CinderXEvidenceError("targeted_udf_python_tests_invalid")
 
     return {

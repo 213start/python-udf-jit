@@ -18,6 +18,40 @@ def _continuation_suffix(state):
     return state.values["value"] + 1
 
 
+def _mapping_is_writable_and_executable(line: str) -> bool:
+    fields = line.split(maxsplit=2)
+    if len(fields) < 2:
+        return False
+    permissions = fields[1]
+    return (
+        len(permissions) >= 3
+        and permissions[1] == "w"
+        and permissions[2] == "x"
+    )
+
+
+class ProcMapsPermissionsTests(unittest.TestCase):
+    def test_detects_every_writable_executable_permission_form(self) -> None:
+        cases = {
+            "1000-2000 rwxp 00000000 00:00 0": True,
+            "1000-2000 rwxs 00000000 00:00 0": True,
+            "1000-2000 -wxp 00000000 00:00 0": True,
+            "1000-2000 -wxs 00000000 00:00 0": True,
+            "1000-2000 r-xp 00000000 00:00 0": False,
+            "1000-2000 rw-p 00000000 00:00 0": False,
+            "1000-2000 ---p 00000000 00:00 0": False,
+            "": False,
+            "malformed": False,
+            "1000-2000 wx": False,
+        }
+        for line, expected in cases.items():
+            with self.subTest(line=line):
+                self.assertIs(
+                    _mapping_is_writable_and_executable(line),
+                    expected,
+                )
+
+
 class _WorkerScalarSlotProbe:
     def run(self, cluster_epoch: str) -> dict[str, object]:
         from dataclasses import astuple
@@ -26,7 +60,10 @@ class _WorkerScalarSlotProbe:
 
         import cinderx.jit
         import ray
-        from cinderjit import _udf_build_continuation_payload
+        from cinderjit import (
+            _udf_build_continuation_payload,
+            _udf_register_continuation_code,
+        )
 
         from python_udf_jit.compiler.capture import FallbackIdentity
         from python_udf_jit.compiler.identity import capture_identities
@@ -248,8 +285,8 @@ class _WorkerScalarSlotProbe:
                 label="int64_branch",
             )
             branch_results = [
-                branch.execute(-9),
-                branch.execute(7),
+                branch.execute(-9, boundary=CommitBoundary()),
+                branch.execute(7, boundary=CommitBoundary()),
             ]
             if branch_results != [9, 7]:
                 raise AssertionError(
@@ -300,12 +337,13 @@ class _WorkerScalarSlotProbe:
             ),
             proof_complete=True,
         )
-        effects = [("compiled_prefix", 7)]
+        effects = []
 
         def compiled_continuation(_input, _output):
+            effects.append(("compiled_prefix", 7))
             return _udf_build_continuation_payload(
                 CONTINUATION_ABI_VERSION,
-                "cinderx_deopt",
+                "python_region",
                 resume_id,
                 identity.namespace_sha256,
                 identity.code_sha256,
@@ -314,12 +352,13 @@ class _WorkerScalarSlotProbe:
                 (effects, 7),
                 ("python_object", "int64"),
                 (False, False),
-                (True, False),
                 (True, True),
                 None,
                 True,
             )
 
+        if not _udf_register_continuation_code(compiled_continuation):
+            raise AssertionError("continuation probe registration rejected")
         if not cinderx.jit.force_compile(compiled_continuation):
             raise AssertionError("continuation probe did not JIT compile")
         if not cinderx.jit.is_jit_compiled(compiled_continuation):
@@ -364,8 +403,7 @@ class _WorkerScalarSlotProbe:
             rwx_mapping_count = sum(
                 1
                 for line in mappings
-                if len(fields := line.split(maxsplit=2)) >= 2
-                and fields[1].startswith("rwx")
+                if _mapping_is_writable_and_executable(line)
             )
         if rwx_mapping_count:
             raise AssertionError(

@@ -65,14 +65,25 @@
             "test_manifest_binds_installed_cinderx_wheel_and_base_image",
             "test_only_numeric_loopback_hosts_are_accepted",
             "test_outer_guard_miss_falls_back_once_without_compile_or_semantic_execute",
+            "test_real_graph_break_preserves_compiled_prefix_for_suffix",
+            "test_graph_break_rejects_suffix_that_uses_opaque_result",
             "test_rejects_non_internal_data_plane",
             "test_request_disables_proxies_and_installs_redirect_rejection",
             "test_restart_baseline_is_captured_after_live_suite",
             "test_root_environment_discards_inherited_execution_controls",
             "test_runtime_binding_is_exact_and_reversible",
-            "test_successful_compose_down_still_verifies_no_resources_remain"
+            "test_successful_compose_down_still_verifies_no_resources_remain",
+            "test_targeted_summary_accepts_optional_zero_exit_status",
+            "test_targeted_summary_rejects_trailing_failure_evidence",
+            "test_real_scalar_graph_break_finalizes_three_region_artifact",
+            "test_unproven_graph_break_shape_falls_back_before_artifact_commit",
+            "test_committed_pre_semantics_error_propagates_without_replay",
+            "test_verified_python_region_uses_production_continuation_once",
+            "test_unproven_python_region_falls_back_before_provider_entry",
+            "test_factory_registers_only_continuation_code_before_force_compile",
+            "test_resume_id_admission_matches_native_v1_digest_contract"
           ],
-          "expected_test_count": 179,
+          "expected_test_count": 191,
           "allow_skips": false
         },
         "integration": {
@@ -101,9 +112,10 @@
             "test_partitioned_float_projection_runs_only_on_worker_nodes",
             "test_head_owned_object_ref_reaches_both_workers",
             "test_both_workers_execute_full_cinderx_scalar_matrix",
+            "test_detects_every_writable_executable_permission_form",
             "test_same_production_plan_compiles_and_executes_on_each_worker"
           ],
-          "expected_test_count": 36,
+          "expected_test_count": 37,
           "allow_skips": false
         },
         "live": {
@@ -121,9 +133,10 @@
             "test_zero_row_counts_are_derived_from_observed_runtime_events",
             "test_rfc003_system_contract",
             "test_rfc004_system_contract",
-            "test_rfc005_system_contract"
+            "test_rfc005_system_contract",
+            "test_rfc006_system_contract"
           ],
-          "expected_test_count": 17,
+          "expected_test_count": 18,
           "allow_skips": false
         }
       }

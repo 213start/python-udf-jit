@@ -46,6 +46,13 @@ def _libtest(count: int) -> dict[str, object]:
     }
 
 
+def _targeted_log(*, exit_status: int | None = None) -> str:
+    log = "....... [100%]\n7 passed, 22 subtests passed in 0.06s\n"
+    if exit_status is not None:
+        log += f"[exit status={exit_status}]\n"
+    return log
+
+
 class CinderXEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -71,10 +78,7 @@ class CinderXEvidenceTests(unittest.TestCase):
             "adaptive_log": "423 tests OK.\n",
             "official_summary": _libtest(26),
             "official_log": "All 26 tests OK.\n",
-            "targeted_log": (
-                "....... [100%]\n"
-                "7 passed, 22 subtests passed in 0.06s\n"
-            ),
+            "targeted_log": _targeted_log(exit_status=0),
         }
         self.paths = {
             name: self.root / f"{name}.{'json' if isinstance(value, dict) else 'log'}"
@@ -182,6 +186,51 @@ class CinderXEvidenceTests(unittest.TestCase):
             CinderXEvidenceError, "adaptive_libtest_contract_invalid"
         ):
             self._build()
+
+    def test_targeted_summary_accepts_optional_zero_exit_status(self) -> None:
+        for exit_status in (None, 0):
+            with self.subTest(exit_status=exit_status):
+                self.documents["targeted_log"] = (
+                    "0 failed preflight checks\n"
+                    + _targeted_log(exit_status=exit_status)
+                )
+                self._write_all()
+
+                self.assertEqual(
+                    self._build()["python_tests"]["udf_targeted"],
+                    {
+                        "passed": 7,
+                        "subtests_passed": 22,
+                        "failed": 0,
+                    },
+                )
+
+    def test_targeted_summary_rejects_trailing_failure_evidence(self) -> None:
+        polluted_logs = {
+            "failed": _targeted_log() + "FAILED tests/test_udf.py::test_live\n",
+            "error": _targeted_log() + "ERROR tests/test_udf.py::test_live\n",
+            "traceback": (
+                _targeted_log()
+                + "Traceback (most recent call last):\n"
+                + "RuntimeError: late failure\n"
+            ),
+            "failed_summary": _targeted_log() + "1 failed in 0.07s\n",
+            "nonzero_exit": _targeted_log(exit_status=1),
+            "after_zero_exit": (
+                _targeted_log(exit_status=0)
+                + "FAILED tests/test_udf.py::test_live\n"
+            ),
+        }
+        for pollution, log in polluted_logs.items():
+            with self.subTest(pollution=pollution):
+                self.documents["targeted_log"] = log
+                self._write_all()
+
+                with self.assertRaisesRegex(
+                    CinderXEvidenceError,
+                    "targeted_udf_python_tests_invalid",
+                ):
+                    self._build()
 
     def test_every_raw_artifact_must_be_mode_0600(self) -> None:
         os.chmod(self.paths["targeted_log"], 0o644)
