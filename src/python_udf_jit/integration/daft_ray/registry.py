@@ -12,6 +12,7 @@ from typing import Any, Callable
 from python_udf_jit.compiler.capture import CaptureIR, CaptureRequest, try_capture
 from python_udf_jit.compiler.capture_cache import CaptureCache
 from python_udf_jit.compiler.core_ir import lower_capture
+from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.compiler.region import form_verified_region
 from python_udf_jit.diagnostics import events
 from python_udf_jit.diagnostics.events import DecisionEvent
@@ -55,6 +56,8 @@ class CandidateRecord:
     pyexpr_hashes: set[int] = field(default_factory=set)
     finalized: bool = False
     capture_ir: CaptureIR | None = None
+    semantic_core_hash: str | None = None
+    semantic_region_hash: str | None = None
 
 
 def _candidate_id(
@@ -390,12 +393,32 @@ class CandidateRegistry:
                         record.capture_ir = None
                 if record.capture_ir is not None:
                     try:
-                        module = lower_capture(record.capture_ir)
+                        semantic = compile_semantic(record.capture_ir)
+                        if (
+                            not semantic.accepted
+                            or semantic.core_module is None
+                            or semantic.region_graph is None
+                            or len(semantic.region_graph.regions) != 1
+                            or semantic.region_graph.regions[
+                                0
+                            ].provider_candidates
+                            != ("scalar_cinderx",)
+                        ):
+                            raise ValueError(
+                                "semantic_pipeline_not_scalar_eligible"
+                            )
+                        record.semantic_core_hash = (
+                            semantic.core_module.semantic_hash
+                        )
+                        record.semantic_region_hash = (
+                            semantic.region_graph.semantic_hash
+                        )
+                        legacy_module = lower_capture(record.capture_ir)
                         artifact_bytes = encode_artifact(
                             build_artifact(
-                                module,
-                                form_verified_region(module),
-                                module.fallback_identity,
+                                legacy_module,
+                                form_verified_region(legacy_module),
+                                legacy_module.fallback_identity,
                             )
                         )
                     except Exception:
