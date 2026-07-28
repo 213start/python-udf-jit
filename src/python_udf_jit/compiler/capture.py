@@ -176,11 +176,7 @@ def _validate_request_before_callable(request: CaptureRequest) -> None:
         _reject(CaptureRejectCode.PYTHON_VERSION_MISMATCH, ".".join(runtime))
 
 
-def capture(request: CaptureRequest) -> CaptureIR:
-    """Statically decode one float64 straight-line function without invoking it."""
-
-    _validate_request_before_callable(request)
-    function = _resolve_user_function(request.callable_object)
+def _validate_scalar_function(function: types.FunctionType) -> None:
     code = function.__code__
     forbidden_flags = (
         inspect.CO_VARARGS
@@ -197,6 +193,13 @@ def capture(request: CaptureRequest) -> CaptureIR:
     if code.co_freevars or code.co_cellvars:
         _reject(CaptureRejectCode.CLOSURE_DEPENDENCY)
 
+
+def capture_program_request(request: CaptureRequest) -> CapturedProgram:
+    """Analyze a scalar candidate even when closed-region lowering rejects it."""
+
+    _validate_request_before_callable(request)
+    function = _resolve_user_function(request.callable_object)
+    _validate_scalar_function(function)
     try:
         identities = capture_identities(
             function,
@@ -244,6 +247,30 @@ def capture(request: CaptureRequest) -> CaptureIR:
         _reject(code_map.get(error.code, CaptureRejectCode.CONTROL_FLOW), error.detail)
     except IdentityError as error:
         _reject(CaptureRejectCode.UNSUPPORTED_DEPENDENCY, error.code.value)
+    return program
+
+
+def fallback_identity_for_program(
+    callable_object: Any,
+    program: CapturedProgram,
+) -> FallbackIdentity:
+    function = _resolve_user_function(callable_object)
+    if capture_identities(function).code.sha256 != program.identities.code.sha256:
+        _reject(CaptureRejectCode.INVALID_BYTECODE, "program_identity_mismatch")
+    return FallbackIdentity(
+        function.__module__,
+        function.__qualname__,
+        program.identities.code.sha256,
+    )
+
+
+def capture(request: CaptureRequest) -> CaptureIR:
+    """Statically decode one float64 straight-line function without invoking it."""
+
+    program = capture_program_request(request)
+    function = _resolve_user_function(request.callable_object)
+    code = function.__code__
+    frontend = program.frontend
 
     instructions = frontend.decoded_bytecode.instructions
     if any(instruction.jump_target is not None for instruction in instructions):

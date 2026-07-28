@@ -14,6 +14,7 @@ from python_udf_jit.compiler.core_ir import (
     Nullability,
     SemanticCoreModule,
     SemanticOperation,
+    SemanticPythonRegion,
 )
 from python_udf_jit.compiler.region import (
     SemanticRegionGraph,
@@ -39,6 +40,10 @@ from python_udf_jit.runtime.layout import (
     INT32_SCALAR_TYPE,
     INT64_SCALAR_TYPE,
 )
+from python_udf_jit.runtime.continuation import (
+    ContinuationContract,
+    build_continuation_payload,
+)
 
 
 GuardFunction = Callable[[object], object]
@@ -46,6 +51,7 @@ NullFunction = Callable[[object], bool]
 LoadFunction = Callable[[object], object]
 StoreFunction = Callable[[object, object], object]
 StoreNullFunction = Callable[[object], None]
+ContinuationPayloadFunction = Callable[..., object]
 ArgumentKind = Literal["capability_pair", "backend_pair"]
 
 
@@ -58,6 +64,9 @@ class ScalarLoweringHooks:
     load: LoadFunction
     store: StoreFunction
     store_null: StoreNullFunction
+    build_continuation_payload: ContinuationPayloadFunction = (
+        build_continuation_payload
+    )
 
     def __post_init__(self) -> None:
         if not all(
@@ -68,6 +77,7 @@ class ScalarLoweringHooks:
                 self.load,
                 self.store,
                 self.store_null,
+                self.build_continuation_payload,
             )
         ):
             raise TypeError("scalar lowering hooks must be callable")
@@ -351,6 +361,7 @@ def _operation_statements(
     operation: SemanticOperation,
     *,
     output_nullable: bool,
+    continuation_contract: ContinuationContract | None,
 ) -> list[ast.stmt]:
     if operation.op == "argument":
         if _attributes(operation).get("index") != "0":
@@ -397,6 +408,90 @@ def _operation_statements(
             ),
             output_nullable=output_nullable,
         )
+    elif operation.op == "python.region":
+        if continuation_contract is None:
+            raise ValueError("Python region continuation proof is missing")
+        if tuple(operation.operands) != continuation_contract.live_names:
+            raise ValueError("Python region continuation live-in mismatch")
+        source_map = continuation_contract.source_map
+        return [
+            ast.Return(
+                value=ast.Call(
+                    func=ast.Name(
+                        id="_udf_build_continuation_payload",
+                        ctx=ast.Load(),
+                    ),
+                    args=[
+                        ast.Constant(
+                            value=continuation_contract.abi_version
+                        ),
+                        ast.Constant(value="python_region"),
+                        ast.Constant(
+                            value=continuation_contract.resume_id
+                        ),
+                        ast.Constant(
+                            value=(
+                                continuation_contract.source_identity
+                                .namespace_sha256
+                            )
+                        ),
+                        ast.Constant(
+                            value=(
+                                continuation_contract.source_identity
+                                .code_sha256
+                            )
+                        ),
+                        ast.Constant(
+                            value=(
+                                continuation_contract.source_identity
+                                .first_line
+                            )
+                        ),
+                        ast.Constant(
+                            value=(
+                                source_map.schema_version,
+                                source_map.bytecode_offset,
+                                source_map.line,
+                                source_map.column,
+                                source_map.end_line,
+                                source_map.end_column,
+                            )
+                        ),
+                        ast.Tuple(
+                            elts=[
+                                ast.Name(
+                                    id=_value_name(name),
+                                    ctx=ast.Load(),
+                                )
+                                for name in continuation_contract.live_names
+                            ],
+                            ctx=ast.Load(),
+                        ),
+                        ast.Constant(
+                            value=tuple(
+                                spec.kind.value
+                                for spec in continuation_contract.live_values
+                            )
+                        ),
+                        ast.Constant(
+                            value=tuple(
+                                spec.nullable
+                                for spec in continuation_contract.live_values
+                            )
+                        ),
+                        ast.Constant(
+                            value=tuple(
+                                True
+                                for _ in continuation_contract.live_values
+                            )
+                        ),
+                        ast.Constant(value=None),
+                        ast.Constant(value=True),
+                    ],
+                    keywords=[],
+                )
+            )
+        ]
     else:
         expression = _semantic_expression(operation)
     return [
@@ -417,6 +512,7 @@ def _verify_semantic_scalar_contract(
     graph: SemanticRegionGraph,
     input_spec: AccessSpec,
     output_spec: AccessSpec,
+    continuation_contract: ContinuationContract | None,
 ) -> None:
     require_access_spec(input_spec)
     require_access_spec(output_spec)
@@ -462,13 +558,20 @@ def _verify_semantic_scalar_contract(
         "jump",
         "return",
     }
-    if any(
-        operation.op not in admitted
-        or operation.effect.value != "pure"
-        or operation.python_region_id is not None
-        for operation in module.operations
-    ):
-        raise ValueError("semantic module is not a closed scalar region")
+    if continuation_contract is None:
+        if any(
+            operation.op not in admitted
+            or operation.effect.value != "pure"
+            or operation.python_region_id is not None
+            for operation in module.operations
+        ):
+            raise ValueError("semantic module is not a closed scalar region")
+    else:
+        _verify_single_python_barrier(
+            module,
+            continuation_contract,
+            input_spec,
+        )
     covered = tuple(
         operation_id
         for region in graph.regions
@@ -482,12 +585,131 @@ def _verify_semantic_scalar_contract(
         raise ValueError("semantic region graph does not cover the module")
 
 
+def require_single_python_barrier(
+    module: SemanticCoreModule,
+) -> SemanticPythonRegion:
+    """Return one straight-line float64 barrier or fail closed."""
+
+    if (
+        len(module.blocks) != 1
+        or len(module.python_regions) != 1
+        or module.input_types != (LogicalType.FLOAT64,)
+        or module.input_nullability != (Nullability.NON_NULL,)
+        or module.output_type is not LogicalType.FLOAT64
+        or module.output_nullability is not Nullability.NON_NULL
+    ):
+        raise ValueError("unsupported Python region shape")
+    region = module.python_regions[0]
+    operation_indexes = {
+        operation.operation_id: index
+        for index, operation in enumerate(module.operations)
+    }
+    python_index = operation_indexes.get(region.operation_id)
+    if python_index is None:
+        raise ValueError("unsupported Python region shape")
+    python_operation = module.operations[python_index]
+    before = module.operations[:python_index]
+    after = module.operations[python_index + 1 :]
+    scalar_ops = {
+        "argument",
+        "constant",
+        "binary.add",
+        "binary.sub",
+        "binary.mul",
+    }
+    arguments = tuple(
+        operation for operation in module.operations
+        if operation.op == "argument"
+    )
+    returns = tuple(
+        operation for operation in module.operations
+        if operation.op == "return"
+    )
+    if (
+        module.blocks[0].operation_ids
+        != tuple(operation.operation_id for operation in module.operations)
+        or len(arguments) != 1
+        or arguments[0] not in before
+        or _attributes(arguments[0]).get("index") != "0"
+        or arguments[0].result_id is None
+        or not before
+        or not after
+        or any(
+            operation.op not in scalar_ops
+            or operation.result_type is not LogicalType.FLOAT64
+            or operation.nullability is not Nullability.NON_NULL
+            or operation.effect.value != "pure"
+            or operation.may_raise
+            for operation in before
+        )
+        or python_operation.op != "python.region"
+        or python_operation.operation_id != region.operation_id
+        or python_operation.python_region_id != region.region_id
+        or python_operation.result_id is None
+        or len(python_operation.operands) != 1
+        or python_operation.result_type is not LogicalType.UNKNOWN
+        or python_operation.nullability is not Nullability.NULLABLE
+        or python_operation.effect.value != "python"
+        or not python_operation.may_raise
+        or region.live_in != python_operation.operands
+        or region.live_out != (python_operation.result_id,)
+        or any(
+            python_operation.result_id in operation.operands
+            for operation in after
+        )
+        or region.handler_blocks
+        or len(returns) != 1
+        or returns[0] not in after
+        or module.return_operation_id != returns[0].operation_id
+        or any(
+            (
+                operation.op not in scalar_ops | {"return"}
+                or operation.result_type is not LogicalType.FLOAT64
+                or operation.nullability is not Nullability.NON_NULL
+                or operation.effect.value != "pure"
+                or operation.may_raise
+            )
+            for operation in after
+        )
+    ):
+        raise ValueError("unsupported Python region shape")
+    return region
+
+
+def _verify_single_python_barrier(
+    module: SemanticCoreModule,
+    contract: ContinuationContract,
+    input_spec: AccessSpec,
+) -> SemanticPythonRegion:
+    """Bind the Worker proof to the admitted scalar graph-break barrier."""
+
+    region = require_single_python_barrier(module)
+    if (
+        not contract.is_proven
+        or contract.resume_id != f"v1:{region.resume_id}"
+        or contract.source_identity.code_sha256 != module.function_id
+        or region.source_end is None
+        or contract.source_map.bytecode_offset != region.source_end
+        or contract.live_names != region.live_in
+        or len(contract.live_values) != 1
+        or contract.live_values[0].kind.value != input_spec.scalar_type
+        or contract.live_values[0].nullable != input_spec.nullable
+        or contract.live_values[0].borrowed
+        or contract.live_values[0].branch_join
+        or contract.preserves_active_exception
+        or contract.alias_groups
+    ):
+        raise ValueError("Python region continuation proof is incomplete")
+    return region
+
+
 def _build_semantic_function_ast(
     module: SemanticCoreModule,
     graph: SemanticRegionGraph,
     *,
     input_nullable: bool,
     output_nullable: bool,
+    continuation_contract: ContinuationContract | None,
 ) -> ast.Module:
     operation_by_id = {
         operation.operation_id: operation
@@ -550,6 +772,7 @@ def _build_semantic_function_ast(
                 _operation_statements(
                     operation_by_id[operation_id],
                     output_nullable=output_nullable,
+                    continuation_contract=continuation_contract,
                 )
             )
         branch = ast.If(
@@ -653,6 +876,9 @@ def _materialize_compiled(
         "_udf_data_load": hooks.load,
         "_udf_data_store": hooks.store,
         "_udf_data_store_null": hooks.store_null,
+        "_udf_build_continuation_payload": (
+            hooks.build_continuation_payload
+        ),
     }
     exec(module_code, namespace)
     function = namespace["_verified_scalar_region"]
@@ -729,6 +955,7 @@ def compile_semantic_scalar_region(
     hooks: ScalarLoweringHooks | None = None,
     execution_mode: str = "python-interpreter",
     argument_kind: ArgumentKind | None = None,
+    continuation_contract: ContinuationContract | None = None,
 ) -> CompiledScalarFunction:
     """Materialize process-local code from the formal scalar region graph."""
 
@@ -739,6 +966,7 @@ def compile_semantic_scalar_region(
         graph,
         input_spec,
         output_spec,
+        continuation_contract,
     )
     resolved, registry_id, resolved_kind = _resolve_hooks(
         registry=registry,
@@ -751,6 +979,7 @@ def compile_semantic_scalar_region(
             graph,
             input_nullable=input_spec.nullable,
             output_nullable=output_spec.nullable,
+            continuation_contract=continuation_contract,
         ),
         semantic_hash=module.semantic_hash,
         execution_mode=execution_mode,

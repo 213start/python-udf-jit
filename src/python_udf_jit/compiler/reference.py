@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from python_udf_jit.compiler.continuation_abi import is_resume_id
 from python_udf_jit.compiler.core_ir import (
     LogicalType,
     SemanticBlock,
@@ -55,7 +56,6 @@ class _SemanticIndex:
 
 @dataclass(frozen=True)
 class _ResumePlan:
-    region: SemanticPythonRegion
     block_id: str
     first_operation_index: int
     live_names: tuple[str, ...]
@@ -234,9 +234,9 @@ def _resume_region(
 ) -> SemanticPythonRegion:
     if not isinstance(resume_id, str):
         raise TypeError("reference continuation resume id must be a string")
-    prefix, separator, semantic_resume_id = resume_id.partition(":")
-    if separator != ":" or prefix != "v1" or not semantic_resume_id:
+    if not is_resume_id(resume_id):
         raise ValueError("reference continuation ABI mismatch")
+    semantic_resume_id = resume_id[3:]
     matches = tuple(
         region
         for region in index.python_regions.values()
@@ -295,10 +295,7 @@ def _resume_plan(
             ):
                 live_names.append(operand)
                 seen_live_names.add(operand)
-    if not set(region.live_out) <= set(live_names):
-        raise ValueError("reference continuation live-out is incomplete")
     return _ResumePlan(
-        region,
         block.block_id,
         start_index,
         tuple(live_names),

@@ -7,6 +7,7 @@ from python_udf_jit.compiler.abstract_interpreter import (
     AbstractCapture,
     CapturedProgram,
 )
+from python_udf_jit.compiler.bytecode_decoder import MAX_INSTRUCTIONS
 from python_udf_jit.compiler.call_models import CallKind, Effect
 from python_udf_jit.compiler.capture_ir import verify_capture_frontend
 from python_udf_jit.compiler.identity import verify_capture_identities
@@ -326,4 +327,49 @@ def verify_abstract_capture(
 def verify_captured_program(program: CapturedProgram) -> None:
     verify_capture_frontend(program.frontend)
     verify_capture_identities(program.identities)
+    constant_instructions = tuple(
+        instruction
+        for instruction in program.frontend.decoded_bytecode.instructions
+        if instruction.operation == "constant.load"
+    )
+    constant_indexes = {
+        instruction.argument
+        for instruction in constant_instructions
+        if instruction.argument is not None
+    }
+    expected_constant_count = (
+        max(constant_indexes) + 1
+        if constant_indexes
+        else 0
+    )
+    if (
+        not isinstance(program.scalar_constants, tuple)
+        or len(program.scalar_constants) > MAX_INSTRUCTIONS
+        or len(program.scalar_constants) != expected_constant_count
+    ):
+        raise ValueError("invalid captured scalar constants")
+    kind_by_index = {
+        instruction.argument: instruction.constant_kind
+        for instruction in constant_instructions
+        if instruction.argument is not None
+    }
+    for index, value in enumerate(program.scalar_constants):
+        if index not in constant_indexes:
+            if value is not None:
+                raise ValueError("unused captured scalar constant")
+            continue
+        if kind_by_index[index] != "float":
+            if value is not None:
+                raise ValueError("non-float captured scalar constant")
+            continue
+        if value is None:
+            raise ValueError("missing captured scalar constant")
+        if not isinstance(value, str):
+            raise ValueError("invalid captured scalar constant")
+        try:
+            decoded = float.fromhex(value)
+        except ValueError as error:
+            raise ValueError("invalid captured scalar constant") from error
+        if decoded.hex() != value:
+            raise ValueError("noncanonical captured scalar constant")
     verify_abstract_capture(program.analysis, program)

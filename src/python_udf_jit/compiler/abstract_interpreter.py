@@ -285,12 +285,14 @@ class CapturedProgram:
     frontend: CaptureFrontend
     analysis: AbstractCapture
     identities: CaptureIdentities
+    scalar_constants: tuple[str | None, ...] = ()
 
     def to_document(self) -> dict[str, Any]:
         return {
             "analysis": self.analysis.to_document(),
             "frontend": self.frontend.to_document(),
             "identities": self.identities.to_document(),
+            "scalar_constants": list(self.scalar_constants),
         }
 
     def canonical_bytes(self) -> bytes:
@@ -303,13 +305,28 @@ class CapturedProgram:
 
     @classmethod
     def from_document(cls, document: object) -> "CapturedProgram":
-        expected = {"analysis", "frontend", "identities"}
+        expected = {
+            "analysis",
+            "frontend",
+            "identities",
+            "scalar_constants",
+        }
         if not isinstance(document, dict) or set(document) != expected:
             raise ValueError("invalid captured program fields")
+        scalar_constants = document["scalar_constants"]
+        if (
+            not isinstance(scalar_constants, list)
+            or any(
+                value is not None and not isinstance(value, str)
+                for value in scalar_constants
+            )
+        ):
+            raise ValueError("invalid captured scalar constants")
         result = cls(
             CaptureFrontend.from_document(document["frontend"]),
             AbstractCapture.from_document(document["analysis"]),
             CaptureIdentities.from_document(document["identities"]),
+            tuple(scalar_constants),
         )
         from python_udf_jit.compiler.capture_verifier import (
             verify_captured_program,
@@ -640,7 +657,34 @@ def analyze_function(
         provisional.python_regions,
         provisional.recompute_semantic_hash(),
     )
-    result = CapturedProgram(frontend, analysis, identities)
+    constant_indexes = {
+        instruction.argument
+        for instruction in frontend.decoded_bytecode.instructions
+        if (
+            instruction.operation == "constant.load"
+            and instruction.argument is not None
+        )
+    }
+    constant_count = (
+        max(constant_indexes) + 1
+        if constant_indexes
+        else 0
+    )
+    result = CapturedProgram(
+        frontend,
+        analysis,
+        identities,
+        tuple(
+            (
+                value.hex()
+                if index in constant_indexes and type(value) is float
+                else None
+            )
+            for index, value in enumerate(
+                function.__code__.co_consts[:constant_count]
+            )
+        ),
+    )
     from python_udf_jit.compiler.capture_verifier import (
         verify_captured_program,
     )

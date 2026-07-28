@@ -23,6 +23,7 @@ from python_udf_jit.runtime.continuation import (
     SideExit,
     SideExitOrigin,
     WholeFunctionInterpreter,
+    build_continuation_payload,
     select_interpreter_path,
     side_exit_from_cinderx_payload,
 )
@@ -37,6 +38,7 @@ def _resume_function(state):
 
 
 _SOURCE_IDENTITY = capture_identities(_source_function).source
+_RESUME_ID = "v1:" + "a" * 64
 
 
 class _Marker:
@@ -46,7 +48,7 @@ class _Marker:
 def _contract(**changes) -> ContinuationContract:
     values = {
         "abi_version": CONTINUATION_ABI_VERSION,
-        "resume_id": "v1:after-branch",
+        "resume_id": _RESUME_ID,
         "source_identity": _SOURCE_IDENTITY,
         "source_code": _source_function.__code__,
         "resume_code": _resume_function.__code__,
@@ -118,7 +120,7 @@ class InterpreterContinuationTests(unittest.TestCase):
             SideExit(
                 abi_version=CONTINUATION_ABI_VERSION,
                 reason="guard_miss",
-                resume_id="v1:after-branch",
+                resume_id=_RESUME_ID,
                 source_identity=contract.source_identity,
                 source_map=contract.source_map,
                 state=state,
@@ -305,6 +307,23 @@ class InterpreterContinuationTests(unittest.TestCase):
         ):
             _contract(abi_version=CONTINUATION_ABI_VERSION + 1)
 
+    def test_resume_id_admission_matches_native_v1_digest_contract(
+        self,
+    ) -> None:
+        invalid = (
+            "v1:after-branch",
+            "v1:" + "a" * 63,
+            "v1:" + "A" * 64,
+            "v2:" + "a" * 64,
+        )
+        for resume_id in invalid:
+            with self.subTest(resume_id=resume_id):
+                with self.assertRaisesRegex(
+                    ContinuationError,
+                    "resume_id_invalid",
+                ):
+                    _contract(resume_id=resume_id)
+
     def test_cinderx_payload_is_bound_to_contract_and_commit_boundary(
         self,
     ) -> None:
@@ -344,6 +363,55 @@ class InterpreterContinuationTests(unittest.TestCase):
             side_exit.state.values["alias"],
             side_exit.state.values["value"],
         )
+        self.assertIs(side_exit.origin, SideExitOrigin.CINDERX_DEOPT)
+
+        region_payload = list(payload)
+        region_payload[1] = "python_region"
+        region_boundary = CommitBoundary()
+        region_boundary.commit()
+        region_side_exit = side_exit_from_cinderx_payload(
+            tuple(region_payload),
+            contract=contract,
+            boundary=region_boundary,
+        )
+        self.assertIs(
+            region_side_exit.origin,
+            SideExitOrigin.REGION_SIDE_EXIT,
+        )
+
+        unknown_reason_payload = list(payload)
+        unknown_reason_payload[1] = "internal_failure"
+        unknown_reason_boundary = CommitBoundary()
+        unknown_reason_boundary.commit()
+        with self.assertRaisesRegex(
+            ContinuationError,
+            "reason_invalid",
+        ):
+            side_exit_from_cinderx_payload(
+                tuple(unknown_reason_payload),
+                contract=contract,
+                boundary=unknown_reason_boundary,
+            )
+
+        with self.assertRaisesRegex(
+            ContinuationError,
+            "reason_invalid",
+        ):
+            build_continuation_payload(
+                CONTINUATION_ABI_VERSION,
+                "internal_failure",
+                contract.resume_id,
+                contract.source_identity.namespace_sha256,
+                contract.source_identity.code_sha256,
+                contract.source_identity.first_line,
+                astuple(contract.source_map),
+                (marker, None, marker),
+                ("python_object",) * 3,
+                (False, True, False),
+                (True, True, True),
+                RuntimeError("active"),
+                True,
+            )
 
         failed_materialization = list(payload)
         failed_entries = list(failed_materialization[7])

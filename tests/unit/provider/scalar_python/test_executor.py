@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +14,7 @@ from python_udf_jit.provider.scalar_python.compiler import (
     compile_scalar_region,
 )
 from python_udf_jit.provider.scalar_python.executor import (
+    CinderXScalarProviderFactory,
     PreSemanticsExecutionError,
     ScalarExecutor,
 )
@@ -83,6 +84,35 @@ class _FakeCinderjit(ModuleType):
     def _udf_data_store_null(self, guarded):
         self.calls.append(("store_null", guarded))
         self.values[guarded] = None
+
+    def _udf_build_continuation_payload(self, *args):
+        return args
+
+    def _udf_register_continuation_code(self, target):
+        self.calls.append(("register_continuation", target))
+        return True
+
+
+class _FakeCinderXJit(ModuleType):
+    def __init__(self, calls):
+        super().__init__("fake_cinderx_jit")
+        self.calls = calls
+
+    def is_enabled(self):
+        return True
+
+    def force_compile(self, target):
+        self.calls.append(("force_compile", target))
+        return True
+
+    def is_jit_compiled(self, target):
+        return True
+
+    def get_function_hir_opcode_counts(self, target):
+        return {
+            "LoadUdfDataF64": 1,
+            "StoreUdfDataF64": 1,
+        }
 
 
 class ExecutorTest(unittest.TestCase):
@@ -245,6 +275,62 @@ class ExecutorTest(unittest.TestCase):
             registry.release(output_handle)
             registry.release(input_handle)
             self.assertEqual(fake.calls[-1][0], "release")
+
+    def test_factory_registers_only_continuation_code_before_force_compile(self):
+        runtime = _FakeCinderjit()
+        jit = _FakeCinderXJit(runtime.calls)
+        target = lambda _input, _output: None
+        compiled = SimpleNamespace(jit_function=target)
+        scalar_spec = SimpleNamespace(
+            scalar_type="float64",
+            nullable=False,
+        )
+        artifact = SimpleNamespace(
+            input_access_specs=(scalar_spec,),
+            output_access_spec=scalar_spec,
+            semantic_core_module=object(),
+            semantic_region_graph=object(),
+        )
+        key = SimpleNamespace(
+            process=SimpleNamespace(cluster_epoch="epoch-a"),
+        )
+        factory = CinderXScalarProviderFactory(
+            jit_module_name=jit.__name__,
+            runtime_module_name=runtime.__name__,
+        )
+        modules = {
+            jit.__name__: jit,
+            runtime.__name__: runtime,
+        }
+
+        with (
+            patch.dict(sys.modules, modules),
+            patch(
+                "python_udf_jit.provider.scalar_python.executor."
+                "compile_semantic_scalar_region",
+                return_value=compiled,
+            ),
+        ):
+            plain_variant = factory.compile(artifact, key)
+            plain_variant.close()
+            self.assertNotIn(
+                "register_continuation",
+                [call[0] for call in runtime.calls],
+            )
+
+            runtime.calls.clear()
+            continuation_variant = factory.compile(
+                artifact,
+                key,
+                continuation=SimpleNamespace(contract=object()),
+            )
+            continuation_variant.close()
+
+        event_names = [call[0] for call in runtime.calls]
+        self.assertLess(
+            event_names.index("register_continuation"),
+            event_names.index("force_compile"),
+        )
 
 
 if __name__ == "__main__":

@@ -202,6 +202,7 @@ class ScalarProviderVariant:
     output_handle: CapabilityHandle
     executor: ScalarExecutor
     intrinsic_counts: tuple[tuple[str, int], ...]
+    continuation_enabled: bool = False
 
     @property
     def code_hash(self) -> str:
@@ -268,6 +269,8 @@ class ScalarProviderFactory(Protocol):
         self,
         artifact: PortableUdfArtifact,
         key: VariantKey,
+        *,
+        continuation: InterpreterContinuation[object] | None = None,
     ) -> ScalarProviderVariant: ...
 
 
@@ -287,6 +290,8 @@ class CinderXScalarProviderFactory:
         self,
         artifact: PortableUdfArtifact,
         key: VariantKey,
+        *,
+        continuation: InterpreterContinuation[object] | None = None,
     ) -> ScalarProviderVariant:
         if len(artifact.input_access_specs) != 1:
             raise RuntimeError("scalar_provider_requires_one_input")
@@ -307,6 +312,7 @@ class CinderXScalarProviderFactory:
             getattr(runtime, f"_udf_data_load_{input_suffix}"),
             getattr(runtime, f"_udf_data_store_{output_suffix}"),
             runtime._udf_data_store_null,
+            runtime._udf_build_continuation_payload,
         )
 
         registry = CapabilityRegistry(epoch=key.process.cluster_epoch)
@@ -337,7 +343,20 @@ class CinderXScalarProviderFactory:
                 hooks=hooks,
                 execution_mode="cinderx-jit",
                 argument_kind="backend_pair",
+                continuation_contract=(
+                    None
+                    if continuation is None
+                    else continuation.contract
+                ),
             )
+            if continuation is not None and not bool(
+                runtime._udf_register_continuation_code(
+                    compiled.jit_function
+                )
+            ):
+                raise RuntimeError(
+                    "cinderx_continuation_registration_rejected"
+                )
             if not bool(jit.force_compile(compiled.jit_function)):
                 raise RuntimeError("cinderx_force_compile_rejected")
             if not bool(jit.is_jit_compiled(compiled.jit_function)):
@@ -349,8 +368,9 @@ class CinderXScalarProviderFactory:
             output_hir = _HIR_TYPE_NAME[output_spec.scalar_type]
             required = {
                 f"LoadUdfData{input_hir}": 1,
-                f"StoreUdfData{output_hir}": 1,
             }
+            if continuation is None:
+                required[f"StoreUdfData{output_hir}"] = 1
             if input_spec.nullable:
                 required["IsUdfDataNull"] = 1
             observed = tuple(
@@ -377,6 +397,7 @@ class CinderXScalarProviderFactory:
                 output_handle,
                 ScalarExecutor(registry),
                 observed,
+                continuation is not None,
             )
         except BaseException:
             registry.release(output_handle)

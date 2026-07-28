@@ -26,6 +26,7 @@ from python_udf_jit.integration.daft_ray.control import (
 )
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
 from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
+from python_udf_jit.protocol.codec import decode_artifact
 
 
 MANIFEST_SHA256 = "a" * 64
@@ -40,9 +41,37 @@ def affine(value: float) -> float:
     return value * 2.0 + 3.0
 
 
+def opaque_middle(value: float) -> float:
+    prefix = value * 2.0
+    print(prefix)
+    return prefix + 1.0
+
+
+def unsupported_opaque_middle(value: float) -> float:
+    prefix = value * 2.0
+    print(prefix)
+    return prefix / 1.0
+
+
 @functools.wraps(affine)
 def daft_affine_method(_instance: object, value: float) -> float:
     return affine(value)
+
+
+@functools.wraps(opaque_middle)
+def daft_opaque_middle_method(
+    _instance: object,
+    value: float,
+) -> float:
+    return opaque_middle(value)
+
+
+@functools.wraps(unsupported_opaque_middle)
+def daft_unsupported_opaque_middle_method(
+    _instance: object,
+    value: float,
+) -> float:
+    return unsupported_opaque_middle(value)
 
 
 class FakePyExpr:
@@ -360,6 +389,96 @@ class ControlHookTest(unittest.TestCase):
             self.assertIsNotNone(record.semantic_region_hash)
             self.assertEqual(len(record.semantic_core_hash), 64)
             self.assertEqual(len(record.semantic_region_hash), 64)
+        finally:
+            uninstall_daft_control_hooks(FakeFunc, FakeFloatDataFrame)
+
+    def test_real_scalar_graph_break_finalizes_three_region_artifact(self):
+        registry = CandidateRegistry(MANIFEST_SHA256)
+        target = target_for_objects(
+            SimpleNamespace(__version__="0.7.2"),
+            FakeFunc,
+            FakeFloatDataFrame,
+        )
+        result = install_daft_control_hooks(
+            daft_module=SimpleNamespace(__version__="0.7.2"),
+            func_class=FakeFunc,
+            dataframe_class=FakeFloatDataFrame,
+            expression_class=FakeExpression,
+            mode="auto",
+            registry=registry,
+            target=target,
+        )
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        try:
+            expression = FakeFunc(
+                daft_opaque_middle_method
+            )(FakeExpression())
+            FakeFloatDataFrame().with_column("result", expression)
+            wrapper = expression.worker_callable
+            artifact = decode_artifact(
+                wrapper.carrier.artifact_bytes
+            )
+
+            self.assertTrue(wrapper.carrier.finalized)
+            self.assertEqual(
+                tuple(
+                    region.provider_candidates
+                    for region in artifact.semantic_region_graph.regions
+                ),
+                (
+                    ("scalar_cinderx",),
+                    (),
+                    ("scalar_cinderx",),
+                ),
+            )
+            self.assertEqual(
+                len(artifact.semantic_core_module.python_regions),
+                1,
+            )
+            record = registry.records()[0]
+            self.assertIsNone(record.capture_ir)
+            self.assertIsNotNone(record.semantic_core_hash)
+            self.assertIsNotNone(record.semantic_region_hash)
+        finally:
+            uninstall_daft_control_hooks(FakeFunc, FakeFloatDataFrame)
+
+    def test_unproven_graph_break_shape_falls_back_before_artifact_commit(self):
+        registry = CandidateRegistry(MANIFEST_SHA256)
+        target = target_for_objects(
+            SimpleNamespace(__version__="0.7.2"),
+            FakeFunc,
+            FakeFloatDataFrame,
+        )
+        result = install_daft_control_hooks(
+            daft_module=SimpleNamespace(__version__="0.7.2"),
+            func_class=FakeFunc,
+            dataframe_class=FakeFloatDataFrame,
+            expression_class=FakeExpression,
+            mode="auto",
+            registry=registry,
+            target=target,
+        )
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        try:
+            expression = FakeFunc(
+                daft_unsupported_opaque_middle_method
+            )(FakeExpression())
+            FakeFloatDataFrame().with_column("result", expression)
+            wrapper = expression.worker_callable
+            record = registry.records()[0]
+
+            self.assertFalse(wrapper.carrier.finalized)
+            self.assertEqual(
+                wrapper.carrier.handle.kind,
+                "placeholder",
+            )
+            self.assertEqual(wrapper.carrier.handle.size_bytes, 0)
+            self.assertIsNone(record.capture_ir)
+            self.assertIsNone(record.semantic_core_hash)
+            self.assertIsNone(record.semantic_region_hash)
+            with mock.patch("builtins.print") as opaque_call:
+                self.assertEqual(wrapper(None, 3.0), 6.0)
+            opaque_call.assert_called_once_with(6.0)
         finally:
             uninstall_daft_control_hooks(FakeFunc, FakeFloatDataFrame)
 

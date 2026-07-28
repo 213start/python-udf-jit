@@ -9,7 +9,15 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from python_udf_jit.compiler.capture import CaptureIR, CaptureRequest, try_capture
+from python_udf_jit.compiler.abstract_interpreter import CapturedProgram
+from python_udf_jit.compiler.capture import (
+    CaptureIR,
+    CaptureRejectCode,
+    CaptureRequest,
+    capture_program_request,
+    fallback_identity_for_program,
+    try_capture,
+)
 from python_udf_jit.compiler.capture_cache import CaptureCache
 from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.diagnostics import events
@@ -366,41 +374,91 @@ class CandidateRegistry:
                 if record.finalized:
                     continue
                 artifact_bytes: bytes | None = None
+                semantic_source: CaptureIR | CapturedProgram | None = None
+                fallback_identity = None
                 if "float64" in logical_schema.lower():
                     try:
-                        captured = try_capture(
-                            CaptureRequest(
-                                record.capture_callable,
-                                job_namespace=self._job_namespace,
-                                schema_sha256=hashlib.sha256(
-                                    logical_schema.encode("utf-8")
-                                ).hexdigest(),
-                                adapter_abi_sha256=hashlib.sha256(
-                                    b"daft-0.7.2-scalar-capture"
-                                ).hexdigest(),
-                                policy_sha256=hashlib.sha256(
-                                    b"python-3.14.3-float64-scalar"
-                                ).hexdigest(),
-                                capture_cache=self._capture_cache,
-                            )
+                        request = CaptureRequest(
+                            record.capture_callable,
+                            job_namespace=self._job_namespace,
+                            schema_sha256=hashlib.sha256(
+                                logical_schema.encode("utf-8")
+                            ).hexdigest(),
+                            adapter_abi_sha256=hashlib.sha256(
+                                b"daft-0.7.2-scalar-capture"
+                            ).hexdigest(),
+                            policy_sha256=hashlib.sha256(
+                                b"python-3.14.3-float64-scalar"
+                            ).hexdigest(),
+                            capture_cache=self._capture_cache,
                         )
+                        captured = try_capture(request)
                         record.capture_ir = (
                             captured.capture_ir if captured.supported else None
                         )
+                        if record.capture_ir is not None:
+                            semantic_source = record.capture_ir
+                            fallback_identity = (
+                                record.capture_ir.fallback_identity
+                            )
+                        elif captured.reject_code in {
+                            CaptureRejectCode.OPAQUE_CALL,
+                            CaptureRejectCode.GLOBAL_DEPENDENCY,
+                        }:
+                            program = capture_program_request(request)
+                            semantic_source = program
+                            fallback_identity = (
+                                fallback_identity_for_program(
+                                    record.capture_callable,
+                                    program,
+                                )
+                            )
                     except Exception:
                         record.capture_ir = None
-                if record.capture_ir is not None:
+                        semantic_source = None
+                        fallback_identity = None
+                if semantic_source is not None and fallback_identity is not None:
                     try:
-                        semantic = compile_semantic(record.capture_ir)
+                        semantic = compile_semantic(semantic_source)
+                        closed_scalar = (
+                            semantic.reason_code == "verified_semantic_ir"
+                            and semantic.region_graph is not None
+                            and len(semantic.region_graph.regions) == 1
+                            and semantic.region_graph.regions[
+                                0
+                            ].provider_candidates
+                            == ("scalar_cinderx",)
+                        )
+                        graph_break_scalar = (
+                            semantic.reason_code
+                            == "verified_scalar_graph_break"
+                            and semantic.core_module is not None
+                            and len(
+                                semantic.core_module.python_regions
+                            )
+                            == 1
+                            and semantic.region_graph is not None
+                            and len(semantic.region_graph.regions) == 3
+                            and semantic.region_graph.regions[
+                                0
+                            ].provider_candidates
+                            == ("scalar_cinderx",)
+                            and not semantic.region_graph.regions[
+                                1
+                            ].provider_candidates
+                            and semantic.region_graph.regions[
+                                2
+                            ].provider_candidates
+                            == ("scalar_cinderx",)
+                        )
                         if (
                             not semantic.accepted
                             or semantic.core_module is None
                             or semantic.region_graph is None
-                            or len(semantic.region_graph.regions) != 1
-                            or semantic.region_graph.regions[
-                                0
-                            ].provider_candidates
-                            != ("scalar_cinderx",)
+                            or not (
+                                closed_scalar
+                                or graph_break_scalar
+                            )
                         ):
                             raise ValueError(
                                 "semantic_pipeline_not_scalar_eligible"
@@ -415,7 +473,7 @@ class CandidateRegistry:
                             build_artifact(
                                 semantic.core_module,
                                 semantic.region_graph,
-                                record.capture_ir.fallback_identity,
+                                fallback_identity,
                             )
                         )
                     except Exception:

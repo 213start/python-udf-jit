@@ -56,6 +56,7 @@ class ReferenceContinuationTest(unittest.TestCase):
 
         for candidate, reason in (
             ("v2:" + module.python_regions[0].resume_id, "ABI mismatch"),
+            ("v1:" + "A" * 64, "ABI mismatch"),
             ("v1:" + "0" * 64, "resume id mismatch"),
         ):
             with self.subTest(candidate=candidate):

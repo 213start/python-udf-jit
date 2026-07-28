@@ -4,9 +4,11 @@ import math
 import struct
 import unittest
 
+from python_udf_jit.compiler.abstract_interpreter import analyze_function
 from python_udf_jit.compiler.capture import CaptureRequest, capture
 from python_udf_jit.compiler.core_ir import (
     LogicalType,
+    Nullability,
     SemanticCoreModule,
     SemanticLiteral,
     CoreUdfModule,
@@ -14,12 +16,28 @@ from python_udf_jit.compiler.core_ir import (
     reference_execute,
 )
 from python_udf_jit.compiler.pipeline import compile_semantic
-from python_udf_jit.compiler.reference import reference_execute_semantic
+from python_udf_jit.compiler.reference import (
+    reference_execute_semantic,
+    reference_resume_live_names,
+    reference_resume_semantic,
+)
 from tests.semantic_cases import multitype_semantic_module
 
 
 def affine(x):
     return x * 2.0 + 3.0
+
+
+def opaque_middle(value):
+    prefix = value * 2.0
+    print(prefix)
+    return prefix + 1.0
+
+
+def opaque_result_used(value):
+    prefix = value * 2.0
+    printed = print(prefix)
+    return printed + 1.0
 
 
 def float_bits(value: float) -> bytes:
@@ -132,6 +150,96 @@ class CoreIrTest(unittest.TestCase):
         self.assertEqual(
             reference_execute_semantic(result.core_module, (4.0,)),
             11.0,
+        )
+
+    def test_real_graph_break_preserves_compiled_prefix_for_suffix(self):
+        result = compile_semantic(analyze_function(opaque_middle))
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            result.reason_code,
+            "verified_scalar_graph_break",
+        )
+        self.assertIsNotNone(result.core_module)
+        self.assertIsNotNone(result.region_graph)
+        module = result.core_module
+        graph = result.region_graph
+        assert module is not None
+        assert graph is not None
+        python_operation = next(
+            operation
+            for operation in module.operations
+            if operation.op == "python.region"
+        )
+        suffix_add = next(
+            operation
+            for operation in module.operations[
+                module.operations.index(python_operation) + 1 :
+            ]
+            if operation.op == "binary.add"
+        )
+        prefix_value = python_operation.operands[0]
+
+        self.assertEqual(
+            tuple(operation.op for operation in module.operations),
+            (
+                "argument",
+                "constant",
+                "binary.mul",
+                "python.region",
+                "constant",
+                "binary.add",
+                "return",
+            ),
+        )
+        self.assertEqual(python_operation.result_type, LogicalType.UNKNOWN)
+        self.assertEqual(
+            python_operation.nullability,
+            Nullability.NULLABLE,
+        )
+        self.assertIn(prefix_value, suffix_add.operands)
+        self.assertNotIn(
+            python_operation.result_id,
+            suffix_add.operands,
+        )
+        self.assertEqual(
+            tuple(
+                region.provider_candidates
+                for region in graph.regions
+            ),
+            (
+                ("scalar_cinderx",),
+                (),
+                ("scalar_cinderx",),
+            ),
+        )
+        region = module.python_regions[0]
+        resume_id = f"v1:{region.resume_id}"
+        self.assertEqual(
+            reference_resume_live_names(module, resume_id),
+            (prefix_value,),
+        )
+        self.assertEqual(
+            reference_resume_semantic(
+                module,
+                resume_id,
+                {prefix_value: 6.0},
+            ),
+            7.0,
+        )
+
+    def test_graph_break_rejects_suffix_that_uses_opaque_result(self):
+        result = compile_semantic(analyze_function(opaque_result_used))
+
+        self.assertEqual(
+            result.reason_code,
+            "whole_function_python_region",
+        )
+        self.assertTrue(
+            all(
+                "scalar_cinderx" not in region.provider_candidates
+                for region in result.region_graph.regions
+            )
         )
 
     def test_non_jit_types_never_claim_a_cinderx_region(self):

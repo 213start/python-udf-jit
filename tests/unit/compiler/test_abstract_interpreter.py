@@ -162,6 +162,21 @@ class AbstractInterpreterTest(unittest.TestCase):
         self.assertNotIn(b"controlled_calls", encoded)
         self.assertNotIn(b"strip", encoded)
 
+    def test_scalar_float_constants_are_canonical_and_tamper_checked(self):
+        program = analyze_function(opaque_middle)
+
+        self.assertEqual(
+            program.scalar_constants,
+            (2.0.hex(), 1.0.hex()),
+        )
+        document = program.to_document()
+        document["scalar_constants"][0] = "0x1p+1"
+        with self.assertRaisesRegex(
+            ValueError,
+            "noncanonical captured scalar constant",
+        ):
+            CapturedProgram.from_document(document)
+
 
 if __name__ == "__main__":
     unittest.main()

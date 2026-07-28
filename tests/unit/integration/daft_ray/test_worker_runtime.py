@@ -10,9 +10,17 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from python_udf_jit.compiler.capture import CaptureRequest, capture
+from python_udf_jit.compiler.abstract_interpreter import analyze_function
+from python_udf_jit.compiler.capture import (
+    CaptureRequest,
+    FallbackIdentity,
+    capture,
+)
 from python_udf_jit.compiler.core_ir import rehash_semantic_module
+from python_udf_jit.compiler.identity import capture_identities
 from python_udf_jit.compiler.pipeline import compile_semantic
+from python_udf_jit.compiler.region import form_semantic_region_graph
+from python_udf_jit.compiler.reference import reference_resume_semantic
 from python_udf_jit.diagnostics.report import InMemoryRuntimeReport
 from python_udf_jit.integration.daft_ray.carrier import (
     InlineArtifactHandle,
@@ -45,12 +53,62 @@ from python_udf_jit.provider.scalar_python.executor import (
     ScalarExecutor,
     ScalarProviderVariant,
 )
+from python_udf_jit.runtime.continuation import build_continuation_payload
 from python_udf_jit.runtime.layout import LocalScalarSlotBackend
 from python_udf_jit.runtime.variant import WorkerProcessKey
 
 
 def affine(value):
     return value * 2.0 + 3.0
+
+
+def opaque_middle(value):
+    prefix = value * 2.0
+    print(prefix)
+    return prefix + 1.0
+
+
+def python_region_artifact(
+    function,
+    *,
+    include_source_proof: bool = True,
+) -> bytes:
+    identities = capture_identities(function)
+    fallback_identity = FallbackIdentity(
+        function.__module__,
+        function.__qualname__,
+        identities.code.sha256,
+    )
+    compiled = compile_semantic(
+        analyze_function(function, identities=identities)
+    )
+    if (
+        compiled.reason_code != "verified_scalar_graph_break"
+        or compiled.core_module is None
+        or compiled.region_graph is None
+    ):
+        raise AssertionError("test function did not form a scalar graph break")
+    module = compiled.core_module
+    graph = compiled.region_graph
+    if not include_source_proof:
+        region = dataclasses.replace(
+            module.python_regions[0],
+            source_end=None,
+        )
+        module = rehash_semantic_module(
+            dataclasses.replace(
+                module,
+                python_regions=(region,),
+            )
+        )
+        graph = form_semantic_region_graph(module)
+    return encode_artifact(
+        build_artifact(
+            module,
+            graph,
+            fallback_identity,
+        )
+    )
 
 
 def encoded_artifact() -> bytes:
@@ -96,8 +154,10 @@ class _LocalProviderFactory:
 
     def __init__(self):
         self.compile_count = 0
+        self.continuation_payload_count = 0
+        self.continuation_payload_values = []
 
-    def compile(self, artifact, key):
+    def compile(self, artifact, key, *, continuation=None):
         self.compile_count += 1
         registry = CapabilityRegistry(epoch=key.process.cluster_epoch)
         input_spec = artifact.input_access_specs[0]
@@ -121,7 +181,19 @@ class _LocalProviderFactory:
             output_spec=output_spec,
             registry=registry,
             execution_mode="python-interpreter-test-double",
+            continuation_contract=(
+                None if continuation is None else continuation.contract
+            ),
         )
+        if continuation is not None:
+            def observed_payload(*arguments):
+                self.continuation_payload_count += 1
+                self.continuation_payload_values.append(arguments[7])
+                return build_continuation_payload(*arguments)
+
+            compiled.jit_function.__globals__[
+                "_udf_build_continuation_payload"
+            ] = observed_payload
         return ScalarProviderVariant(
             key,
             compiled,
@@ -130,6 +202,7 @@ class _LocalProviderFactory:
             output_handle,
             ScalarExecutor(registry),
             (),
+            continuation is not None,
         )
 
 
@@ -165,6 +238,17 @@ class _DescriptorMissVariant(_PostEntryVariant):
 class _DescriptorMissFactory:
     def compile(self, _artifact, _key):
         return _DescriptorMissVariant()
+
+
+class _CommittedPreSemanticsVariant(_PostEntryVariant):
+    def execute(self, _value, *, boundary):
+        boundary.commit()
+        raise PreSemanticsExecutionError("late_descriptor_miss")
+
+
+class _CommittedPreSemanticsFactory:
+    def compile(self, _artifact, _key):
+        return _CommittedPreSemanticsVariant()
 
 
 class WorkerRuntimeTest(unittest.TestCase):
@@ -392,6 +476,93 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertTrue(
             any(
                 event.decision == "post_entry_failure"
+                for event in self.report.snapshot()
+            )
+        )
+
+    def test_committed_pre_semantics_error_propagates_without_replay(self):
+        adapter = self.adapter(_CommittedPreSemanticsFactory())
+
+        with self.assertRaisesRegex(
+            PreSemanticsExecutionError,
+            "late_descriptor_miss",
+        ):
+            adapter.invoke((None, 3.0), {})
+
+        self.assertEqual(self.calls, [])
+        self.assertTrue(
+            any(
+                event.decision == "post_entry_failure"
+                and event.reason_code == "late_descriptor_miss"
+                for event in self.report.snapshot()
+            )
+        )
+
+    def test_verified_python_region_uses_production_continuation_once(self):
+        @functools.wraps(opaque_middle)
+        def daft_method(_self, value):
+            self.calls.append(value)
+            return opaque_middle(value)
+
+        self.original = daft_method
+        self.carrier = ProductionCarrierState.placeholder(
+            "candidate-a", "a" * 64
+        ).finalize(python_region_artifact(opaque_middle))
+        provider = _LocalProviderFactory()
+        adapter = self.adapter(provider)
+
+        with mock.patch("builtins.print") as region_call:
+            with mock.patch(
+                (
+                    "python_udf_jit.integration.daft_ray.worker."
+                    "reference_resume_semantic"
+                ),
+                wraps=reference_resume_semantic,
+            ) as suffix_call:
+                result = adapter.invoke((None, 3.0), {})
+
+        self.assertEqual(result, 7.0)
+        region_call.assert_called_once_with(6.0)
+        suffix_call.assert_called_once()
+        self.assertEqual(provider.compile_count, 1)
+        self.assertEqual(provider.continuation_payload_count, 1)
+        self.assertEqual(provider.continuation_payload_values, [(6.0,)])
+        self.assertEqual(self.calls, [])
+        self.assertTrue(
+            any(
+                event.decision == "semantic_execute"
+                for event in self.report.snapshot()
+            )
+        )
+
+    def test_unproven_python_region_falls_back_before_provider_entry(self):
+        @functools.wraps(opaque_middle)
+        def daft_method(_self, value):
+            self.calls.append(value)
+            return opaque_middle(value)
+
+        self.original = daft_method
+        self.carrier = ProductionCarrierState.placeholder(
+            "candidate-a", "a" * 64
+        ).finalize(
+            python_region_artifact(
+                opaque_middle,
+                include_source_proof=False,
+            )
+        )
+        provider = _LocalProviderFactory()
+
+        with mock.patch("builtins.print") as region_call:
+            result = self.adapter(provider).invoke((None, 3.0), {})
+
+        self.assertEqual(result, 7.0)
+        region_call.assert_called_once_with(6.0)
+        self.assertEqual(self.calls, [3.0])
+        self.assertEqual(provider.compile_count, 0)
+        self.assertTrue(
+            any(
+                event.decision == "fallback"
+                and event.reason_code == "continuation_proof_incomplete"
                 for event in self.report.snapshot()
             )
         )

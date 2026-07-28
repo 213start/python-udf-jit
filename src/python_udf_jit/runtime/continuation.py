@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import math
-import re
 import threading
 from dataclasses import dataclass
 from enum import StrEnum
 from types import CodeType, MappingProxyType
 from typing import Any, Callable, Generic, Mapping, TypeVar
 
+from python_udf_jit.compiler.continuation_abi import is_resume_id
 from python_udf_jit.compiler.identity import (
     SourceIdentity,
     code_identity_from_code,
@@ -62,12 +62,6 @@ class CommitPhase(StrEnum):
     COMMITTED = "committed"
     SUFFIX_CLAIMED = "suffix_claimed"
     WHOLE_FUNCTION_CLAIMED = "whole_function_claimed"
-
-
-_RESUME_ID = re.compile(
-    r"^v([1-9][0-9]*):"
-    r"(?:[a-z][a-z0-9_.-]{0,63}|[0-9a-f]{64})$"
-)
 
 
 def _unique_names(values: tuple[str, ...], field: str) -> tuple[str, ...]:
@@ -217,15 +211,8 @@ class ContinuationContract:
     def __post_init__(self) -> None:
         if self.abi_version != CONTINUATION_ABI_VERSION:
             raise ContinuationError("continuation_abi_mismatch")
-        match = (
-            _RESUME_ID.fullmatch(self.resume_id)
-            if isinstance(self.resume_id, str)
-            else None
-        )
-        if match is None:
+        if not is_resume_id(self.resume_id):
             raise ContinuationError("resume_id_invalid")
-        if int(match.group(1)) != self.abi_version:
-            raise ContinuationError("resume_id_version_mismatch")
         if not isinstance(self.source_identity, SourceIdentity):
             raise ContinuationError("source_identity_invalid")
         try:
@@ -426,7 +413,7 @@ class SideExit:
             raise ContinuationError("side_exit_abi_mismatch")
         if not isinstance(self.reason, str) or not self.reason:
             raise ContinuationError("side_exit_reason_invalid")
-        if not isinstance(self.resume_id, str) or not self.resume_id:
+        if not is_resume_id(self.resume_id):
             raise ContinuationError("side_exit_resume_id_invalid")
         if not isinstance(self.source_map, ResumeSourceMap):
             raise ContinuationError("side_exit_source_map_invalid")
@@ -451,6 +438,134 @@ class SideExit:
 
 
 _CINDERX_CONTINUATION_PAYLOAD_FIELD_COUNT = 10
+_CONTINUATION_ORIGIN_BY_REASON = {
+    "python_region": SideExitOrigin.REGION_SIDE_EXIT,
+    "cinderx_deopt": SideExitOrigin.CINDERX_DEOPT,
+}
+
+
+def build_continuation_payload(
+    abi_version: object,
+    reason: object,
+    resume_id: object,
+    namespace_sha256: object,
+    code_sha256: object,
+    first_line: object,
+    source_position: object,
+    values: object,
+    kinds: object,
+    nullable: object,
+    materialized: object,
+    active_exception: object,
+    committed: object,
+) -> tuple[object, ...]:
+    """Python implementation of the production CinderX payload helper ABI."""
+
+    if abi_version != CONTINUATION_ABI_VERSION:
+        raise ContinuationError("cinderx_continuation_abi_mismatch")
+    if type(reason) is not str or reason not in _CONTINUATION_ORIGIN_BY_REASON:
+        raise ContinuationError("cinderx_continuation_reason_invalid")
+    if not is_resume_id(resume_id):
+        raise ContinuationError("cinderx_continuation_resume_id_invalid")
+    try:
+        source_identity = SourceIdentity.from_document(
+            {
+                "format_version": abi_version,
+                "namespace_sha256": namespace_sha256,
+                "code_sha256": code_sha256,
+                "first_line": first_line,
+            }
+        )
+    except ValueError as error:
+        raise ContinuationError(
+            "cinderx_continuation_source_identity_invalid"
+        ) from error
+    if type(source_position) is not tuple or len(source_position) != 6:
+        raise ContinuationError("cinderx_continuation_source_map_invalid")
+    try:
+        source_map = ResumeSourceMap(*source_position)
+    except (ContinuationError, TypeError) as error:
+        raise ContinuationError(
+            "cinderx_continuation_source_map_invalid"
+        ) from error
+    if (
+        type(values) is not tuple
+        or type(kinds) is not tuple
+        or type(nullable) is not tuple
+        or type(materialized) is not tuple
+        or not (
+            len(values)
+            == len(kinds)
+            == len(nullable)
+            == len(materialized)
+        )
+    ):
+        raise ContinuationError(
+            "cinderx_continuation_live_value_shape_mismatch"
+        )
+    live_payloads: list[tuple[object, ...]] = []
+    for index, (value, kind_name, is_nullable, is_materialized) in enumerate(
+        zip(values, kinds, nullable, materialized, strict=True)
+    ):
+        if (
+            type(kind_name) is not str
+            or type(is_nullable) is not bool
+            or type(is_materialized) is not bool
+        ):
+            raise ContinuationError(
+                f"cinderx_continuation_live_value_invalid:{index}"
+            )
+        try:
+            kind = LiveValueKind(kind_name)
+        except ValueError as error:
+            raise ContinuationError(
+                f"cinderx_continuation_live_value_kind_invalid:{index}"
+            ) from error
+        spec = LiveValueSpec(
+            f"value_{index}",
+            kind,
+            nullable=is_nullable,
+        )
+        candidate = MaterializedLiveValue(
+            kind,
+            (
+                MaterializationState.MATERIALIZED
+                if is_materialized
+                else MaterializationState.FAILED
+            ),
+            value,
+        )
+        _verify_materialized_value(spec, candidate)
+        live_payloads.append(
+            (kind.value, is_nullable, is_materialized, value)
+        )
+    if active_exception is not None and not isinstance(
+        active_exception, BaseException
+    ):
+        raise ContinuationError(
+            "cinderx_continuation_active_exception_invalid"
+        )
+    if committed is not True:
+        raise ContinuationError("cinderx_continuation_commit_mismatch")
+    return (
+        abi_version,
+        reason,
+        resume_id,
+        source_identity.namespace_sha256,
+        source_identity.code_sha256,
+        source_identity.first_line,
+        (
+            source_map.schema_version,
+            source_map.bytecode_offset,
+            source_map.line,
+            source_map.column,
+            source_map.end_line,
+            source_map.end_column,
+        ),
+        tuple(live_payloads),
+        active_exception,
+        committed,
+    )
 
 
 def side_exit_from_cinderx_payload(
@@ -489,6 +604,11 @@ def side_exit_from_cinderx_payload(
     ) = payload
     if abi_version != contract.abi_version:
         raise ContinuationError("cinderx_continuation_abi_mismatch")
+    origin = _CONTINUATION_ORIGIN_BY_REASON.get(reason)
+    if origin is None:
+        raise ContinuationError("cinderx_continuation_reason_invalid")
+    if resume_id != contract.resume_id:
+        raise ContinuationError("cinderx_continuation_resume_id_mismatch")
     try:
         source_identity = SourceIdentity.from_document(
             {
@@ -577,7 +697,7 @@ def side_exit_from_cinderx_payload(
         source_map=source_map,
         state=state,
         boundary=boundary,
-        origin=SideExitOrigin.CINDERX_DEOPT,
+        origin=origin,
     )
 
 

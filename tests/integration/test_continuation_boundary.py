@@ -72,6 +72,10 @@ def _materialized(kind, value):
 
 
 _SOURCE_IDENTITY = capture_identities(_whole_function).source
+_JOIN_RESUME_ID = "v1:" + "a" * 64
+_FIRST_RESUME_ID = "v1:" + "b" * 64
+_SECOND_RESUME_ID = "v1:" + "c" * 64
+_FAILING_RESUME_ID = "v1:" + "d" * 64
 
 
 class ContinuationBoundaryIntegrationTests(unittest.TestCase):
@@ -83,7 +87,7 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
                 active = RuntimeError("active")
                 contract = ContinuationContract(
                     abi_version=CONTINUATION_ABI_VERSION,
-                    resume_id="v1:join",
+                    resume_id=_JOIN_RESUME_ID,
                     source_identity=_SOURCE_IDENTITY,
                     source_code=_whole_function.__code__,
                     resume_code=_suffix.__code__,
@@ -136,7 +140,7 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
                     SideExit(
                         abi_version=CONTINUATION_ABI_VERSION,
                         reason="branch_join",
-                        resume_id="v1:join",
+                        resume_id=_JOIN_RESUME_ID,
                         source_identity=contract.source_identity,
                         source_map=contract.source_map,
                         state=state,
@@ -162,7 +166,7 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
         contracts = (
             ContinuationContract(
                 abi_version=CONTINUATION_ABI_VERSION,
-                resume_id="v1:first-break",
+                resume_id=_FIRST_RESUME_ID,
                 source_identity=_SOURCE_IDENTITY,
                 source_code=_whole_function.__code__,
                 resume_code=_first_suffix.__code__,
@@ -178,7 +182,7 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
             ),
             ContinuationContract(
                 abi_version=CONTINUATION_ABI_VERSION,
-                resume_id="v1:second-break",
+                resume_id=_SECOND_RESUME_ID,
                 source_identity=_SOURCE_IDENTITY,
                 source_code=_whole_function.__code__,
                 resume_code=_second_suffix.__code__,
@@ -252,7 +256,7 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
         effects = []
         contract = ContinuationContract(
             abi_version=CONTINUATION_ABI_VERSION,
-            resume_id="v1:failing-suffix",
+            resume_id=_FAILING_RESUME_ID,
             source_identity=_SOURCE_IDENTITY,
             source_code=_whole_function.__code__,
             resume_code=_failing_suffix.__code__,
