@@ -24,7 +24,7 @@ _TARGETED_UDF_FAILURE = re.compile(
 _TARGETED_UDF_NONZERO_EXIT = re.compile(
     r"(?m)^\[exit status=(?!0\]$)[^\]\n]+\]$"
 )
-EXPECTED_RUNTIME_TOTALS = (1180, 67, 130)
+EXPECTED_RUNTIME_TOTALS = (1180, 68, 130)
 EXPECTED_UDF_RUNTIME_CASES = (
     "UdfDataIntrinsicTest.RuntimeHelpersCoverTypedNullableLifecycle",
     "UdfDataIntrinsicTest.RuntimeHelpersRejectCrossProcessCapsule",
@@ -359,7 +359,7 @@ def validate_cinderx_evidence(proof: object) -> str:
 
     runtime_totals = {
         "normal": 1180,
-        "lightweight_frames_deopt": 67,
+        "lightweight_frames_deopt": 68,
         "osr": 130,
     }
     runtime_valid = all(

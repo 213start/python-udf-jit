@@ -299,7 +299,7 @@ def _evidence() -> dict[str, object]:
         },
         "runtime_tests": {
             "normal": {"passed": 1180, "failed": 0},
-            "lightweight_frames_deopt": {"passed": 67, "failed": 0},
+            "lightweight_frames_deopt": {"passed": 68, "failed": 0},
             "osr": {"passed": 130, "failed": 0},
             "udf_cases": list(EXPECTED_UDF_RUNTIME_CASES),
         },

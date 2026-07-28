@@ -28,7 +28,7 @@ def _runtime_log() -> str:
     return (
         f"{cases}\n"
         "100% tests passed, 0 tests failed out of 1180\n"
-        "100% tests passed, 0 tests failed out of 67\n"
+        "100% tests passed, 0 tests failed out of 68\n"
         "100% tests passed, 0 tests failed out of 130\n"
     )
 
