@@ -465,5 +465,106 @@ class RFC005SystemTests(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(
+    os.environ.get("UDFJIT_LIVE_RAY") == "1",
+    "requires the blue-98 fixed three-node final candidate cluster",
+)
+class RFC006SystemTests(unittest.TestCase):
+    def test_rfc006_system_contract(self):
+        import ray
+        from ray.util.scheduling_strategies import (
+            NodeAffinitySchedulingStrategy,
+        )
+
+        from tests.integration.test_ray_cinderx_scalar_slot_smoke import (
+            _WorkerScalarSlotProbe,
+        )
+
+        cluster_epoch = os.environ.get("UDFJIT_CLUSTER_EPOCH", "")
+        self.assertTrue(cluster_epoch)
+        ray.init(address="auto")
+        actors = []
+        try:
+            alive = [node for node in ray.nodes() if node.get("Alive")]
+            head = [
+                node
+                for node in alive
+                if node.get("NodeName") == "ray-head-driver"
+            ]
+            workers = sorted(
+                (
+                    node
+                    for node in alive
+                    if node.get("NodeName")
+                    in {"ray-worker-1", "ray-worker-2"}
+                ),
+                key=lambda node: node["NodeName"],
+            )
+            self.assertEqual(len(head), 1)
+            self.assertEqual(
+                head[0].get("Resources", {}).get("CPU", 0),
+                0,
+            )
+            self.assertEqual(
+                [node["NodeName"] for node in workers],
+                ["ray-worker-1", "ray-worker-2"],
+            )
+            remote_probe = ray.remote(num_cpus=1)(
+                _WorkerScalarSlotProbe
+            )
+            references = []
+            for worker in workers:
+                actor = remote_probe.options(
+                    scheduling_strategy=(
+                        NodeAffinitySchedulingStrategy(
+                            node_id=worker["NodeID"],
+                            soft=False,
+                        )
+                    )
+                ).remote()
+                actors.append(actor)
+                references.append(
+                    actor.run.remote(cluster_epoch)
+                )
+            reports = ray.get(references)
+        finally:
+            for actor in actors:
+                ray.kill(actor, no_restart=True)
+            ray.shutdown()
+
+        self.assertEqual(
+            {report["node_id"] for report in reports},
+            {worker["NodeID"] for worker in workers},
+        )
+        for report in reports:
+            self.assertEqual(
+                {
+                    item["scalar_type"]
+                    for item in report["scalar_types"]
+                },
+                {
+                    "bool",
+                    "int32",
+                    "int64",
+                    "float32",
+                    "float64",
+                },
+            )
+            self.assertEqual(
+                len(
+                    {
+                        item["code_hash"]
+                        for item in report["scalar_types"]
+                    }
+                ),
+                5,
+            )
+            self.assertEqual(report["branch_results"], [9, 7])
+            self.assertGreaterEqual(
+                report["branch_counts"].get("CondBranch", 0),
+                1,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

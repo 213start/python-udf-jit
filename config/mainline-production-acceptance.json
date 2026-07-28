@@ -132,9 +132,15 @@
       "test_all_types_and_nulls_publish_atomically_with_value_free_metrics",
       "test_failed_output_is_aborted_and_never_exposes_partial_value",
       "test_concurrent_frames_are_isolated_and_old_process_is_rejected",
-      "test_rfc005_unit_contract"
+      "test_rfc005_unit_contract",
+      "test_five_scalar_types_execute_through_typed_input_and_output_slots",
+      "test_five_scalar_types_roundtrip_through_formal_artifact_layout",
+      "test_nullable_matrix_preserves_null_without_loading_a_value",
+      "test_local_branch_and_comparison_publish_exactly_one_result",
+      "test_layout_and_semantic_type_mismatch_is_rejected_before_compile",
+      "test_rfc006_unit_contract"
       ],
-      "expected_test_count": 254,
+      "expected_test_count": 260,
       "allow_skips": false
     },
     "integration": {
@@ -159,9 +165,11 @@
       "test_driver_worker_mismatch_rejects_before_resource_qualification",
       "test_rfc004_integration_contract",
       "test_five_scalar_layouts_materialize_in_a_fresh_worker_process",
-      "test_rfc005_integration_contract"
+      "test_rfc005_integration_contract",
+      "test_both_workers_execute_full_cinderx_scalar_matrix",
+      "test_rfc006_integration_contract"
       ],
-      "expected_test_count": 52,
+      "expected_test_count": 49,
       "allow_skips": false
     },
     "live": {
@@ -179,9 +187,10 @@
       "test_rfc002_frontend_verifies_on_each_worker",
       "test_rfc003_system_contract",
       "test_rfc004_system_contract",
-      "test_rfc005_system_contract"
+      "test_rfc005_system_contract",
+      "test_rfc006_system_contract"
       ],
-      "expected_test_count": 19,
+      "expected_test_count": 20,
       "allow_skips": false
     }
   },
