@@ -327,7 +327,7 @@ def _evidence() -> dict[str, object]:
             },
             "udf_targeted": {
                 "passed": 7,
-                "subtests_passed": 22,
+                "subtests_passed": 26,
                 "failed": 0,
             },
         },

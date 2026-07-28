@@ -47,7 +47,7 @@ def _libtest(count: int) -> dict[str, object]:
 
 
 def _targeted_log(*, exit_status: int | None = None) -> str:
-    log = "....... [100%]\n7 passed, 22 subtests passed in 0.06s\n"
+    log = "....... [100%]\n7 passed, 26 subtests passed in 0.06s\n"
     if exit_status is not None:
         log += f"[exit status={exit_status}]\n"
     return log
@@ -200,7 +200,7 @@ class CinderXEvidenceTests(unittest.TestCase):
                     self._build()["python_tests"]["udf_targeted"],
                     {
                         "passed": 7,
-                        "subtests_passed": 22,
+                        "subtests_passed": 26,
                         "failed": 0,
                     },
                 )

@@ -12,7 +12,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _TARGETED_UDF_TERMINAL = re.compile(
-    r"(?:\A|\n)7 passed, 22 subtests passed in "
+    r"(?:\A|\n)7 passed, 26 subtests passed in "
     r"[0-9]+(?:\.[0-9]+)?s"
     r"(?:\n\[exit status=0\])?\n?\Z"
 )
@@ -235,7 +235,7 @@ def _python_tests(
         "official_skip_libtest": official,
         "udf_targeted": {
             "passed": 7,
-            "subtests_passed": 22,
+            "subtests_passed": 26,
             "failed": 0,
         },
     }
@@ -393,7 +393,7 @@ def validate_cinderx_evidence(proof: object) -> str:
         and official.get("returncode") == 0
         and isinstance(targeted, Mapping)
         and targeted.get("passed") == 7
-        and targeted.get("subtests_passed") == 22
+        and targeted.get("subtests_passed") == 26
         and targeted.get("failed") == 0
     )
     expected_artifacts = {
