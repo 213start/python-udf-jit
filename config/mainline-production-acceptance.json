@@ -169,7 +169,7 @@
       "test_both_workers_execute_full_cinderx_scalar_matrix",
       "test_rfc006_integration_contract"
       ],
-      "expected_test_count": 49,
+      "expected_test_count": 53,
       "allow_skips": false
     },
     "live": {
