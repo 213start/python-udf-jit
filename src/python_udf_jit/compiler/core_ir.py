@@ -138,7 +138,7 @@ class CoreUdfModule:
 
 def lower_capture(captured: CaptureIR) -> CoreUdfModule:
     if not captured.instructions:
-        raise ValueError("capture has no legacy F64 lowering")
+        raise ValueError("capture has no scalar F64 lowering")
     stack: list[str] = []
     nodes: list[CoreNode] = []
     next_value = 0
@@ -204,7 +204,7 @@ def reference_execute(module: CoreUdfModule, value: float) -> float:
     return values[module.return_value]
 
 
-SEMANTIC_CORE_IR_VERSION = 2
+SEMANTIC_CORE_IR_VERSION = 1
 MAX_SEMANTIC_NODES = 4096
 MAX_SEMANTIC_BLOCKS = 1024
 MAX_SEMANTIC_EDGES = 16_384
@@ -640,7 +640,7 @@ class SemanticCoreModule:
 
     def recompute_semantic_hash(self) -> str:
         return hashlib.sha256(
-            b"python-udf-jit-semantic-core-v2\0"
+            b"python-udf-jit-semantic-core-formal\0"
             + _canonical_bytes(self.semantic_document())
         ).hexdigest()
 

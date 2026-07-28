@@ -318,7 +318,7 @@ def capture(request: CaptureRequest) -> CaptureIR:
 
 
 def capture_frontend(callable_object: Any) -> CaptureFrontend:
-    """Build the versioned static frontend without applying legacy lowering gates."""
+    """Build the static frontend without applying scalar-subset lowering gates."""
 
     function = _resolve_user_function(callable_object)
     return build_capture_frontend(function.__code__)

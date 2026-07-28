@@ -114,7 +114,7 @@ class CoreIrTest(unittest.TestCase):
             },
         )
 
-    def test_legacy_f64_capture_enters_the_semantic_pipeline(self):
+    def test_scalar_f64_capture_enters_the_semantic_pipeline(self):
         result = compile_semantic(capture(CaptureRequest(affine)))
 
         self.assertTrue(result.accepted)

@@ -376,7 +376,7 @@ class CandidateRegistry:
                                     logical_schema.encode("utf-8")
                                 ).hexdigest(),
                                 adapter_abi_sha256=hashlib.sha256(
-                                    b"daft-0.7.2-capture-v2"
+                                    b"daft-0.7.2-scalar-capture"
                                 ).hexdigest(),
                                 policy_sha256=hashlib.sha256(
                                     b"python-3.14.3-float64-scalar"

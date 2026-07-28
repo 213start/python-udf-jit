@@ -113,7 +113,7 @@ class ScalarCallView:
             }
             if type(document) is not dict or set(document) != expected:
                 raise CarrierContractError(
-                    "scalar call view fields do not match schema v1"
+                    "scalar call view fields do not match the formal schema"
                 )
             view = cls(
                 schema_version=document["schema_version"],
@@ -169,11 +169,11 @@ class ProductionCarrierState:
     def placeholder(
         cls, candidate_id: str, manifest_sha256: str
     ) -> "ProductionCarrierState":
-        if not candidate_id:
+        if type(candidate_id) is not str or not candidate_id:
             raise CarrierContractError("candidate_id must not be empty")
         _require_sha256(manifest_sha256, "manifest_sha256")
         placeholder_payload = (
-            f"python-udf-jit:placeholder:v1:{candidate_id}:{manifest_sha256}"
+            f"python-udf-jit:placeholder:{candidate_id}:{manifest_sha256}"
         ).encode("utf-8")
         return cls(
             schema_version=1,
@@ -294,31 +294,59 @@ class ProductionCarrierState:
     def from_bytes(cls, payload: bytes) -> "ProductionCarrierState":
         try:
             document = json.loads(payload.decode("ascii"))
-            if set(document) != {"candidate_id", "handle", "manifest_sha256", "schema_version"}:
-                raise CarrierContractError("carrier envelope fields do not match schema v1")
+            if (
+                type(document) is not dict
+                or set(document)
+                != {
+                    "candidate_id",
+                    "handle",
+                    "manifest_sha256",
+                    "schema_version",
+                }
+            ):
+                raise CarrierContractError(
+                    "carrier envelope fields do not match the formal schema"
+                )
             handle_doc = document["handle"]
-            if set(handle_doc) != {
-                "content_sha256",
-                "kind",
-                "payload_b64",
-                "size_bytes",
-            }:
-                raise CarrierContractError("carrier handle fields do not match schema v1")
+            if (
+                type(handle_doc) is not dict
+                or set(handle_doc)
+                != {
+                    "content_sha256",
+                    "kind",
+                    "payload_b64",
+                    "size_bytes",
+                }
+            ):
+                raise CarrierContractError(
+                    "carrier handle fields do not match the formal schema"
+                )
+            if (
+                type(document["schema_version"]) is not int
+                or type(document["candidate_id"]) is not str
+                or type(document["manifest_sha256"]) is not str
+                or type(handle_doc["kind"]) is not str
+                or type(handle_doc["content_sha256"]) is not str
+                or type(handle_doc["size_bytes"]) is not int
+            ):
+                raise CarrierContractError(
+                    "carrier field types do not match the formal schema"
+                )
             payload_b64 = handle_doc["payload_b64"]
             if payload_b64 is None:
                 artifact_payload = None
-            elif isinstance(payload_b64, str):
+            elif type(payload_b64) is str:
                 artifact_payload = base64.b64decode(payload_b64, validate=True)
             else:
                 raise CarrierContractError("carrier payload encoding is invalid")
             state = cls(
-                schema_version=int(document["schema_version"]),
-                candidate_id=str(document["candidate_id"]),
-                manifest_sha256=str(document["manifest_sha256"]),
+                schema_version=document["schema_version"],
+                candidate_id=document["candidate_id"],
+                manifest_sha256=document["manifest_sha256"],
                 handle=InlineArtifactHandle(
-                    str(handle_doc["kind"]),
-                    str(handle_doc["content_sha256"]),
-                    int(handle_doc["size_bytes"]),
+                    handle_doc["kind"],
+                    handle_doc["content_sha256"],
+                    handle_doc["size_bytes"],
                     artifact_payload,
                 ),
             )
@@ -335,7 +363,16 @@ class ProductionCarrierState:
         return state
 
     def _validate(self) -> None:
-        if self.schema_version != 1 or not self.candidate_id:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or type(self.candidate_id) is not str
+            or not self.candidate_id
+            or type(self.manifest_sha256) is not str
+            or type(self.handle.kind) is not str
+            or type(self.handle.content_sha256) is not str
+            or type(self.handle.size_bytes) is not int
+        ):
             raise CarrierContractError("unsupported or incomplete carrier state")
         _require_sha256(self.manifest_sha256, "manifest_sha256")
         _require_sha256(self.handle.content_sha256, "handle.content_sha256")

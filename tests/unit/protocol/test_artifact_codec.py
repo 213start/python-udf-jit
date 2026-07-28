@@ -134,7 +134,7 @@ print(json.dumps({'hash': loaded.content_sha256, 'result': reference_execute_sem
     def test_rejects_missing_fields_duplicate_keys_and_incompatible_manifest(self):
         valid = artifact().section_documents()
         missing_core = dict(valid)
-        missing_core["semantic_core_ir"] = {"format_version": 2}
+        missing_core["semantic_core_ir"] = {"format_version": 1}
 
         duplicate_manifest = b'{"artifact_format_major":1,"artifact_format_major":1}'
 

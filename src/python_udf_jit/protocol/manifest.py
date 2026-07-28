@@ -51,7 +51,7 @@ class ArtifactManifest:
 
     artifact_format_major: int = 1
     artifact_format_minor: int = 0
-    semantic_core_ir_version: int = 2
+    semantic_core_ir_version: int = 1
     semantic_region_version: int = 1
     runtime_abi: int = 1
     adapter_abi: int = 1

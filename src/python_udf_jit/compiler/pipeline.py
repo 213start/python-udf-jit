@@ -107,9 +107,9 @@ def _attributes(**values: str) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(values.items()))
 
 
-def _import_legacy_capture(captured: CaptureIR) -> SemanticCoreModule:
+def _lower_scalar_capture(captured: CaptureIR) -> SemanticCoreModule:
     if not captured.instructions:
-        raise ValueError("legacy capture has no semantic operations")
+        raise ValueError("scalar capture has no semantic operations")
     operations: list[SemanticOperation] = []
     operation_ids: list[str] = []
     stack: list[str] = []
@@ -154,7 +154,7 @@ def _import_legacy_capture(captured: CaptureIR) -> SemanticCoreModule:
             argument_value = result_id
         elif instruction.op == "const.f64":
             if type(instruction.literal) is not float:
-                raise ValueError("legacy float constant is invalid")
+                raise ValueError("scalar float constant is invalid")
             result_id = f"%{next_value}"
             next_value += 1
             append(
@@ -199,7 +199,7 @@ def _import_legacy_capture(captured: CaptureIR) -> SemanticCoreModule:
             stack.append(result_id)
         elif instruction.op == "return":
             if len(stack) != 1:
-                raise ValueError("legacy capture stack is invalid")
+                raise ValueError("scalar capture stack is invalid")
             return_operation_id = operation_id
             append(
                 SemanticOperation(
@@ -218,10 +218,10 @@ def _import_legacy_capture(captured: CaptureIR) -> SemanticCoreModule:
             )
         else:
             raise ValueError(
-                f"legacy capture operation is unsupported: {instruction.op}"
+                f"scalar capture operation is unsupported: {instruction.op}"
             )
     if not return_operation_id:
-        raise ValueError("legacy capture has no return")
+        raise ValueError("scalar capture has no return")
     return build_semantic_module(
         function_id=captured.fallback_identity.code_sha256,
         entry_block="b0",
@@ -361,7 +361,7 @@ def compile_semantic(
     try:
         policy.verify()
         if isinstance(capture_module, CaptureIR):
-            module = _import_legacy_capture(capture_module)
+            module = _lower_scalar_capture(capture_module)
             status = SemanticCompileStatus.COMPILED
             reason = "verified_semantic_ir"
         elif isinstance(capture_module, CapturedProgram):

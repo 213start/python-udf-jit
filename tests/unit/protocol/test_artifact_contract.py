@@ -54,15 +54,26 @@ class FormalArtifactContractTest(unittest.TestCase):
 
     def test_unknown_section_is_rejected_without_forward_compatibility(self):
         documents = list(artifact().section_documents().items())
-        documents.append(("future_hint", {"value": 1}))
+        cases = {
+            "unknown_future_section": documents
+            + [("future_hint", {"value": 1})],
+            "piercing_sections_are_not_a_previous_version": [
+                ("manifest", documents[0][1]),
+                ("core_ir", {"format_version": 1}),
+                ("region", {"format_version": 1}),
+                ("guard", {}),
+                ("fallback", {}),
+            ],
+        }
 
-        with self.assertRaises(ArtifactCodecError) as raised:
-            decode_artifact(raw_envelope(documents))
-
-        self.assertEqual(
-            raised.exception.code,
-            ArtifactRejectCode.UNKNOWN_SECTION,
-        )
+        for name, payload_documents in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ArtifactCodecError) as raised:
+                    decode_artifact(raw_envelope(payload_documents))
+                self.assertEqual(
+                    raised.exception.code,
+                    ArtifactRejectCode.UNKNOWN_SECTION,
+                )
 
     def test_unknown_manifest_field_is_rejected(self):
         documents = artifact().section_documents()
