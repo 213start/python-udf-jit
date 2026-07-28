@@ -1,23 +1,21 @@
-# CinderX candidate source provenance
+# CinderX 候选源码来源
 
-The scalar-piercing image uses an openEuler CinderX source snapshot based on
-upstream commit `ac09c68527153b43cc8b4f16f36d9245cb861d12`, plus the deterministic
-runtime overlay in `patches/0001-runtime-candidate.patch`.
+标量主线候选镜像使用基于上游提交
+`ac09c68527153b43cc8b4f16f36d9245cb861d12` 的 openEuler CinderX
+源码快照，并按 `patches/manifest.json` 中的顺序应用确定性补丁系列。
 
-The patch contains the complete runtime/API/test delta of the validated
-candidate, including pre-existing platform fixes on which the UDF intrinsic
-depends. Build output, virtual environments, IDE state, CI-only files,
-generated egg metadata, and documentation are intentionally outside the
-runtime-tree identity. The exact exclusions and before/after tree hashes are
-recorded in `patches/manifest.json`.
+第一个补丁包含 UDF 内建指令依赖的平台修复和基础运行时接缝，第二个补丁实现
+五种物理标量类型、空值语义、分支执行及相应的 HIR/LIR 和测试。构建输出、
+虚拟环境、IDE 状态、仅用于 CI 的文件、生成的 egg 元数据和文档不参与运行时
+源码树身份计算；具体排除项及应用补丁前后的源码树摘要均记录在清单中。
 
-Apply the overlay from the root of the matching CinderX baseline:
+从匹配的 CinderX 基线源码根目录按顺序应用补丁：
 
 ```text
 patch --batch -p1 < 0001-runtime-candidate.patch
+patch --batch -p1 < 0002-primitive-data-intrinsics.patch
 ```
 
-Formal acceptance recomputes the committed patch SHA-256, records the
-normalized candidate runtime-tree SHA-256, and carries both values into the
-candidate image labels and CinderX test proof. A wheel or image built from a
-different patch/tree identity is rejected.
+正式验收逐个校验补丁 SHA-256，并按清单顺序拼接补丁原始字节后计算补丁系列
+SHA-256。规范化源码树摘要、补丁系列摘要会同时写入候选镜像标签和 CinderX
+测试证据；任何源码树、补丁顺序或补丁内容不一致的 wheel 和镜像都会被拒绝。

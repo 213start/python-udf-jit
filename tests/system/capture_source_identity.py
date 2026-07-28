@@ -7,7 +7,7 @@ import re
 import stat
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from python_udf_jit.diagnostics.cinderx_evidence import (
     validate_cinderx_evidence,
@@ -112,23 +112,35 @@ def capture(
     cinderx_wheel: Path,
     cinderx_base_image_digest: str,
     cinderx_proof_path: Path,
-    patch_path: Path,
+    patch_paths: Sequence[Path],
 ) -> dict[str, object]:
     repository = repository.resolve()
-    patch = patch_path.resolve()
-    try:
-        patch_relative = patch.relative_to(repository)
-    except ValueError as error:
-        raise ValueError("CinderX patch must be inside the Git repository") from error
+    patches = tuple(path.resolve() for path in patch_paths)
+    if not patches:
+        raise ValueError("CinderX patch series must not be empty")
+    patch_relatives = []
+    for patch in patches:
+        try:
+            patch_relatives.append(patch.relative_to(repository))
+        except ValueError as error:
+            raise ValueError(
+                "CinderX patches must be inside the Git repository"
+            ) from error
     git_commit = _run(["git", "rev-parse", "HEAD"], cwd=repository).strip()
     status = _run(
         ["git", "status", "--porcelain=v1", "--untracked-files=all"],
         cwd=repository,
     )
-    _run(
-        ["git", "ls-files", "--error-unmatch", patch_relative.as_posix()],
-        cwd=repository,
-    )
+    for patch_relative in patch_relatives:
+        _run(
+            [
+                "git",
+                "ls-files",
+                "--error-unmatch",
+                patch_relative.as_posix(),
+            ],
+            cwd=repository,
+        )
     if not udf_jit_wheel.is_file():
         raise FileNotFoundError(f"UDF JIT wheel is missing: {udf_jit_wheel}")
     if not cinderx_wheel.is_file():
@@ -137,7 +149,10 @@ def capture(
     cinderx_wheel_digest = hashlib.sha256(
         cinderx_wheel.read_bytes()
     ).hexdigest()
-    patch_digest = hashlib.sha256(patch.read_bytes()).hexdigest()
+    patch_hasher = hashlib.sha256()
+    for patch in patches:
+        patch_hasher.update(patch.read_bytes())
+    patch_digest = patch_hasher.hexdigest()
     cinderx_proof = _private_document(cinderx_proof_path)
     image_documents = json.loads(
         _run(["docker", "image", "inspect", image])
@@ -169,7 +184,13 @@ def main() -> None:
     parser.add_argument("--cinderx-wheel", type=Path, required=True)
     parser.add_argument("--cinderx-base-image-digest", required=True)
     parser.add_argument("--cinderx-proof", type=Path, required=True)
-    parser.add_argument("--patch", type=Path, required=True)
+    parser.add_argument(
+        "--patch",
+        dest="patches",
+        action="append",
+        type=Path,
+        required=True,
+    )
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     document = capture(
@@ -179,7 +200,7 @@ def main() -> None:
         cinderx_wheel=arguments.cinderx_wheel,
         cinderx_base_image_digest=arguments.cinderx_base_image_digest,
         cinderx_proof_path=arguments.cinderx_proof,
-        patch_path=arguments.patch,
+        patch_paths=arguments.patches,
     )
     write_private_json(arguments.output, document)
     print(document["git_commit"])

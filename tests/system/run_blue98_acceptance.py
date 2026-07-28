@@ -1140,18 +1140,40 @@ def run(arguments: argparse.Namespace) -> Path:
     patch_manifest = json.loads(
         patch_manifest_path.read_text(encoding="utf-8")
     )
-    patch_path = (
-        repository
-        / "vendor/cinderx/patches"
-        / str(patch_manifest["patch"])
-    )
+    patch_entries = patch_manifest.get("patches")
+    if not isinstance(patch_entries, list) or not patch_entries:
+        raise AcceptanceRunError("committed_cinderx_manifest_invalid")
+    patch_paths = []
+    patch_hasher = hashlib.sha256()
+    seen_patch_paths = set()
+    for entry in patch_entries:
+        if not isinstance(entry, dict):
+            raise AcceptanceRunError("committed_cinderx_manifest_invalid")
+        relative_path = Path(str(entry.get("path", "")))
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.as_posix() in seen_patch_paths
+        ):
+            raise AcceptanceRunError("committed_cinderx_manifest_invalid")
+        patch_path = (
+            repository / "vendor/cinderx/patches" / relative_path
+        )
+        if (
+            not patch_path.is_file()
+            or entry.get("sha256") != _sha256(patch_path)
+        ):
+            raise AcceptanceRunError("committed_cinderx_manifest_invalid")
+        seen_patch_paths.add(relative_path.as_posix())
+        patch_paths.append(patch_path)
+        patch_hasher.update(patch_path.read_bytes())
     cinderx_commit = str(patch_manifest["upstream_commit"])
     cinderx_tree = str(patch_manifest["candidate_runtime_tree_sha256"])
-    patch_sha256 = _sha256(patch_path)
+    patch_sha256 = patch_hasher.hexdigest()
     if (
         _GIT_COMMIT.fullmatch(cinderx_commit) is None
         or _SHA256.fullmatch(cinderx_tree) is None
-        or patch_manifest.get("patch_sha256") != patch_sha256
+        or patch_manifest.get("patch_series_sha256") != patch_sha256
     ):
         raise AcceptanceRunError("committed_cinderx_manifest_invalid")
 
@@ -1301,7 +1323,7 @@ def run(arguments: argparse.Namespace) -> Path:
             cinderx_wheel=cinderx_wheel,
             cinderx_base_image_digest=base_image_id,
             cinderx_proof_path=cinderx_proof_path,
-            patch_path=patch_path,
+            patch_paths=patch_paths,
         )
         source_path = layout.evidence / "source-identity.json"
         _write_private_json(source_path, source_document)

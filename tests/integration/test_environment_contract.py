@@ -128,32 +128,66 @@ class EnvironmentContractTests(unittest.TestCase):
         manifest = json.loads(
             (root / "manifest.json").read_text(encoding="utf-8")
         )
-        patch = (root / manifest["patch"]).read_bytes()
-        text = patch.decode("utf-8")
-        changed = [
-            line.removeprefix("--- a/")
-            for line in text.splitlines()
-            if line.startswith("--- a/")
-        ]
+        patches = manifest["patches"]
+        series = hashlib.sha256()
+        all_changed = set()
 
         self.assertEqual(manifest["schema_version"], 1)
         self.assertRegex(manifest["upstream_commit"], r"^[0-9a-f]{40}$")
         self.assertEqual(
-            hashlib.sha256(patch).hexdigest(),
-            manifest["patch_sha256"],
+            [entry["path"] for entry in patches],
+            [
+                "0001-runtime-candidate.patch",
+                "0002-primitive-data-intrinsics.patch",
+            ],
         )
-        self.assertEqual(len(changed), manifest["changed_file_count"])
-        self.assertEqual(len(set(changed)), len(changed))
-        self.assertTrue(
-            all(path.startswith("cinderx/") for path in changed)
+        for entry in patches:
+            patch = (root / entry["path"]).read_bytes()
+            series.update(patch)
+            lines = patch.decode("utf-8").splitlines()
+            changed = [
+                line.split(" b/", 1)[1]
+                for line in lines
+                if line.startswith("diff --git a/")
+            ]
+            if not changed:
+                changed = [
+                    line.removeprefix("--- a/")
+                    for line in lines
+                    if line.startswith("--- a/")
+                ]
+            self.assertEqual(
+                hashlib.sha256(patch).hexdigest(),
+                entry["sha256"],
+            )
+            self.assertEqual(
+                len(changed),
+                entry["changed_file_count"],
+            )
+            self.assertEqual(len(set(changed)), len(changed))
+            self.assertTrue(
+                all(path.startswith("cinderx/") for path in changed)
+            )
+            all_changed.update(changed)
+        self.assertEqual(
+            series.hexdigest(),
+            manifest["patch_series_sha256"],
+        )
+        self.assertEqual(
+            len(all_changed),
+            manifest["changed_file_count"],
         )
         self.assertIn(
             "cinderx/RuntimeTests/udf_data_intrinsic_test.cpp",
-            changed,
+            all_changed,
         )
         self.assertIn(
             "cinderx/PythonLib/test_cinderx/test_udf_data_intrinsic.py",
-            changed,
+            all_changed,
+        )
+        self.assertIn(
+            "cinderx/RuntimeTests/udf_descriptor_fuzz_test.cpp",
+            all_changed,
         )
 
     def test_compose_network_plan_does_not_overlap_blue_98_routes(self) -> None:

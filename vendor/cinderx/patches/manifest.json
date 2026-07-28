@@ -2,10 +2,21 @@
   "schema_version": 1,
   "upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
   "baseline_runtime_tree_sha256": "d29b9cb3512f7cca22d9fefece56484f705c4049e724ec6e99f04153477ff5de",
-  "candidate_runtime_tree_sha256": "0a20e7ad522bbe6f765d73fc42c75f49055687e31d179cae700b416dafb53850",
-  "patch": "0001-runtime-candidate.patch",
-  "patch_sha256": "ebe271657f6b2875d1ed814c94d676660a37c35f23e7022d5260cc3eb252cd23",
-  "changed_file_count": 25,
+  "candidate_runtime_tree_sha256": "b27d10bdaa47d1d4407fa9751e101c576fad7ebad77d5c67bf34fd186c72064c",
+  "patches": [
+    {
+      "path": "0001-runtime-candidate.patch",
+      "sha256": "ebe271657f6b2875d1ed814c94d676660a37c35f23e7022d5260cc3eb252cd23",
+      "changed_file_count": 25
+    },
+    {
+      "path": "0002-primitive-data-intrinsics.patch",
+      "sha256": "cad210f4f748340771c611ad65128b4d59d79d2b020ccce348aca4bebdf2b312",
+      "changed_file_count": 16
+    }
+  ],
+  "patch_series_sha256": "19c877bd060f7601eec31121745e4d22a4ae6e99c01e71a68b259fecf50b7220",
+  "changed_file_count": 26,
   "excluded_paths": [
     "*.egg-info",
     ".gitcode",

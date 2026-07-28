@@ -1,0 +1,2762 @@
+diff --git a/cinderx/Jit/hir/hir.cpp b/cinderx/Jit/hir/hir.cpp
+index 126d4f1..2908c53 100644
+--- a/cinderx/Jit/hir/hir.cpp
++++ b/cinderx/Jit/hir/hir.cpp
+@@ -401,6 +401,11 @@ bool Instr::isReplayable() const {
+     case Opcode::kLoadFieldAddress:
+     case Opcode::kLoadFunctionIndirect:
+     case Opcode::kLoadGlobalCached:
++    case Opcode::kIsUdfDataNull:
++    case Opcode::kLoadUdfDataBool:
++    case Opcode::kLoadUdfDataI32:
++    case Opcode::kLoadUdfDataI64:
++    case Opcode::kLoadUdfDataF32:
+     case Opcode::kLoadUdfDataF64:
+     case Opcode::kLoadSplitDictItem:
+     case Opcode::kLoadTupleItem:
+@@ -532,6 +537,12 @@ bool Instr::isReplayable() const {
+     case Opcode::kStoreArrayItem:
+     case Opcode::kStoreAttr:
+     case Opcode::kStoreAttrCached:
++    case Opcode::kStoreUdfDataBool:
++    case Opcode::kStoreUdfDataI32:
++    case Opcode::kStoreUdfDataI64:
++    case Opcode::kStoreUdfDataF32:
++    case Opcode::kStoreUdfDataF64:
++    case Opcode::kStoreUdfDataNull:
+     case Opcode::kStoreSubscr:
+     case Opcode::kClearTreeIterState:
+     case Opcode::kTreeIterEnterChild:
+@@ -783,6 +794,11 @@ bool isPassthrough(const Instr& instr) {
+     case Opcode::kLoadFunctionIndirect:
+     case Opcode::kLoadGlobal:
+     case Opcode::kLoadGlobalCached:
++    case Opcode::kIsUdfDataNull:
++    case Opcode::kLoadUdfDataBool:
++    case Opcode::kLoadUdfDataI32:
++    case Opcode::kLoadUdfDataI64:
++    case Opcode::kLoadUdfDataF32:
+     case Opcode::kLoadUdfDataF64:
+     case Opcode::kLoadMethod:
+     case Opcode::kLoadMethodCached:
+@@ -878,6 +894,12 @@ bool isPassthrough(const Instr& instr) {
+     case Opcode::kSnapshot:
+     case Opcode::kOSREntry:
+     case Opcode::kStoreField:
++    case Opcode::kStoreUdfDataBool:
++    case Opcode::kStoreUdfDataI32:
++    case Opcode::kStoreUdfDataI64:
++    case Opcode::kStoreUdfDataF32:
++    case Opcode::kStoreUdfDataF64:
++    case Opcode::kStoreUdfDataNull:
+     case Opcode::kTreeIterEnterChild:
+     case Opcode::kTreeIterLeaveCurrentNode:
+     case Opcode::kUpdatePrevInstr:
+diff --git a/cinderx/Jit/hir/hir.h b/cinderx/Jit/hir/hir.h
+index 30f88c7..a0d273a 100644
+--- a/cinderx/Jit/hir/hir.h
++++ b/cinderx/Jit/hir/hir.h
+@@ -414,8 +414,7 @@ class InstrT<T, opcode, Operands<arity>, Tys...>
+   // Usage:
+   //   auto instr = T::create(<args for T's constructor>);
+   template <typename... Args, class T1 = T>
+-    requires(arity >= 0)
+-  static T1* create(Args&&... args) {
++  requires(arity >= 0) static T1* create(Args&&... args) {
+     auto ptr = Instr::allocate(sizeof(T1), arity);
+     return new (ptr) T1(std::forward<Args>(args)...);
+   }
+@@ -425,36 +424,33 @@ class InstrT<T, opcode, Operands<arity>, Tys...>
+   // Usage:
+   //   auto instr = T::create(<num_operands>, <args for T's constructor>);
+   template <typename... Args, class T1 = T>
+-    requires(arity == kVariadic)
+-  static T1* create(std::size_t num_ops, Args&&... args) {
++  requires(arity == kVariadic) static T1* create(
++      std::size_t num_ops,
++      Args&&... args) {
+     auto ptr = Instr::allocate(sizeof(T1), num_ops);
+     return new (ptr) T1(std::forward<Args>(args)...);
+   }
+ 
+   // Forwarding constructor for variadic `T`.
+   template <typename... Args, int a = arity>
+-    requires(a <= 0)
+-  explicit InstrT(Args&&... args)
++  requires(a <= 0) explicit InstrT(Args&&... args)
+       : InstrT<T, opcode, Tys...>(std::forward<Args>(args)...) {}
+ 
+   // Constructor for unary `T`.
+   template <typename... Args, int a = arity>
+-    requires(a == 1)
+-  explicit InstrT(Register* reg, Args&&... args)
++  requires(a == 1) explicit InstrT(Register* reg, Args&&... args)
+       : InstrT<T, opcode, Tys...>(std::forward<Args>(args)...) {
+     this->operandAt(0) = reg;
+   }
+ 
+   template <int a = arity>
+-    requires(a == 1)
+-  Register* reg() const {
++  requires(a == 1) Register* reg() const {
+     return this->GetOperand(0);
+   }
+ 
+   // Constructor for binary `T`.
+   template <typename... Args, int a = arity>
+-    requires(a == 2)
+-  InstrT(Register* lhs, Register* rhs, Args&&... args)
++  requires(a == 2) InstrT(Register* lhs, Register* rhs, Args&&... args)
+       : InstrT<T, opcode, Tys...>(std::forward<Args>(args)...) {
+     this->operandAt(0) = lhs;
+     this->operandAt(1) = rhs;
+@@ -462,8 +458,7 @@ class InstrT<T, opcode, Operands<arity>, Tys...>
+ 
+   // Constructor for trinary `T`.
+   template <typename... Args, int x = arity>
+-    requires(x == 3)
+-  InstrT(Register* a, Register* b, Register* c, Args&&... args)
++  requires(x == 3) InstrT(Register* a, Register* b, Register* c, Args&&... args)
+       : InstrT<T, opcode, Tys...>(std::forward<Args>(args)...) {
+     this->operandAt(0) = a;
+     this->operandAt(1) = b;
+@@ -472,8 +467,8 @@ class InstrT<T, opcode, Operands<arity>, Tys...>
+ 
+   // Constructor for 4 operand `T`.
+   template <typename... Args, int x = arity>
+-    requires(x == 4)
+-  InstrT(Register* a, Register* b, Register* c, Register* d, Args&&... args)
++  requires(x == 4)
++      InstrT(Register* a, Register* b, Register* c, Register* d, Args&&... args)
+       : InstrT<T, opcode, Tys...>(std::forward<Args>(args)...) {
+     this->operandAt(0) = a;
+     this->operandAt(1) = b;
+@@ -1186,10 +1181,21 @@ class INSTR_CLASS(CallStaticRetVoid, (TTop), Operands<>) {
+   void* addr_;
+ };
+ 
+-// Read a float64 value from a process-local scalar-slot capsule.  This may
+-// only be emitted from the exact `_udf_data_load_f64(exact_guard(slot))`
+-// sequence; the operand is the result of the guard, never the unguarded slot.
++// Data-aware scalar operations may only be emitted from an exact runtime
++// helper call whose slot operand is produced by the adjacent exact guard.
++// Their first operand is therefore the guard result, never an unguarded slot.
++DEFINE_SIMPLE_INSTR(IsUdfDataNull, (TObject), HasOutput, Operands<1>);
++DEFINE_SIMPLE_INSTR(LoadUdfDataBool, (TObject), HasOutput, Operands<1>);
++DEFINE_SIMPLE_INSTR(LoadUdfDataI32, (TObject), HasOutput, Operands<1>);
++DEFINE_SIMPLE_INSTR(LoadUdfDataI64, (TObject), HasOutput, Operands<1>);
++DEFINE_SIMPLE_INSTR(LoadUdfDataF32, (TObject), HasOutput, Operands<1>);
+ DEFINE_SIMPLE_INSTR(LoadUdfDataF64, (TObject), HasOutput, Operands<1>);
++DEFINE_SIMPLE_INSTR(StoreUdfDataBool, (TObject, TCBool), Operands<2>);
++DEFINE_SIMPLE_INSTR(StoreUdfDataI32, (TObject, TCInt32), Operands<2>);
++DEFINE_SIMPLE_INSTR(StoreUdfDataI64, (TObject, TCInt64), Operands<2>);
++DEFINE_SIMPLE_INSTR(StoreUdfDataF32, (TObject, TCDouble), Operands<2>);
++DEFINE_SIMPLE_INSTR(StoreUdfDataF64, (TObject, TCDouble), Operands<2>);
++DEFINE_SIMPLE_INSTR(StoreUdfDataNull, (TObject), Operands<1>);
+ 
+ // Invokes a function with a static entry point, where we can
+ // directly provide the arguments using the x64 calling convention.
+@@ -4194,7 +4200,8 @@ DEFINE_SIMPLE_INSTR(
+     Operands<2>,
+     DeoptBase);
+ 
+-// Pop the top entry; transfers ownership of node to output; writes popped_phase.
++// Pop the top entry; transfers ownership of node to output; writes
++// popped_phase.
+ DEFINE_SIMPLE_INSTR(StateStackPop, (TObject), HasOutput, Operands<0>);
+ 
+ // Read tree_iter_popped_phase (written by StateStackPop).
+diff --git a/cinderx/Jit/hir/hir_ops.h b/cinderx/Jit/hir/hir_ops.h
+index 6796181..df28235 100644
+--- a/cinderx/Jit/hir/hir_ops.h
++++ b/cinderx/Jit/hir/hir_ops.h
+@@ -113,6 +113,11 @@ namespace jit::hir {
+   V(LoadFunctionIndirect)          \
+   V(LoadGlobalCached)              \
+   V(LoadGlobal)                    \
++  V(IsUdfDataNull)                 \
++  V(LoadUdfDataBool)               \
++  V(LoadUdfDataI32)                \
++  V(LoadUdfDataI64)                \
++  V(LoadUdfDataF32)                \
+   V(LoadUdfDataF64)                \
+   V(LoadMethod)                    \
+   V(LoadMethodCached)              \
+@@ -171,6 +176,12 @@ namespace jit::hir {
+   V(StoreAttr)                     \
+   V(StoreAttrCached)               \
+   V(StoreField)                    \
++  V(StoreUdfDataBool)              \
++  V(StoreUdfDataI32)               \
++  V(StoreUdfDataI64)               \
++  V(StoreUdfDataF32)               \
++  V(StoreUdfDataF64)               \
++  V(StoreUdfDataNull)              \
+   V(StoreSubscr)                   \
+   V(TpAlloc)                       \
+   V(TreeIterEnterChild)            \
+diff --git a/cinderx/Jit/hir/instr_effects.cpp b/cinderx/Jit/hir/instr_effects.cpp
+index e5a9a99..528e799 100644
+--- a/cinderx/Jit/hir/instr_effects.cpp
++++ b/cinderx/Jit/hir/instr_effects.cpp
+@@ -49,6 +49,11 @@ MemoryEffects memoryEffects(const Instr& inst) {
+     case Opcode::kIsCompactLong:
+     case Opcode::kIsNegativeAndErrOccurred:
+     case Opcode::kLoadEvalBreaker:
++    case Opcode::kIsUdfDataNull:
++    case Opcode::kLoadUdfDataBool:
++    case Opcode::kLoadUdfDataI32:
++    case Opcode::kLoadUdfDataI64:
++    case Opcode::kLoadUdfDataF32:
+     case Opcode::kLoadUdfDataF64:
+     case Opcode::kLoadVarObjectSize:
+     case Opcode::kLongCompare:
+@@ -74,6 +79,16 @@ MemoryEffects memoryEffects(const Instr& inst) {
+     case Opcode::kWaitHandleLoadWaiter:
+       return commonEffects(inst, AEmpty);
+ 
++    // Scalar output publication mutates process-local slot state but cannot
++    // execute arbitrary Python.
++    case Opcode::kStoreUdfDataBool:
++    case Opcode::kStoreUdfDataI32:
++    case Opcode::kStoreUdfDataI64:
++    case Opcode::kStoreUdfDataF32:
++    case Opcode::kStoreUdfDataF64:
++    case Opcode::kStoreUdfDataNull:
++      return commonEffects(inst, AOther);
++
+     // If boxing a bool, we return a borrowed reference to Py_True or Py_False.
+     case Opcode::kPrimitiveBoxBool:
+       return borrowFrom(inst, AEmpty);
+@@ -429,6 +444,11 @@ bool hasArbitraryExecution(const Instr& inst) {
+     case Opcode::kLoadFieldAddress:
+     case Opcode::kLoadFunctionIndirect:
+     case Opcode::kLoadGlobalCached:
++    case Opcode::kIsUdfDataNull:
++    case Opcode::kLoadUdfDataBool:
++    case Opcode::kLoadUdfDataI32:
++    case Opcode::kLoadUdfDataI64:
++    case Opcode::kLoadUdfDataF32:
+     case Opcode::kLoadUdfDataF64:
+     case Opcode::kLoadSplitDictItem:
+     case Opcode::kLoadTupleItem:
+@@ -462,6 +482,12 @@ bool hasArbitraryExecution(const Instr& inst) {
+     case Opcode::kSwapCellItem:
+     case Opcode::kStoreArrayItem:
+     case Opcode::kStoreField:
++    case Opcode::kStoreUdfDataBool:
++    case Opcode::kStoreUdfDataI32:
++    case Opcode::kStoreUdfDataI64:
++    case Opcode::kStoreUdfDataF32:
++    case Opcode::kStoreUdfDataF64:
++    case Opcode::kStoreUdfDataNull:
+     case Opcode::kTpAlloc:
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
+diff --git a/cinderx/Jit/hir/parser.cpp b/cinderx/Jit/hir/parser.cpp
+index 254037b..e04a19c 100644
+--- a/cinderx/Jit/hir/parser.cpp
++++ b/cinderx/Jit/hir/parser.cpp
+@@ -757,11 +757,71 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
+       NEW_INSTR(LoadArrayItem, dst, ob_item, idx, array_unused, 0, TObject);
+       break;
+     }
++    case Opcode::kIsUdfDataNull: {
++      auto guarded_slot = ParseRegister();
++      NEW_INSTR(IsUdfDataNull, dst, guarded_slot);
++      break;
++    }
++    case Opcode::kLoadUdfDataBool: {
++      auto guarded_slot = ParseRegister();
++      NEW_INSTR(LoadUdfDataBool, dst, guarded_slot);
++      break;
++    }
++    case Opcode::kLoadUdfDataI32: {
++      auto guarded_slot = ParseRegister();
++      NEW_INSTR(LoadUdfDataI32, dst, guarded_slot);
++      break;
++    }
++    case Opcode::kLoadUdfDataI64: {
++      auto guarded_slot = ParseRegister();
++      NEW_INSTR(LoadUdfDataI64, dst, guarded_slot);
++      break;
++    }
++    case Opcode::kLoadUdfDataF32: {
++      auto guarded_slot = ParseRegister();
++      NEW_INSTR(LoadUdfDataF32, dst, guarded_slot);
++      break;
++    }
+     case Opcode::kLoadUdfDataF64: {
+       auto guarded_slot = ParseRegister();
+       NEW_INSTR(LoadUdfDataF64, dst, guarded_slot);
+       break;
+     }
++    case Opcode::kStoreUdfDataBool: {
++      auto guarded_slot = ParseRegister();
++      auto value = ParseRegister();
++      NEW_INSTR(StoreUdfDataBool, guarded_slot, value);
++      break;
++    }
++    case Opcode::kStoreUdfDataI32: {
++      auto guarded_slot = ParseRegister();
++      auto value = ParseRegister();
++      NEW_INSTR(StoreUdfDataI32, guarded_slot, value);
++      break;
++    }
++    case Opcode::kStoreUdfDataI64: {
++      auto guarded_slot = ParseRegister();
++      auto value = ParseRegister();
++      NEW_INSTR(StoreUdfDataI64, guarded_slot, value);
++      break;
++    }
++    case Opcode::kStoreUdfDataF32: {
++      auto guarded_slot = ParseRegister();
++      auto value = ParseRegister();
++      NEW_INSTR(StoreUdfDataF32, guarded_slot, value);
++      break;
++    }
++    case Opcode::kStoreUdfDataF64: {
++      auto guarded_slot = ParseRegister();
++      auto value = ParseRegister();
++      NEW_INSTR(StoreUdfDataF64, guarded_slot, value);
++      break;
++    }
++    case Opcode::kStoreUdfDataNull: {
++      auto guarded_slot = ParseRegister();
++      NEW_INSTR(StoreUdfDataNull, guarded_slot);
++      break;
++    }
+     case Opcode::kPhi: {
+       expect("<");
+       PhiInfo info{dst};
+diff --git a/cinderx/Jit/hir/pass.cpp b/cinderx/Jit/hir/pass.cpp
+index f3eb05c..20b20c7 100644
+--- a/cinderx/Jit/hir/pass.cpp
++++ b/cinderx/Jit/hir/pass.cpp
+@@ -276,6 +276,14 @@ Type outputType(
+       return static_cast<const LoadField&>(instr).type();
+     case Opcode::kLoadFieldAddress:
+       return TCPtr;
++    case Opcode::kIsUdfDataNull:
++    case Opcode::kLoadUdfDataBool:
++      return TCBool;
++    case Opcode::kLoadUdfDataI32:
++      return TCInt32;
++    case Opcode::kLoadUdfDataI64:
++      return TCInt64;
++    case Opcode::kLoadUdfDataF32:
+     case Opcode::kLoadUdfDataF64:
+       return TCDouble;
+     case Opcode::kCallStatic: {
+@@ -558,6 +566,12 @@ Type outputType(
+     case Opcode::kStoreAttrCached:
+     case Opcode::kStoreField:
+     case Opcode::kStoreSubscr:
++    case Opcode::kStoreUdfDataBool:
++    case Opcode::kStoreUdfDataI32:
++    case Opcode::kStoreUdfDataI64:
++    case Opcode::kStoreUdfDataF32:
++    case Opcode::kStoreUdfDataF64:
++    case Opcode::kStoreUdfDataNull:
+     case Opcode::kTreeIterEnterChild:
+     case Opcode::kTreeIterLeaveCurrentNode:
+     case Opcode::kUnreachable:
+diff --git a/cinderx/Jit/hir/printer.cpp b/cinderx/Jit/hir/printer.cpp
+index 887fffc..019a3f9 100644
+--- a/cinderx/Jit/hir/printer.cpp
++++ b/cinderx/Jit/hir/printer.cpp
+@@ -278,6 +278,11 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
+     case Opcode::kLoadCurrentFunc:
+     case Opcode::kLoadFrame:
+     case Opcode::kLoadEvalBreaker:
++    case Opcode::kIsUdfDataNull:
++    case Opcode::kLoadUdfDataBool:
++    case Opcode::kLoadUdfDataI32:
++    case Opcode::kLoadUdfDataI64:
++    case Opcode::kLoadUdfDataF32:
+     case Opcode::kLoadUdfDataF64:
+     case Opcode::kAtQuiescentState:
+     case Opcode::kLoadFieldAddress:
+@@ -304,6 +309,12 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
+     case Opcode::kSwapCellItem:
+     case Opcode::kStoreArrayItem:
+     case Opcode::kStoreSubscr:
++    case Opcode::kStoreUdfDataBool:
++    case Opcode::kStoreUdfDataI32:
++    case Opcode::kStoreUdfDataI64:
++    case Opcode::kStoreUdfDataF32:
++    case Opcode::kStoreUdfDataF64:
++    case Opcode::kStoreUdfDataNull:
+     case Opcode::kWaitHandleLoadCoroOrResult:
+     case Opcode::kWaitHandleLoadWaiter:
+     case Opcode::kWaitHandleRelease:
+diff --git a/cinderx/Jit/hir/simplify.cpp b/cinderx/Jit/hir/simplify.cpp
+index 6be725a..5c3bb06 100644
+--- a/cinderx/Jit/hir/simplify.cpp
++++ b/cinderx/Jit/hir/simplify.cpp
+@@ -20,10 +20,9 @@
+ #include "cinderx/Jit/threaded_compile.h"
+ #include "cinderx/StaticPython/strictmoduleobject.h"
+ 
+-#include <cfloat>
+-
+ #include <fmt/ostream.h>
+ 
++#include <cfloat>
+ #include <unordered_set>
+ 
+ namespace jit::hir {
+@@ -822,13 +821,12 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
+   // --- slow: generic subscript (PyObject_GetItem) ---
+   env.block = slow;
+   env.cursor = slow->end();
+-  BinaryOp* slow_instr =
+-      env.emitInstr<BinaryOp>(
+-          BinaryOpKind::kSubscript,
+-          container,
+-          sub,
+-          frame,
+-          /* array_subscr_slow_path= */ true);
++  BinaryOp* slow_instr = env.emitInstr<BinaryOp>(
++      BinaryOpKind::kSubscript,
++      container,
++      sub,
++      frame,
++      /* array_subscr_slow_path= */ true);
+   Register* slow_result = slow_instr->output();
+   env.emit<Branch>(done);
+ 
+@@ -1033,23 +1031,20 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
+   if (op == BinaryOpKind::kPower && rhs->isA(TLongExact) &&
+       rhs->type().hasObjectSpec()) {
+     int overflow;
+-    long long_val = PyLong_AsLongAndOverflow(
+-        rhs->type().objectSpec(), &overflow);
++    long long_val =
++        PyLong_AsLongAndOverflow(rhs->type().objectSpec(), &overflow);
+     if (!overflow && long_val == 2) {
+       Register* guarded_left =
+           env.emit<GuardType>(TFloatExact, lhs, *instr->frameState());
+       env.emit<UseType>(guarded_left, TFloatExact);
+-      Register* unbox_left =
+-          env.emit<PrimitiveUnbox>(guarded_left, TCDouble);
++      Register* unbox_left = env.emit<PrimitiveUnbox>(guarded_left, TCDouble);
+       Register* result = env.emit<DoubleBinaryOp>(
+           BinaryOpKind::kMultiply, unbox_left, unbox_left);
+-      Register* max_double =
+-          env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
++      Register* max_double = env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+       Register* is_finite = env.emit<PrimitiveCompare>(
+           PrimitiveCompareOp::kLessThan, result, max_double);
+       env.emitInstr<Guard>(is_finite);
+-      return env.emit<PrimitiveBox>(
+-          result, TCDouble, *instr->frameState());
++      return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+     }
+   }
+ 
+@@ -1279,8 +1274,7 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
+             env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+         Register* result = env.emit<DoubleBinaryOp>(
+             BinaryOpKind::kMultiply, unbox_left, unbox_left);
+-        Register* max_double =
+-            env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
++        Register* max_double = env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+         Register* is_finite = env.emit<PrimitiveCompare>(
+             PrimitiveCompareOp::kLessThan, result, max_double);
+         env.emitInstr<Guard>(is_finite);
+@@ -2217,38 +2211,170 @@ bool isAdjacentUdfGuardChain(const VectorCall* guard, const VectorCall* load) {
+   return false;
+ }
+ 
+-Register* trySimplifyGuardedUdfDataLoad(Env& env, const VectorCall* instr) {
++bool isGuardedUdfScalarCall(const VectorCall* instr) {
++  const VectorCall* guard_call = guardedUdfScalarProducer(instr->arg(0));
++  return guard_call != nullptr && guard_call->flags() == CallFlags::None &&
++      guard_call->numArgs() == 1 &&
++      isExactUdfScalarHelper(
++             guard_call->func(),
++             reinterpret_cast<PyCFunction>(JITRT_UdfGuardDataHandle)) &&
++      isAdjacentUdfGuardChain(guard_call, instr);
++}
++
++void preserveUdfScalarHelperIdentities(Env& env, const VectorCall* instr) {
++  const VectorCall* guard_call = guardedUdfScalarProducer(instr->arg(0));
++  JIT_CHECK(guard_call != nullptr, "missing guarded scalar producer");
++  env.emit<UseType>(guard_call->func(), guard_call->func()->type());
++  env.emit<UseType>(instr->func(), instr->func()->type());
++}
++
++Register* trySimplifyGuardedUdfDataOperation(
++    Env& env,
++    const VectorCall* instr) {
+ #ifdef Py_GIL_DISABLED
+   // A separate thread could end the borrow after the Python guard returns but
+-  // before the native load.  Keep the checked Python call on free-threading
+-  // builds until the capability protocol has an atomic guard+load operation.
++  // before the native operation. Keep checked Python calls on free-threading
++  // builds until the capability protocol has an atomic guard+operation.
+   (void)env;
+   (void)instr;
+   return nullptr;
+ #endif
+-  if (instr->frameState() == nullptr ||
+-      instr->flags() != CallFlags::None || instr->numArgs() != 1 ||
+-      !isExactUdfScalarHelper(
+-          instr->func(), reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadF64))) {
++  if (instr->frameState() == nullptr || instr->flags() != CallFlags::None ||
++      instr->numArgs() < 1 || !isGuardedUdfScalarCall(instr)) {
+     return nullptr;
+   }
+ 
+-  const VectorCall* guard_call = guardedUdfScalarProducer(instr->arg(0));
+-  if (guard_call == nullptr || guard_call->flags() != CallFlags::None ||
+-      guard_call->numArgs() != 1 ||
+-      !isExactUdfScalarHelper(
+-          guard_call->func(),
+-          reinterpret_cast<PyCFunction>(JITRT_UdfGuardDataHandle)) ||
+-      !isAdjacentUdfGuardChain(guard_call, instr)) {
++  bool supported = false;
++  if (instr->numArgs() == 1) {
++    supported = isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataIsNull)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadBool)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadI32)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadI64)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadF32)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadF64)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreNull));
++  } else if (instr->numArgs() == 2) {
++    supported = isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreBool)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreI32)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreI64)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreF32)) ||
++        isExactUdfScalarHelper(
++                    instr->func(),
++                    reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreF64));
++  }
++  if (!supported) {
+     return nullptr;
+   }
+ 
+-  // Preserve the exact global identities on which the native lowering relies.
+-  // The primitive load consumes the checked guard result, never guard->arg(0).
+-  env.emit<UseType>(guard_call->func(), guard_call->func()->type());
+-  env.emit<UseType>(instr->func(), instr->func()->type());
+-  Register* value = env.emit<LoadUdfDataF64>(instr->arg(0));
+-  return env.emit<PrimitiveBox>(value, TCDouble, *instr->frameState());
++  preserveUdfScalarHelperIdentities(env, instr);
++  if (instr->numArgs() == 1) {
++    if (isExactUdfScalarHelper(
++            instr->func(),
++            reinterpret_cast<PyCFunction>(JITRT_UdfDataIsNull))) {
++      Register* value = env.emit<IsUdfDataNull>(instr->arg(0));
++      return env.emit<PrimitiveBoxBool>(value);
++    }
++    if (isExactUdfScalarHelper(
++            instr->func(),
++            reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadBool))) {
++      Register* value = env.emit<LoadUdfDataBool>(instr->arg(0));
++      return env.emit<PrimitiveBoxBool>(value);
++    }
++    if (isExactUdfScalarHelper(
++            instr->func(),
++            reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadI32))) {
++      Register* value = env.emit<LoadUdfDataI32>(instr->arg(0));
++      return env.emit<PrimitiveBox>(value, TCInt32, *instr->frameState());
++    }
++    if (isExactUdfScalarHelper(
++            instr->func(),
++            reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadI64))) {
++      Register* value = env.emit<LoadUdfDataI64>(instr->arg(0));
++      return env.emit<PrimitiveBox>(value, TCInt64, *instr->frameState());
++    }
++    if (isExactUdfScalarHelper(
++            instr->func(),
++            reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadF32))) {
++      Register* value = env.emit<LoadUdfDataF32>(instr->arg(0));
++      return env.emit<PrimitiveBox>(value, TCDouble, *instr->frameState());
++    }
++    if (isExactUdfScalarHelper(
++            instr->func(),
++            reinterpret_cast<PyCFunction>(JITRT_UdfDataLoadF64))) {
++      Register* value = env.emit<LoadUdfDataF64>(instr->arg(0));
++      return env.emit<PrimitiveBox>(value, TCDouble, *instr->frameState());
++    }
++    if (isExactUdfScalarHelper(
++            instr->func(),
++            reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreNull))) {
++      env.emit<StoreUdfDataNull>(instr->arg(0));
++      return env.emit<LoadConst>(TNoneType);
++    }
++    return nullptr;
++  }
++
++  if (instr->numArgs() != 2) {
++    return nullptr;
++  }
++  Register* boxed = instr->arg(1);
++  if (isExactUdfScalarHelper(
++          instr->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreBool))) {
++    Register* value = env.emit<PrimitiveUnbox>(boxed, TCBool);
++    env.emit<StoreUdfDataBool>(instr->arg(0), value);
++    return boxed;
++  }
++  if (isExactUdfScalarHelper(
++          instr->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreI32))) {
++    Register* value = env.emit<PrimitiveUnbox>(boxed, TCInt32);
++    env.emit<StoreUdfDataI32>(instr->arg(0), value);
++    return boxed;
++  }
++  if (isExactUdfScalarHelper(
++          instr->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreI64))) {
++    Register* value = env.emit<PrimitiveUnbox>(boxed, TCInt64);
++    env.emit<StoreUdfDataI64>(instr->arg(0), value);
++    return boxed;
++  }
++  if (isExactUdfScalarHelper(
++          instr->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreF32))) {
++    Register* value = env.emit<PrimitiveUnbox>(boxed, TCDouble);
++    env.emit<StoreUdfDataF32>(instr->arg(0), value);
++    return boxed;
++  }
++  if (isExactUdfScalarHelper(
++          instr->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfDataStoreF64))) {
++    Register* value = env.emit<PrimitiveUnbox>(boxed, TCDouble);
++    env.emit<StoreUdfDataF64>(instr->arg(0), value);
++    return boxed;
++  }
++  return nullptr;
+ }
+ 
+ Register* simplifyVectorCallStatic(Env& env, const VectorCall* instr) {
+@@ -2356,7 +2482,7 @@ std::optional<std::pair<Instr*, std::vector<Instr*>>> isVectorCallIfIsInstance(
+ }
+ 
+ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
+-  if (Register* result = trySimplifyGuardedUdfDataLoad(env, instr)) {
++  if (Register* result = trySimplifyGuardedUdfDataOperation(env, instr)) {
+     return result;
+   }
+   if (Register* result = simplifyVectorCallStatic(env, instr)) {
+diff --git a/cinderx/Jit/jit_rt.cpp b/cinderx/Jit/jit_rt.cpp
+index a31fcd8..15d84d0 100644
+--- a/cinderx/Jit/jit_rt.cpp
++++ b/cinderx/Jit/jit_rt.cpp
+@@ -39,6 +39,7 @@
+ #include <atomic>
+ #include <cmath>
+ #include <cstdint>
++#include <cstring>
+ #include <limits>
+ #include <memory>
+ #include <mutex>
+@@ -52,20 +53,38 @@
+ 
+ namespace {
+ 
+-constexpr const char* kUdfScalarSlotCapsuleName =
+-    "cinderjit._udf_scalar_slot_f64.v1";
++constexpr const char* kUdfScalarSlotCapsuleName = "cinderjit._udf_scalar_slot";
+ constexpr uint64_t kUdfScalarSlotMagic = 0x554446534c4f5431ULL;
+ constexpr uint64_t kUdfScalarSlotDeadMagic = 0x5544464445414431ULL;
+ 
++enum class UdfScalarType : uint8_t {
++  kBool,
++  kI32,
++  kI64,
++  kF32,
++  kF64,
++};
++
++union UdfScalarValue {
++  bool boolean;
++  int32_t i32;
++  int64_t i64;
++  float f32;
++  double f64;
++};
++
+ struct UdfScalarSlot {
+   uint64_t magic{kUdfScalarSlotMagic};
+   uint64_t owner_pid{0};
+   uint64_t generation{0};
+   mutable std::mutex mutex;
++  UdfScalarType type{UdfScalarType::kF64};
++  bool nullable{false};
+   bool borrowed{false};
+   bool released{false};
+   bool initialized{false};
+-  double value{0.0};
++  bool is_null{false};
++  UdfScalarValue value{};
+ };
+ 
+ std::atomic<uint64_t> g_udf_scalar_slot_generation{1};
+@@ -93,8 +112,7 @@ void udfScalarSlotCapsuleDestructor(PyObject* capsule) {
+ 
+ UdfScalarSlot* checkedUdfScalarSlot(PyObject* capsule) {
+   if (!PyCapsule_CheckExact(capsule)) {
+-    PyErr_SetString(
+-        PyExc_TypeError, "expected a CinderX float64 scalar-slot capsule");
++    PyErr_SetString(PyExc_TypeError, "expected a CinderX scalar-slot capsule");
+     return nullptr;
+   }
+ 
+@@ -159,11 +177,175 @@ bool requireInitializedUdfScalarSlot(UdfScalarSlot* slot) {
+   return true;
+ }
+ 
++bool requireUdfScalarType(UdfScalarSlot* slot, UdfScalarType expected) {
++  if (slot->type != expected) {
++    PyErr_SetString(PyExc_TypeError, "scalar-slot type mismatch");
++    return false;
++  }
++  return true;
++}
++
++bool requireNonNullUdfScalarSlot(UdfScalarSlot* slot) {
++  if (slot->is_null) {
++    PyErr_SetString(PyExc_TypeError, "scalar-slot value is null");
++    return false;
++  }
++  return true;
++}
++
++bool parseUdfScalarType(const char* name, UdfScalarType* result) {
++  if (std::strcmp(name, "bool") == 0) {
++    *result = UdfScalarType::kBool;
++  } else if (std::strcmp(name, "int32") == 0) {
++    *result = UdfScalarType::kI32;
++  } else if (std::strcmp(name, "int64") == 0) {
++    *result = UdfScalarType::kI64;
++  } else if (std::strcmp(name, "float32") == 0) {
++    *result = UdfScalarType::kF32;
++  } else if (std::strcmp(name, "float64") == 0) {
++    *result = UdfScalarType::kF64;
++  } else {
++    PyErr_SetString(PyExc_ValueError, "unsupported scalar-slot type");
++    return false;
++  }
++  return true;
++}
++
++bool setUdfScalarValue(
++    UdfScalarSlot* slot,
++    PyObject* value,
++    UdfScalarType expected) {
++  if (!requireBorrowedUdfScalarSlot(slot) ||
++      !requireUdfScalarType(slot, expected)) {
++    return false;
++  }
++  if (value == Py_None) {
++    if (!slot->nullable) {
++      PyErr_SetString(PyExc_TypeError, "non-nullable scalar slot rejects None");
++      return false;
++    }
++    slot->initialized = true;
++    slot->is_null = true;
++    slot->value = {};
++    return true;
++  }
++
++  switch (expected) {
++    case UdfScalarType::kBool:
++      if (!PyBool_Check(value)) {
++        PyErr_SetString(
++            PyExc_TypeError, "bool scalar-slot value must be an exact bool");
++        return false;
++      }
++      slot->value.boolean = value == Py_True;
++      break;
++    case UdfScalarType::kI32:
++    case UdfScalarType::kI64: {
++      if (!PyLong_CheckExact(value)) {
++        PyErr_SetString(
++            PyExc_TypeError, "integer scalar-slot value must be an exact int");
++        return false;
++      }
++      long long converted = PyLong_AsLongLong(value);
++      if (converted == -1 && PyErr_Occurred()) {
++        return false;
++      }
++      if (expected == UdfScalarType::kI32) {
++        if (converted < std::numeric_limits<int32_t>::min() ||
++            converted > std::numeric_limits<int32_t>::max()) {
++          PyErr_SetString(
++              PyExc_OverflowError, "int32 scalar value out of range");
++          return false;
++        }
++        slot->value.i32 = static_cast<int32_t>(converted);
++      } else {
++        slot->value.i64 = static_cast<int64_t>(converted);
++      }
++      break;
++    }
++    case UdfScalarType::kF32:
++    case UdfScalarType::kF64: {
++      if (!PyFloat_CheckExact(value)) {
++        PyErr_SetString(
++            PyExc_TypeError,
++            "floating scalar-slot value must be an exact float");
++        return false;
++      }
++      double converted = PyFloat_AS_DOUBLE(value);
++      if (expected == UdfScalarType::kF32) {
++        if (std::isfinite(converted) &&
++            std::fabs(converted) > std::numeric_limits<float>::max()) {
++          PyErr_SetString(
++              PyExc_OverflowError, "float32 scalar value out of range");
++          return false;
++        }
++        slot->value.f32 = static_cast<float>(converted);
++      } else {
++        slot->value.f64 = converted;
++      }
++      break;
++    }
++  }
++  slot->initialized = true;
++  slot->is_null = false;
++  return true;
++}
++
++template <typename Result, typename Reader>
++Result readUdfScalarUnchecked(
++    PyObject* capsule,
++    UdfScalarType expected,
++    Reader reader) {
++  std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
++  auto it = g_udf_scalar_slots.find(capsule);
++  JIT_CHECK(it != g_udf_scalar_slots.end(), "guarded scalar slot disappeared");
++  const UdfScalarSlot* slot = it->second.get();
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  JIT_CHECK(
++      slot->magic == kUdfScalarSlotMagic && !slot->released && slot->borrowed &&
++          slot->initialized && !slot->is_null && slot->type == expected &&
++          slot->owner_pid == udfScalarSlotProcessId(),
++      "guarded scalar slot became invalid before data load");
++  return reader(slot->value);
++}
++
++template <typename Value, typename Writer>
++void storeUdfScalarUnchecked(
++    PyObject* capsule,
++    UdfScalarType expected,
++    Value value,
++    Writer writer) {
++  std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
++  auto it = g_udf_scalar_slots.find(capsule);
++  JIT_CHECK(it != g_udf_scalar_slots.end(), "guarded scalar slot disappeared");
++  UdfScalarSlot* slot = it->second.get();
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  JIT_CHECK(
++      slot->magic == kUdfScalarSlotMagic && !slot->released && slot->borrowed &&
++          slot->type == expected && slot->owner_pid == udfScalarSlotProcessId(),
++      "guarded scalar slot became invalid before data store");
++  writer(slot->value, value);
++  slot->initialized = true;
++  slot->is_null = false;
++}
++
+ } // namespace
+ 
+-PyObject* JITRT_UdfCreateScalarSlot(PyObject*, PyObject*) {
++PyObject* JITRT_UdfCreateScalarSlot(PyObject*, PyObject* args) {
++  const char* type_name;
++  int nullable;
++  if (!PyArg_ParseTuple(
++          args, "sp:_udf_create_scalar_slot", &type_name, &nullable)) {
++    return nullptr;
++  }
++  UdfScalarType scalar_type;
++  if (!parseUdfScalarType(type_name, &scalar_type)) {
++    return nullptr;
++  }
+   auto slot = std::make_unique<UdfScalarSlot>();
+   slot->owner_pid = udfScalarSlotProcessId();
++  slot->type = scalar_type;
++  slot->nullable = nullable != 0;
+   slot->generation =
+       g_udf_scalar_slot_generation.fetch_add(1, std::memory_order_relaxed);
+   if (slot->generation == 0) {
+@@ -176,8 +358,8 @@ PyObject* JITRT_UdfCreateScalarSlot(PyObject*, PyObject*) {
+   if (capsule == nullptr) {
+     return nullptr;
+   }
+-  if (PyCapsule_SetContext(
+-          capsule, reinterpret_cast<void*>(slot->generation)) < 0) {
++  if (PyCapsule_SetContext(capsule, reinterpret_cast<void*>(slot->generation)) <
++      0) {
+     Py_DECREF(capsule);
+     return nullptr;
+   }
+@@ -200,16 +382,9 @@ PyObject* JITRT_UdfSetScalarSlot(PyObject*, PyObject* args) {
+     return nullptr;
+   }
+   std::lock_guard<std::mutex> lock{slot->mutex};
+-  if (!requireBorrowedUdfScalarSlot(slot)) {
++  if (!setUdfScalarValue(slot, value, slot->type)) {
+     return nullptr;
+   }
+-  if (!PyFloat_CheckExact(value)) {
+-    PyErr_SetString(
+-        PyExc_TypeError, "scalar-slot value must be an exact float");
+-    return nullptr;
+-  }
+-  slot->value = PyFloat_AS_DOUBLE(value);
+-  slot->initialized = true;
+   Py_RETURN_NONE;
+ }
+ 
+@@ -229,7 +404,8 @@ PyObject* JITRT_UdfBeginScalarSlotBorrow(PyObject*, PyObject* capsule) {
+   }
+   slot->borrowed = true;
+   slot->initialized = false;
+-  slot->value = 0.0;
++  slot->is_null = false;
++  slot->value = {};
+   Py_RETURN_NONE;
+ }
+ 
+@@ -248,7 +424,8 @@ PyObject* JITRT_UdfEndScalarSlotBorrow(PyObject*, PyObject* capsule) {
+   }
+   slot->borrowed = false;
+   slot->initialized = false;
+-  slot->value = 0.0;
++  slot->is_null = false;
++  slot->value = {};
+   Py_RETURN_NONE;
+ }
+ 
+@@ -269,7 +446,8 @@ PyObject* JITRT_UdfReleaseScalarSlot(PyObject*, PyObject* capsule) {
+   }
+   slot->released = true;
+   slot->initialized = false;
+-  slot->value = 0.0;
++  slot->is_null = false;
++  slot->value = {};
+   Py_RETURN_NONE;
+ }
+ 
+@@ -279,14 +457,14 @@ PyObject* JITRT_UdfGuardDataHandle(PyObject*, PyObject* capsule) {
+     return nullptr;
+   }
+   std::lock_guard<std::mutex> lock{slot->mutex};
+-  if (!requireInitializedUdfScalarSlot(slot)) {
++  if (!requireBorrowedUdfScalarSlot(slot)) {
+     return nullptr;
+   }
+   Py_INCREF(capsule);
+   return capsule;
+ }
+ 
+-PyObject* JITRT_UdfDataLoadF64(PyObject*, PyObject* capsule) {
++PyObject* JITRT_UdfDataIsNull(PyObject*, PyObject* capsule) {
+   UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
+   if (slot == nullptr) {
+     return nullptr;
+@@ -295,13 +473,142 @@ PyObject* JITRT_UdfDataLoadF64(PyObject*, PyObject* capsule) {
+   if (!requireInitializedUdfScalarSlot(slot)) {
+     return nullptr;
+   }
+-  return PyFloat_FromDouble(slot->value);
++  return PyBool_FromLong(slot->is_null);
+ }
+ 
+-double JITRT_LoadUdfDataF64Unchecked(PyObject* capsule) {
+-  // This helper is never exposed to Python.  The HIR rewrite passes the result
+-  // of the exact guard call, not the original slot argument.  With that guard
+-  // and the active borrow, release and mutation cannot invalidate this read.
++PyObject* JITRT_UdfDataLoadBool(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  if (!requireInitializedUdfScalarSlot(slot) ||
++      !requireNonNullUdfScalarSlot(slot) ||
++      !requireUdfScalarType(slot, UdfScalarType::kBool)) {
++    return nullptr;
++  }
++  return PyBool_FromLong(slot->value.boolean);
++}
++
++PyObject* JITRT_UdfDataLoadI32(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  if (!requireInitializedUdfScalarSlot(slot) ||
++      !requireNonNullUdfScalarSlot(slot) ||
++      !requireUdfScalarType(slot, UdfScalarType::kI32)) {
++    return nullptr;
++  }
++  return PyLong_FromLong(slot->value.i32);
++}
++
++PyObject* JITRT_UdfDataLoadI64(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  if (!requireInitializedUdfScalarSlot(slot) ||
++      !requireNonNullUdfScalarSlot(slot) ||
++      !requireUdfScalarType(slot, UdfScalarType::kI64)) {
++    return nullptr;
++  }
++  return PyLong_FromLongLong(slot->value.i64);
++}
++
++PyObject* JITRT_UdfDataLoadF32(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  if (!requireInitializedUdfScalarSlot(slot) ||
++      !requireNonNullUdfScalarSlot(slot) ||
++      !requireUdfScalarType(slot, UdfScalarType::kF32)) {
++    return nullptr;
++  }
++  return PyFloat_FromDouble(slot->value.f32);
++}
++
++PyObject* JITRT_UdfDataLoadF64(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  if (!requireInitializedUdfScalarSlot(slot) ||
++      !requireNonNullUdfScalarSlot(slot) ||
++      !requireUdfScalarType(slot, UdfScalarType::kF64)) {
++    return nullptr;
++  }
++  return PyFloat_FromDouble(slot->value.f64);
++}
++
++namespace {
++
++PyObject* storeUdfScalarValue(PyObject* args, UdfScalarType expected) {
++  PyObject* capsule;
++  PyObject* value;
++  if (!PyArg_ParseTuple(args, "OO", &capsule, &value)) {
++    return nullptr;
++  }
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock{slot->mutex};
++  if (!setUdfScalarValue(slot, value, expected)) {
++    return nullptr;
++  }
++  Py_INCREF(value);
++  return value;
++}
++
++} // namespace
++
++PyObject* JITRT_UdfDataStoreBool(PyObject*, PyObject* args) {
++  return storeUdfScalarValue(args, UdfScalarType::kBool);
++}
++
++PyObject* JITRT_UdfDataStoreI32(PyObject*, PyObject* args) {
++  return storeUdfScalarValue(args, UdfScalarType::kI32);
++}
++
++PyObject* JITRT_UdfDataStoreI64(PyObject*, PyObject* args) {
++  return storeUdfScalarValue(args, UdfScalarType::kI64);
++}
++
++PyObject* JITRT_UdfDataStoreF32(PyObject*, PyObject* args) {
++  return storeUdfScalarValue(args, UdfScalarType::kF32);
++}
++
++PyObject* JITRT_UdfDataStoreF64(PyObject*, PyObject* args) {
++  return storeUdfScalarValue(args, UdfScalarType::kF64);
++}
++
++PyObject* JITRT_UdfDataStoreNull(PyObject*, PyObject* capsule) {
++  UdfScalarSlot* slot = checkedUdfScalarSlot(capsule);
++  if (slot == nullptr) {
++    return nullptr;
++  }
++  std::lock_guard<std::mutex> lock{slot->mutex};
++  if (!requireBorrowedUdfScalarSlot(slot)) {
++    return nullptr;
++  }
++  if (!slot->nullable) {
++    PyErr_SetString(
++        PyExc_TypeError, "non-nullable scalar slot rejects null store");
++    return nullptr;
++  }
++  slot->initialized = true;
++  slot->is_null = true;
++  slot->value = {};
++  Py_RETURN_NONE;
++}
++
++bool JITRT_IsUdfDataNullUnchecked(PyObject* capsule) {
+   std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
+   auto it = g_udf_scalar_slots.find(capsule);
+   JIT_CHECK(it != g_udf_scalar_slots.end(), "guarded scalar slot disappeared");
+@@ -310,8 +617,100 @@ double JITRT_LoadUdfDataF64Unchecked(PyObject* capsule) {
+   JIT_CHECK(
+       slot->magic == kUdfScalarSlotMagic && !slot->released && slot->borrowed &&
+           slot->initialized && slot->owner_pid == udfScalarSlotProcessId(),
+-      "guarded scalar slot became invalid before data load");
+-  return slot->value;
++      "guarded scalar slot became invalid before null test");
++  return slot->is_null;
++}
++
++bool JITRT_LoadUdfDataBoolUnchecked(PyObject* capsule) {
++  return readUdfScalarUnchecked<bool>(
++      capsule, UdfScalarType::kBool, [](const UdfScalarValue& value) {
++        return value.boolean;
++      });
++}
++
++int32_t JITRT_LoadUdfDataI32Unchecked(PyObject* capsule) {
++  return readUdfScalarUnchecked<int32_t>(
++      capsule, UdfScalarType::kI32, [](const UdfScalarValue& value) {
++        return value.i32;
++      });
++}
++
++int64_t JITRT_LoadUdfDataI64Unchecked(PyObject* capsule) {
++  return readUdfScalarUnchecked<int64_t>(
++      capsule, UdfScalarType::kI64, [](const UdfScalarValue& value) {
++        return value.i64;
++      });
++}
++
++double JITRT_LoadUdfDataF32Unchecked(PyObject* capsule) {
++  return readUdfScalarUnchecked<double>(
++      capsule, UdfScalarType::kF32, [](const UdfScalarValue& value) {
++        return static_cast<double>(value.f32);
++      });
++}
++
++double JITRT_LoadUdfDataF64Unchecked(PyObject* capsule) {
++  return readUdfScalarUnchecked<double>(
++      capsule, UdfScalarType::kF64, [](const UdfScalarValue& value) {
++        return value.f64;
++      });
++}
++
++void JITRT_StoreUdfDataBoolUnchecked(PyObject* capsule, bool value) {
++  storeUdfScalarUnchecked(
++      capsule,
++      UdfScalarType::kBool,
++      value,
++      [](UdfScalarValue& target, bool source) { target.boolean = source; });
++}
++
++void JITRT_StoreUdfDataI32Unchecked(PyObject* capsule, int32_t value) {
++  storeUdfScalarUnchecked(
++      capsule,
++      UdfScalarType::kI32,
++      value,
++      [](UdfScalarValue& target, int32_t source) { target.i32 = source; });
++}
++
++void JITRT_StoreUdfDataI64Unchecked(PyObject* capsule, int64_t value) {
++  storeUdfScalarUnchecked(
++      capsule,
++      UdfScalarType::kI64,
++      value,
++      [](UdfScalarValue& target, int64_t source) { target.i64 = source; });
++}
++
++void JITRT_StoreUdfDataF32Unchecked(PyObject* capsule, double value) {
++  storeUdfScalarUnchecked(
++      capsule,
++      UdfScalarType::kF32,
++      value,
++      [](UdfScalarValue& target, double source) {
++        target.f32 = static_cast<float>(source);
++      });
++}
++
++void JITRT_StoreUdfDataF64Unchecked(PyObject* capsule, double value) {
++  storeUdfScalarUnchecked(
++      capsule,
++      UdfScalarType::kF64,
++      value,
++      [](UdfScalarValue& target, double source) { target.f64 = source; });
++}
++
++void JITRT_StoreUdfDataNullUnchecked(PyObject* capsule) {
++  std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
++  auto it = g_udf_scalar_slots.find(capsule);
++  JIT_CHECK(it != g_udf_scalar_slots.end(), "guarded scalar slot disappeared");
++  UdfScalarSlot* slot = it->second.get();
++  std::lock_guard<std::mutex> slot_lock{slot->mutex};
++  JIT_CHECK(
++      slot->magic == kUdfScalarSlotMagic && !slot->released && slot->borrowed &&
++          slot->nullable && slot->owner_pid == udfScalarSlotProcessId(),
++      "guarded scalar slot became invalid before null store");
++  slot->initialized = true;
++  slot->is_null = true;
++  slot->value = {};
+ }
+ 
+ // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
+@@ -2683,11 +3082,9 @@ int JITRT_StateStackPush(
+       return -1;
+     }
+     int32_t new_cap = state->tree_iter_stack_capacity * 2;
+-    auto* new_stack = static_cast<jit::TreeIterStackEntry*>(
+-        std::realloc(
+-            state->tree_iter_stack,
+-            static_cast<std::size_t>(new_cap) *
+-                sizeof(jit::TreeIterStackEntry)));
++    auto* new_stack = static_cast<jit::TreeIterStackEntry*>(std::realloc(
++        state->tree_iter_stack,
++        static_cast<std::size_t>(new_cap) * sizeof(jit::TreeIterStackEntry)));
+     if (new_stack == nullptr) {
+       PyErr_NoMemory();
+       return -1;
+@@ -2733,9 +3130,7 @@ int32_t JITRT_LoadStackTop(jit::GenDataFooter* footer) {
+   return state->tree_iter_stack_top;
+ }
+ 
+-int JITRT_CheckTreeIterChildEntry(
+-    jit::GenDataFooter* footer,
+-    PyObject* child) {
++int JITRT_CheckTreeIterChildEntry(jit::GenDataFooter* footer, PyObject* child) {
+   jit::TreeIterState* state = footer->tree_iter_state;
+   if (state == nullptr) {
+     PyErr_SetString(PyExc_SystemError, "TreeIter state is not allocated");
+@@ -2793,8 +3188,7 @@ int JITRT_CheckTreeIterChildEntry(
+ 
+   if (jit::treeIterActivePathContains(state, child)) {
+     PyErr_SetString(
+-        PyExc_RecursionError,
+-        "cycle detected while traversing tree iterator");
++        PyExc_RecursionError, "cycle detected while traversing tree iterator");
+     return -1;
+   }
+ 
+diff --git a/cinderx/Jit/jit_rt.h b/cinderx/Jit/jit_rt.h
+index 2454245..af3c5ce 100644
+--- a/cinderx/Jit/jit_rt.h
++++ b/cinderx/Jit/jit_rt.h
+@@ -28,18 +28,39 @@ struct JITRT_StaticCallFPReturn {
+   double xmm1;
+ };
+ 
+-// Process-local scalar-slot helpers used by the python-udf-jit vertical slice.
+-// The public helpers have normal Python-call semantics.  The unchecked load is
+-// emitted only after an exact _udf_guard_data_handle() call has validated the
+-// same capsule and established an active borrow.
+-PyObject* JITRT_UdfCreateScalarSlot(PyObject* module, PyObject* unused);
++// Process-local scalar-slot helpers used by python-udf-jit. Public helpers
++// retain normal Python-call semantics. Unchecked loads and stores are emitted
++// only after the exact guard has established an active process-local borrow.
++PyObject* JITRT_UdfCreateScalarSlot(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfSetScalarSlot(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfBeginScalarSlotBorrow(PyObject* module, PyObject* capsule);
+ PyObject* JITRT_UdfEndScalarSlotBorrow(PyObject* module, PyObject* capsule);
+ PyObject* JITRT_UdfReleaseScalarSlot(PyObject* module, PyObject* capsule);
+ PyObject* JITRT_UdfGuardDataHandle(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfDataIsNull(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfDataLoadBool(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfDataLoadI32(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfDataLoadI64(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfDataLoadF32(PyObject* module, PyObject* capsule);
+ PyObject* JITRT_UdfDataLoadF64(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfDataStoreBool(PyObject* module, PyObject* args);
++PyObject* JITRT_UdfDataStoreI32(PyObject* module, PyObject* args);
++PyObject* JITRT_UdfDataStoreI64(PyObject* module, PyObject* args);
++PyObject* JITRT_UdfDataStoreF32(PyObject* module, PyObject* args);
++PyObject* JITRT_UdfDataStoreF64(PyObject* module, PyObject* args);
++PyObject* JITRT_UdfDataStoreNull(PyObject* module, PyObject* capsule);
++bool JITRT_IsUdfDataNullUnchecked(PyObject* capsule);
++bool JITRT_LoadUdfDataBoolUnchecked(PyObject* capsule);
++int32_t JITRT_LoadUdfDataI32Unchecked(PyObject* capsule);
++int64_t JITRT_LoadUdfDataI64Unchecked(PyObject* capsule);
++double JITRT_LoadUdfDataF32Unchecked(PyObject* capsule);
+ double JITRT_LoadUdfDataF64Unchecked(PyObject* capsule);
++void JITRT_StoreUdfDataBoolUnchecked(PyObject* capsule, bool value);
++void JITRT_StoreUdfDataI32Unchecked(PyObject* capsule, int32_t value);
++void JITRT_StoreUdfDataI64Unchecked(PyObject* capsule, int64_t value);
++void JITRT_StoreUdfDataF32Unchecked(PyObject* capsule, double value);
++void JITRT_StoreUdfDataF64Unchecked(PyObject* capsule, double value);
++void JITRT_StoreUdfDataNullUnchecked(PyObject* capsule);
+ 
+ PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Debug(
+     PyFunctionObject* func,
+@@ -501,9 +522,7 @@ int JITRT_FastPyObjectRichCompareBoolLessThanEqual(PyObject* v, PyObject* w);
+ int JITRT_FastPyObjectRichCompareBoolEqual(PyObject* v, PyObject* w);
+ int JITRT_FastPyObjectRichCompareBoolNotEqual(PyObject* v, PyObject* w);
+ int JITRT_FastPyObjectRichCompareBoolGreaterThan(PyObject* v, PyObject* w);
+-int JITRT_FastPyObjectRichCompareBoolGreaterThanEqual(
+-    PyObject* v,
+-    PyObject* w);
++int JITRT_FastPyObjectRichCompareBoolGreaterThanEqual(PyObject* v, PyObject* w);
+ int JITRT_FastPyObjectRichCompareBool(PyObject* v, PyObject* w, int op);
+ int JITRT_RichCompareBoolLessThanEqual(PyObject* v, PyObject* w);
+ #endif
+@@ -643,9 +662,7 @@ int32_t JITRT_LoadStackTop(jit::GenDataFooter* footer);
+ 
+ // Check child exactness, active-path, and depth budget before entering child.
+ // Returns 0 on success; sets an exception and returns -1 on failure.
+-int JITRT_CheckTreeIterChildEntry(
+-    jit::GenDataFooter* footer,
+-    PyObject* child);
++int JITRT_CheckTreeIterChildEntry(jit::GenDataFooter* footer, PyObject* child);
+ 
+ // Record child entry depth.
+ void JITRT_TreeIterEnterChild(jit::GenDataFooter* footer, PyObject* child);
+diff --git a/cinderx/Jit/lir/generator.cpp b/cinderx/Jit/lir/generator.cpp
+index 2e145d8..7b35ace 100644
+--- a/cinderx/Jit/lir/generator.cpp
++++ b/cinderx/Jit/lir/generator.cpp
+@@ -1017,14 +1017,16 @@ void LIRGenerator::GenerateExitBlocks() {
+       nullptr,
+       OutInd{
+           gen_ptr, static_cast<int32_t>(offsetof(PyGenObject, gi_frame_state))},
+-      Imm{static_cast<uint64_t>(
++      Imm {
++        static_cast<uint64_t>(
+ #if PY_VERSION_HEX >= 0x030F0000
+-              FRAME_CLEARED
++            FRAME_CLEARED
+ #else
+-              FRAME_COMPLETED
++            FRAME_COMPLETED
+ #endif
+-              ),
+-          DataType::k8bit});
++            ),
++            DataType::k8bit
++      });
+   static_assert(sizeof(PyGenObject::gi_frame_state) == 1);
+   gi_store->output()->setDataType(DataType::k8bit);
+ 
+@@ -3100,8 +3102,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+         }
+         std::size_t osr_id =
+             env_->code_rt->addOSRMetadata(OSRMetadata{*skeleton});
+-        Instruction* lir =
+-            bbb.appendInstr(Instruction::kOSREntry, Imm{osr_id});
++        Instruction* lir = bbb.appendInstr(Instruction::kOSREntry, Imm{osr_id});
+         JIT_CHECK(
+             env_->asm_tstate != nullptr && env_->asm_func != nullptr &&
+                 env_->asm_interpreter_frame != nullptr,
+@@ -3489,6 +3490,46 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+         bbb.appendInstr(dest, Instruction::kLea, Ind{object, offset});
+         break;
+       }
++      case Opcode::kIsUdfDataNull: {
++        auto instr = static_cast<const IsUdfDataNull*>(&i);
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_IsUdfDataNullUnchecked,
++            instr->GetOperand(0));
++        break;
++      }
++      case Opcode::kLoadUdfDataBool: {
++        auto instr = static_cast<const LoadUdfDataBool*>(&i);
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_LoadUdfDataBoolUnchecked,
++            instr->GetOperand(0));
++        break;
++      }
++      case Opcode::kLoadUdfDataI32: {
++        auto instr = static_cast<const LoadUdfDataI32*>(&i);
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_LoadUdfDataI32Unchecked,
++            instr->GetOperand(0));
++        break;
++      }
++      case Opcode::kLoadUdfDataI64: {
++        auto instr = static_cast<const LoadUdfDataI64*>(&i);
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_LoadUdfDataI64Unchecked,
++            instr->GetOperand(0));
++        break;
++      }
++      case Opcode::kLoadUdfDataF32: {
++        auto instr = static_cast<const LoadUdfDataF32*>(&i);
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_LoadUdfDataF32Unchecked,
++            instr->GetOperand(0));
++        break;
++      }
+       case Opcode::kLoadUdfDataF64: {
+         auto instr = static_cast<const LoadUdfDataF64*>(&i);
+         bbb.appendCallInstruction(
+@@ -3497,6 +3538,52 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+             instr->GetOperand(0));
+         break;
+       }
++      case Opcode::kStoreUdfDataBool: {
++        auto instr = static_cast<const StoreUdfDataBool*>(&i);
++        bbb.appendInvokeInstruction(
++            JITRT_StoreUdfDataBoolUnchecked,
++            instr->GetOperand(0),
++            instr->GetOperand(1));
++        break;
++      }
++      case Opcode::kStoreUdfDataI32: {
++        auto instr = static_cast<const StoreUdfDataI32*>(&i);
++        bbb.appendInvokeInstruction(
++            JITRT_StoreUdfDataI32Unchecked,
++            instr->GetOperand(0),
++            instr->GetOperand(1));
++        break;
++      }
++      case Opcode::kStoreUdfDataI64: {
++        auto instr = static_cast<const StoreUdfDataI64*>(&i);
++        bbb.appendInvokeInstruction(
++            JITRT_StoreUdfDataI64Unchecked,
++            instr->GetOperand(0),
++            instr->GetOperand(1));
++        break;
++      }
++      case Opcode::kStoreUdfDataF32: {
++        auto instr = static_cast<const StoreUdfDataF32*>(&i);
++        bbb.appendInvokeInstruction(
++            JITRT_StoreUdfDataF32Unchecked,
++            instr->GetOperand(0),
++            instr->GetOperand(1));
++        break;
++      }
++      case Opcode::kStoreUdfDataF64: {
++        auto instr = static_cast<const StoreUdfDataF64*>(&i);
++        bbb.appendInvokeInstruction(
++            JITRT_StoreUdfDataF64Unchecked,
++            instr->GetOperand(0),
++            instr->GetOperand(1));
++        break;
++      }
++      case Opcode::kStoreUdfDataNull: {
++        auto instr = static_cast<const StoreUdfDataNull*>(&i);
++        bbb.appendInvokeInstruction(
++            JITRT_StoreUdfDataNullUnchecked, instr->GetOperand(0));
++        break;
++      }
+ 
+       case Opcode::kStoreField: {
+         auto instr = static_cast<const StoreField*>(&i);
+@@ -3567,14 +3654,15 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+         auto instr = static_cast<const MakeTuple*>(&i);
+         Instruction* tuple =
+             bbb.appendInstr(instr->output(), Instruction::kVarArgCall);
+-        tuple->addOperands(
+-            Imm{reinterpret_cast<uint64_t>(
++        tuple->addOperands(Imm {
++          reinterpret_cast<uint64_t>(
+ #if PY_VERSION_HEX >= 0x030F0000
+-                PyTuple_FromArray
++              PyTuple_FromArray
+ #else
+                 _PyTuple_FromArray
+ #endif
+-                )});
++          )
++        });
+         for (size_t ix = 0; ix < instr->NumOperands(); ix++) {
+           tuple->addOperands(VReg{bbb.getDefInstr(instr->GetOperand(ix))});
+         }
+@@ -4059,9 +4147,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+         Instruction* caller_frame = bbb.appendInstr(
+             OutVReg{},
+             Instruction::kLea,
+-            Stk{PhyLocation(
+-                static_cast<int32_t>(
+-                    frameOffsetBefore(instr) + sizeof(FrameHeader)))});
++            Stk{PhyLocation(static_cast<int32_t>(
++                frameOffsetBefore(instr) + sizeof(FrameHeader)))});
+ 
+         // There is already an interpreter frame for the caller function.
+         Instruction* callee_frame = getInlinedFrame(bbb, instr);
+@@ -4144,11 +4231,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+         Instruction* localsplus = bbb.appendInstr(
+             OutVReg{},
+             Instruction::kLea,
+-            Stk{PhyLocation(
+-                static_cast<int32_t>(
+-                    frameOffsetOf(instr) +
+-                    offsetof(_PyInterpreterFrame, localsplus) +
+-                    code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
++            Stk{PhyLocation(static_cast<int32_t>(
++                frameOffsetOf(instr) +
++                offsetof(_PyInterpreterFrame, localsplus) +
++                code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
+ 
+         bbb.appendInstr(
+             OutInd{callee_frame, offsetof(_PyInterpreterFrame, stackpointer)},
+@@ -4292,10 +4378,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+         Instruction* caller_frame = bbb.appendInstr(
+             OutVReg{},
+             Instruction::kLea,
+-            Stk{PhyLocation(
+-                static_cast<int32_t>(
+-                    frameOffsetBefore(instr.matchingBegin()) +
+-                    sizeof(FrameHeader)))});
++            Stk{PhyLocation(static_cast<int32_t>(
++                frameOffsetBefore(instr.matchingBegin()) +
++                sizeof(FrameHeader)))});
+ #if PY_VERSION_HEX >= 0x030D0000
+         bbb.appendInstr(
+             OutInd{env_->asm_tstate, offsetof(PyThreadState, current_frame)},
+@@ -5238,11 +5323,10 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
+     Instruction* localsplus = bbb.appendInstr(
+         OutVReg{},
+         Instruction::kLea,
+-        Stk{PhyLocation(
+-            static_cast<int32_t>(
+-                -fh_size + sizeof(jit::FrameHeader) +
+-                offsetof(_PyInterpreterFrame, localsplus) +
+-                func_->code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
++        Stk{PhyLocation(static_cast<int32_t>(
++            -fh_size + sizeof(jit::FrameHeader) +
++            offsetof(_PyInterpreterFrame, localsplus) +
++            func_->code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
+     bbb.appendInstr(
+         OutInd{frame, offsetof(_PyInterpreterFrame, stackpointer)},
+         Instruction::kMove,
+@@ -5268,10 +5352,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
+ 
+     bbb.annotateNext("Set _PyInterpreterFrame::visited");
+     bbb.appendInstr(
+-        OutInd{
+-            frame,
+-            kInterpreterFrameVisitedOffset,
+-            OperandBase::k8bit},
++        OutInd{frame, kInterpreterFrameVisitedOffset, OperandBase::k8bit},
+         Instruction::kMove,
+         Imm{0, OperandBase::k8bit});
+ #endif
+@@ -5329,8 +5410,8 @@ void GenerateDeoptTrampolineBlocks(
+ #elif defined(CINDER_AARCH64)
+   constexpr int kStage3SavedGPRegs = 28;
+   constexpr int kStage2SavedRegs = 2; // x28 + fp
+-  constexpr int kAArch64ExtraGPSlots = codegen::NUM_GP_REGS -
+-      kStage3SavedGPRegs;
++  constexpr int kAArch64ExtraGPSlots =
++      codegen::NUM_GP_REGS - kStage3SavedGPRegs;
+   static_assert(kAArch64ExtraGPSlots == 4); // x28, fp, lr, xzr
+ #endif
+ 
+diff --git a/cinderx/Jit/pyjit.cpp b/cinderx/Jit/pyjit.cpp
+index 50e17e2..f863437 100644
+--- a/cinderx/Jit/pyjit.cpp
++++ b/cinderx/Jit/pyjit.cpp
+@@ -1258,8 +1258,7 @@ FlagProcessor initFlagProcessor() {
+       "osr-backedge-threshold",
+       "CINDERX_OSR_BACKEDGE_THRESHOLD",
+       [](int val) {
+-        getMutableConfig().osr_backedge_threshold =
+-            static_cast<uint32_t>(val);
++        getMutableConfig().osr_backedge_threshold = static_cast<uint32_t>(val);
+       },
+       "Set the per-backedge OSR trigger threshold");
+ 
+@@ -2485,7 +2484,9 @@ PyObject* disassemble(PyObject* /* self */, PyObject* func) {
+   Py_RETURN_NONE;
+ }
+ 
+-PyObject* test_parse_thread_state_prologue(PyObject* /* self */, PyObject* arg) {
++PyObject* test_parse_thread_state_prologue(
++    PyObject* /* self */,
++    PyObject* arg) {
+   Ref<> seq = Ref<>::steal(PySequence_Fast(
+       arg, "_test_parse_thread_state_prologue expects an iterable"));
+   if (seq == nullptr) {
+@@ -3470,8 +3471,8 @@ void restoreSysSetProfileAndSetTrace() {
+ PyMethodDef jit_methods[] = {
+     {"_udf_create_scalar_slot",
+      JITRT_UdfCreateScalarSlot,
+-     METH_NOARGS,
+-     PyDoc_STR("Create a process-local float64 scalar-slot capsule.")},
++     METH_VARARGS,
++     PyDoc_STR("Create a typed process-local scalar-slot capsule.")},
+     {"_udf_set_scalar_slot",
+      JITRT_UdfSetScalarSlot,
+      METH_VARARGS,
+@@ -3491,11 +3492,55 @@ PyMethodDef jit_methods[] = {
+     {"_udf_guard_data_handle",
+      JITRT_UdfGuardDataHandle,
+      METH_O,
+-     PyDoc_STR("Validate an initialized, actively borrowed scalar slot.")},
++     PyDoc_STR("Validate an actively borrowed scalar slot.")},
++    {"_udf_data_is_null",
++     JITRT_UdfDataIsNull,
++     METH_O,
++     PyDoc_STR("Test the null bit of a guarded scalar-slot capsule.")},
++    {"_udf_data_load_bool",
++     JITRT_UdfDataLoadBool,
++     METH_O,
++     PyDoc_STR("Load bool from a guarded scalar-slot capsule.")},
++    {"_udf_data_load_i32",
++     JITRT_UdfDataLoadI32,
++     METH_O,
++     PyDoc_STR("Load int32 from a guarded scalar-slot capsule.")},
++    {"_udf_data_load_i64",
++     JITRT_UdfDataLoadI64,
++     METH_O,
++     PyDoc_STR("Load int64 from a guarded scalar-slot capsule.")},
++    {"_udf_data_load_f32",
++     JITRT_UdfDataLoadF32,
++     METH_O,
++     PyDoc_STR("Load float32 from a guarded scalar-slot capsule.")},
+     {"_udf_data_load_f64",
+      JITRT_UdfDataLoadF64,
+      METH_O,
+      PyDoc_STR("Load float64 from a guarded scalar-slot capsule.")},
++    {"_udf_data_store_bool",
++     JITRT_UdfDataStoreBool,
++     METH_VARARGS,
++     PyDoc_STR("Store bool through a guarded scalar-slot capsule.")},
++    {"_udf_data_store_i32",
++     JITRT_UdfDataStoreI32,
++     METH_VARARGS,
++     PyDoc_STR("Store int32 through a guarded scalar-slot capsule.")},
++    {"_udf_data_store_i64",
++     JITRT_UdfDataStoreI64,
++     METH_VARARGS,
++     PyDoc_STR("Store int64 through a guarded scalar-slot capsule.")},
++    {"_udf_data_store_f32",
++     JITRT_UdfDataStoreF32,
++     METH_VARARGS,
++     PyDoc_STR("Store float32 through a guarded scalar-slot capsule.")},
++    {"_udf_data_store_f64",
++     JITRT_UdfDataStoreF64,
++     METH_VARARGS,
++     PyDoc_STR("Store float64 through a guarded scalar-slot capsule.")},
++    {"_udf_data_store_null",
++     JITRT_UdfDataStoreNull,
++     METH_O,
++     PyDoc_STR("Store null through a guarded nullable scalar slot.")},
+     {"disable",
+      reinterpret_cast<PyCFunction>(disable_jit),
+      METH_VARARGS | METH_KEYWORDS,
+@@ -3790,9 +3835,8 @@ PyModuleDef_Slot jit_slots[] = {
+ PyModuleDef jit_module = {
+     PyModuleDef_HEAD_INIT,
+     "cinderjit", /* m_name */
+-    PyDoc_STR(
+-        "Control the Cinder JIT compiler. Only available when the JIT "
+-        "has been enabled."),
++    PyDoc_STR("Control the Cinder JIT compiler. Only available when the JIT "
++              "has been enabled."),
+     0, /* m_size */
+     jit_methods, /* m_methods */
+     jit_slots, /* m_slots */
+diff --git a/cinderx/PythonLib/test_cinderx/test_udf_data_intrinsic.py b/cinderx/PythonLib/test_cinderx/test_udf_data_intrinsic.py
+index b8ce3d1..0b28d13 100644
+--- a/cinderx/PythonLib/test_cinderx/test_udf_data_intrinsic.py
++++ b/cinderx/PythonLib/test_cinderx/test_udf_data_intrinsic.py
+@@ -1,7 +1,8 @@
+-"""Tests for the guarded scalar-slot float64 CinderX intrinsic."""
++"""Tests for typed, nullable, guarded scalar-slot CinderX intrinsics."""
+ 
+ import math
+ import os
++import struct
+ import unittest
+ 
+ import cinderx.jit
+@@ -10,7 +11,18 @@ try:
+     from cinderjit import (
+         _udf_begin_scalar_slot_borrow,
+         _udf_create_scalar_slot,
++        _udf_data_is_null,
++        _udf_data_load_bool,
++        _udf_data_load_f32,
+         _udf_data_load_f64,
++        _udf_data_load_i32,
++        _udf_data_load_i64,
++        _udf_data_store_bool,
++        _udf_data_store_f32,
++        _udf_data_store_f64,
++        _udf_data_store_i32,
++        _udf_data_store_i64,
++        _udf_data_store_null,
+         _udf_end_scalar_slot_borrow,
+         _udf_guard_data_handle,
+         _udf_release_scalar_slot,
+@@ -20,173 +32,234 @@ except ImportError:
+     _udf_create_scalar_slot = None
+ 
+ 
++def copy_bool(source, target):
++    value = _udf_data_load_bool(_udf_guard_data_handle(source))
++    result = not value
++    return _udf_data_store_bool(_udf_guard_data_handle(target), result)
++
++
++def copy_i32(source, target):
++    value = _udf_data_load_i32(_udf_guard_data_handle(source))
++    result = value + 1 if value >= 0 else value - 1
++    return _udf_data_store_i32(_udf_guard_data_handle(target), result)
++
++
++def copy_i64(source, target):
++    value = _udf_data_load_i64(_udf_guard_data_handle(source))
++    result = value + 1 if value >= 0 else value - 1
++    return _udf_data_store_i64(_udf_guard_data_handle(target), result)
++
++
++def copy_f32(source, target):
++    value = _udf_data_load_f32(_udf_guard_data_handle(source))
++    result = value * 2.0 - 1.0
++    return _udf_data_store_f32(_udf_guard_data_handle(target), result)
++
++
++def copy_f64(source, target):
++    value = _udf_data_load_f64(_udf_guard_data_handle(source))
++    result = value * 2.0 - 1.0
++    return _udf_data_store_f64(_udf_guard_data_handle(target), result)
++
++
++def copy_nullable_i64(source, target):
++    if _udf_data_is_null(_udf_guard_data_handle(source)):
++        return _udf_data_store_null(_udf_guard_data_handle(target))
++    value = _udf_data_load_i64(_udf_guard_data_handle(source))
++    return _udf_data_store_i64(_udf_guard_data_handle(target), value)
++
++
+ @unittest.skipUnless(
+     cinderx.jit.is_enabled() and _udf_create_scalar_slot is not None,
+     "requires CinderX JIT scalar-slot helpers",
+ )
+ class UdfDataIntrinsicTests(unittest.TestCase):
+-    def setUp(self):
+-        self.slot = _udf_create_scalar_slot()
++    def make_slot(self, scalar_type, nullable=False):
++        slot = _udf_create_scalar_slot(scalar_type, nullable)
++        self.addCleanup(self.release_slot, slot)
++        return slot
+ 
+-    def tearDown(self):
++    @staticmethod
++    def release_slot(slot):
+         try:
+-            _udf_end_scalar_slot_borrow(self.slot)
++            _udf_end_scalar_slot_borrow(slot)
+         except RuntimeError:
+             pass
+-        _udf_release_scalar_slot(self.slot)
++        _udf_release_scalar_slot(slot)
+ 
+-    def test_interpreter_lifecycle_and_exact_float(self):
+-        with self.assertRaises(RuntimeError):
+-            _udf_guard_data_handle(self.slot)
++    def test_interpreter_type_matrix_boundaries_and_lifecycle(self):
++        cases = (
++            ("bool", _udf_data_load_bool, (False, True)),
++            ("int32", _udf_data_load_i32, (-(2**31), 0, 2**31 - 1)),
++            ("int64", _udf_data_load_i64, (-(2**63), 0, 2**63 - 1)),
++            ("float32", _udf_data_load_f32, (-0.0, 1.25, float("inf"))),
++            ("float64", _udf_data_load_f64, (-0.0, 1.25, float("inf"))),
++        )
++        for scalar_type, load, values in cases:
++            with self.subTest(scalar_type=scalar_type):
++                slot = self.make_slot(scalar_type)
++                with self.assertRaises(RuntimeError):
++                    _udf_guard_data_handle(slot)
++                _udf_begin_scalar_slot_borrow(slot)
++                # Guarding an uninitialized output slot is valid; reading it is not.
++                guarded = _udf_guard_data_handle(slot)
++                with self.assertRaises(RuntimeError):
++                    load(guarded)
++                for value in values:
++                    _udf_set_scalar_slot(slot, value)
++                    result = load(_udf_guard_data_handle(slot))
++                    if scalar_type == "float32":
++                        expected = struct.unpack("f", struct.pack("f", value))[0]
++                    else:
++                        expected = value
++                    self.assertEqual(result, expected)
++                    if isinstance(expected, float) and expected == 0.0:
++                        self.assertEqual(
++                            math.copysign(1.0, result),
++                            math.copysign(1.0, expected),
++                        )
++                _udf_end_scalar_slot_borrow(slot)
++                _udf_begin_scalar_slot_borrow(slot)
++                with self.assertRaises(RuntimeError):
++                    load(_udf_guard_data_handle(slot))
+ 
+-        _udf_begin_scalar_slot_borrow(self.slot)
+-        with self.assertRaises(RuntimeError):
+-            _udf_guard_data_handle(self.slot)
+-        for value in (0.0, -0.0, 1.25, float("inf"), float("-inf"), float("nan")):
+-            _udf_set_scalar_slot(self.slot, value)
+-            result = _udf_data_load_f64(_udf_guard_data_handle(self.slot))
+-            if math.isnan(value):
+-                self.assertTrue(math.isnan(result))
+-            else:
+-                self.assertEqual(result, value)
+-                self.assertEqual(math.copysign(1.0, result), math.copysign(1.0, value))
++    def test_type_nullability_and_range_are_exact(self):
++        i32 = self.make_slot("int32")
++        _udf_begin_scalar_slot_borrow(i32)
++        for invalid in (True, 1.0, None):
++            with self.subTest(invalid=invalid):
++                with self.assertRaises(TypeError):
++                    _udf_set_scalar_slot(i32, invalid)
++        for invalid in (-(2**31) - 1, 2**31):
++            with self.subTest(invalid=invalid):
++                with self.assertRaises(OverflowError):
++                    _udf_set_scalar_slot(i32, invalid)
+ 
++        f32 = self.make_slot("float32")
++        _udf_begin_scalar_slot_borrow(f32)
+         with self.assertRaises(TypeError):
+-            _udf_set_scalar_slot(self.slot, 1)
++            _udf_set_scalar_slot(f32, 1)
++        with self.assertRaises(OverflowError):
++            _udf_set_scalar_slot(f32, 3.5e38)
+ 
+-        _udf_end_scalar_slot_borrow(self.slot)
+-        _udf_begin_scalar_slot_borrow(self.slot)
+-        with self.assertRaises(RuntimeError):
+-            _udf_data_load_f64(self.slot)
++        nullable = self.make_slot("int64", True)
++        _udf_begin_scalar_slot_borrow(nullable)
++        _udf_set_scalar_slot(nullable, None)
++        guarded = _udf_guard_data_handle(nullable)
++        self.assertTrue(_udf_data_is_null(guarded))
++        with self.assertRaises(TypeError):
++            _udf_data_load_i64(guarded)
+ 
+-    def test_release_is_idempotent_and_prevents_aba(self):
+-        _udf_begin_scalar_slot_borrow(self.slot)
+-        with self.assertRaises(RuntimeError):
+-            _udf_release_scalar_slot(self.slot)
+-        _udf_end_scalar_slot_borrow(self.slot)
++        with self.assertRaises(ValueError):
++            _udf_create_scalar_slot("uint64", False)
++
++    def test_store_matrix_initializes_output_and_rejects_wrong_type(self):
++        cases = (
++            ("bool", _udf_data_store_bool, _udf_data_load_bool, True),
++            ("int32", _udf_data_store_i32, _udf_data_load_i32, 17),
++            ("int64", _udf_data_store_i64, _udf_data_load_i64, 2**40),
++            ("float32", _udf_data_store_f32, _udf_data_load_f32, 1.25),
++            ("float64", _udf_data_store_f64, _udf_data_load_f64, 2.5),
++        )
++        for scalar_type, store, load, value in cases:
++            with self.subTest(scalar_type=scalar_type):
++                slot = self.make_slot(scalar_type)
++                _udf_begin_scalar_slot_borrow(slot)
++                guarded = _udf_guard_data_handle(slot)
++                self.assertEqual(store(guarded, value), value)
++                self.assertEqual(load(_udf_guard_data_handle(slot)), value)
+ 
+-        _udf_release_scalar_slot(self.slot)
+-        _udf_release_scalar_slot(self.slot)
++        i64 = self.make_slot("int64")
++        _udf_begin_scalar_slot_borrow(i64)
++        with self.assertRaises(TypeError):
++            _udf_data_store_i32(i64, 1)
++        with self.assertRaises(TypeError):
++            _udf_data_store_null(i64)
++
++        nullable = self.make_slot("float64", True)
++        _udf_begin_scalar_slot_borrow(nullable)
++        self.assertIsNone(_udf_data_store_null(_udf_guard_data_handle(nullable)))
++        self.assertTrue(_udf_data_is_null(_udf_guard_data_handle(nullable)))
++
++    def test_release_is_idempotent_and_rejects_forged_or_cross_process(self):
++        slot = self.make_slot("float64")
++        _udf_begin_scalar_slot_borrow(slot)
++        with self.assertRaises(RuntimeError):
++            _udf_release_scalar_slot(slot)
++        _udf_end_scalar_slot_borrow(slot)
++        _udf_release_scalar_slot(slot)
++        _udf_release_scalar_slot(slot)
+         with self.assertRaises(RuntimeError):
+-            _udf_begin_scalar_slot_borrow(self.slot)
++            _udf_begin_scalar_slot_borrow(slot)
++        with self.assertRaises(TypeError):
++            _udf_guard_data_handle(object())
+ 
+-        replacement = _udf_create_scalar_slot()
+-        try:
+-            _udf_begin_scalar_slot_borrow(replacement)
+-            _udf_set_scalar_slot(replacement, 7.0)
+-            self.assertEqual(
+-                _udf_data_load_f64(_udf_guard_data_handle(replacement)), 7.0
+-            )
+-            with self.assertRaises(RuntimeError):
+-                _udf_guard_data_handle(self.slot)
+-            _udf_end_scalar_slot_borrow(replacement)
+-        finally:
+-            _udf_release_scalar_slot(replacement)
+-
+-    @unittest.skipUnless(hasattr(os, "fork"), "requires fork")
+-    def test_cross_process_capsule_is_rejected(self):
+-        _udf_begin_scalar_slot_borrow(self.slot)
++        if not hasattr(os, "fork"):
++            return
++        other = self.make_slot("int64")
++        _udf_begin_scalar_slot_borrow(other)
+         pid = os.fork()
+         if pid == 0:
+             try:
+-                _udf_guard_data_handle(self.slot)
++                _udf_guard_data_handle(other)
+             except RuntimeError:
+                 os._exit(0)
+             os._exit(1)
+         _, status = os.waitpid(pid, 0)
+         self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+ 
+-    def test_exact_guarded_call_is_compiled_and_wrong_guard_is_not(self):
+-        def calibrated(slot):
+-            return _udf_data_load_f64(_udf_guard_data_handle(slot)) * 2.0 - 1.0
+-
+-        def unguarded(slot):
+-            return _udf_data_load_f64(slot)
+-
+-        def passthrough(value):
+-            return value
+-
+-        def wrong_guard(slot):
+-            return _udf_data_load_f64(passthrough(slot))
+-
+-        def fake_load(value):
+-            return _udf_data_load_f64(value)
+-
+-        def wrong_load(slot):
+-            return fake_load(_udf_guard_data_handle(slot))
+-
+-        self.assertTrue(cinderx.jit.force_compile(calibrated))
+-        self.assertTrue(cinderx.jit.force_compile(unguarded))
+-        self.assertTrue(cinderx.jit.force_compile(wrong_guard))
+-        self.assertTrue(cinderx.jit.force_compile(wrong_load))
+-        self.assertTrue(cinderx.jit.is_jit_compiled(calibrated))
+-        self.assertEqual(
+-            cinderx.jit.get_function_hir_opcode_counts(calibrated).get(
+-                "LoadUdfDataF64", 0
+-            ),
+-            1,
+-        )
+-        self.assertEqual(
+-            cinderx.jit.get_function_hir_opcode_counts(unguarded).get(
+-                "LoadUdfDataF64", 0
+-            ),
+-            0,
+-        )
+-        self.assertEqual(
+-            cinderx.jit.get_function_hir_opcode_counts(wrong_guard).get(
+-                "LoadUdfDataF64", 0
+-            ),
+-            0,
+-        )
+-        self.assertEqual(
+-            cinderx.jit.get_function_hir_opcode_counts(wrong_load).get(
+-                "LoadUdfDataF64", 0
+-            ),
+-            0,
++    def test_jit_load_store_matrix_and_branches(self):
++        cases = (
++            ("bool", copy_bool, "LoadUdfDataBool", "StoreUdfDataBool", True, False),
++            ("int32", copy_i32, "LoadUdfDataI32", "StoreUdfDataI32", 7, 8),
++            ("int64", copy_i64, "LoadUdfDataI64", "StoreUdfDataI64", -7, -8),
++            ("float32", copy_f32, "LoadUdfDataF32", "StoreUdfDataF32", 2.0, 3.0),
++            ("float64", copy_f64, "LoadUdfDataF64", "StoreUdfDataF64", 2.0, 3.0),
+         )
++        for scalar_type, function, load_op, store_op, value, expected in cases:
++            with self.subTest(scalar_type=scalar_type):
++                self.assertTrue(cinderx.jit.force_compile(function))
++                counts = cinderx.jit.get_function_hir_opcode_counts(function)
++                self.assertEqual(counts.get(load_op, 0), 1, counts)
++                self.assertEqual(counts.get(store_op, 0), 1, counts)
++                source = self.make_slot(scalar_type)
++                target = self.make_slot(scalar_type)
++                _udf_begin_scalar_slot_borrow(source)
++                _udf_begin_scalar_slot_borrow(target)
++                _udf_set_scalar_slot(source, value)
++                self.assertEqual(function(source, target), expected)
++                loads = {
++                    "bool": _udf_data_load_bool,
++                    "int32": _udf_data_load_i32,
++                    "int64": _udf_data_load_i64,
++                    "float32": _udf_data_load_f32,
++                    "float64": _udf_data_load_f64,
++                }
++                self.assertEqual(
++                    loads[scalar_type](_udf_guard_data_handle(target)),
++                    expected,
++                )
+ 
+-        _udf_begin_scalar_slot_borrow(self.slot)
+-        for value in (
+-            0.0,
+-            -0.0,
+-            1.25,
+-            1.7976931348623157e308,
+-            float("inf"),
+-            float("-inf"),
+-            float("nan"),
+-        ):
+-            _udf_set_scalar_slot(self.slot, value)
+-            expected = value * 2.0 - 1.0
+-            result = calibrated(self.slot)
+-            if math.isnan(expected):
+-                self.assertTrue(math.isnan(result))
+-            else:
+-                self.assertEqual(result, expected)
+-
+-        _udf_end_scalar_slot_borrow(self.slot)
+-        _udf_release_scalar_slot(self.slot)
+-        with self.assertRaises(RuntimeError):
+-            calibrated(self.slot)
+-        with self.assertRaises(TypeError):
+-            calibrated(object())
++    def test_jit_nullable_branch_has_null_and_value_paths(self):
++        self.assertTrue(cinderx.jit.force_compile(copy_nullable_i64))
++        counts = cinderx.jit.get_function_hir_opcode_counts(copy_nullable_i64)
++        self.assertEqual(counts.get("IsUdfDataNull", 0), 1, counts)
++        self.assertEqual(counts.get("LoadUdfDataI64", 0), 1, counts)
++        self.assertEqual(counts.get("StoreUdfDataI64", 0), 1, counts)
++        self.assertEqual(counts.get("StoreUdfDataNull", 0), 1, counts)
+ 
+-    def test_state_change_between_guard_and_load_disables_intrinsic(self):
+-        def end_between_guard_and_load(slot):
+-            guarded = _udf_guard_data_handle(slot)
+-            _udf_end_scalar_slot_borrow(slot)
+-            return _udf_data_load_f64(guarded)
+-
+-        self.assertTrue(cinderx.jit.force_compile(end_between_guard_and_load))
+-        self.assertEqual(
+-            cinderx.jit.get_function_hir_opcode_counts(
+-                end_between_guard_and_load
+-            ).get("LoadUdfDataF64", 0),
+-            0,
+-        )
+-        _udf_begin_scalar_slot_borrow(self.slot)
+-        _udf_set_scalar_slot(self.slot, 3.0)
+-        with self.assertRaises(RuntimeError):
+-            end_between_guard_and_load(self.slot)
++        for value in (None, 41):
++            with self.subTest(value=value):
++                source = self.make_slot("int64", True)
++                target = self.make_slot("int64", True)
++                _udf_begin_scalar_slot_borrow(source)
++                _udf_begin_scalar_slot_borrow(target)
++                _udf_set_scalar_slot(source, value)
++                copy_nullable_i64(source, target)
++                guarded = _udf_guard_data_handle(target)
++                self.assertEqual(_udf_data_is_null(guarded), value is None)
++                if value is not None:
++                    self.assertEqual(_udf_data_load_i64(guarded), value)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/cinderx/RuntimeTests/hir_tests/udf_data_intrinsic_test.txt b/cinderx/RuntimeTests/hir_tests/udf_data_intrinsic_test.txt
+index 06432ff..b810231 100644
+--- a/cinderx/RuntimeTests/hir_tests/udf_data_intrinsic_test.txt
++++ b/cinderx/RuntimeTests/hir_tests/udf_data_intrinsic_test.txt
+@@ -3,32 +3,46 @@ UdfDataIntrinsicHIRTest
+ --- Passes ---
+ Simplify
+ --- Test Name ---
+-ParserPrinterAndOutputTypePreserveGuardedPrimitiveLoad
++ParserPrinterAndOutputTypesPreserveTypedReadsAndWrites
+ --- Input ---
+ # HIR
+ fun test {
+   bb 0 {
+     v0 = LoadArg<0; "slot">
+-    v1 = LoadUdfDataF64 v0
+-    v2 = PrimitiveBox<CDouble> v1 {
+-      FrameState {
+-        CurInstrOffset 0
+-      }
+-    }
+-    Return v2
++    v1 = IsUdfDataNull v0
++    v2 = LoadUdfDataBool v0
++    v3 = LoadUdfDataI32 v0
++    v4 = LoadUdfDataI64 v0
++    v5 = LoadUdfDataF32 v0
++    v6 = LoadUdfDataF64 v0
++    StoreUdfDataBool v0 v2
++    StoreUdfDataI32 v0 v3
++    StoreUdfDataI64 v0 v4
++    StoreUdfDataF32 v0 v5
++    StoreUdfDataF64 v0 v6
++    StoreUdfDataNull v0
++    v7 = LoadConst<NoneType>
++    Return v7
+   }
+ }
+ --- Expected 3.14 ---
+ fun test {
+   bb 0 {
+     v0:Object = LoadArg<0>
+-    v1:CDouble = LoadUdfDataF64 v0
+-    v2:FloatExact = PrimitiveBox<CDouble> v1 {
+-      FrameState {
+-        CurInstrOffset 0
+-      }
+-    }
+-    Return v2
++    v1:CBool = IsUdfDataNull v0
++    v2:CBool = LoadUdfDataBool v0
++    v3:CInt32 = LoadUdfDataI32 v0
++    v4:CInt64 = LoadUdfDataI64 v0
++    v5:CDouble = LoadUdfDataF32 v0
++    v6:CDouble = LoadUdfDataF64 v0
++    StoreUdfDataBool v0 v2
++    StoreUdfDataI32 v0 v3
++    StoreUdfDataI64 v0 v4
++    StoreUdfDataF32 v0 v5
++    StoreUdfDataF64 v0 v6
++    StoreUdfDataNull v0
++    v7:NoneType = LoadConst<NoneType>
++    Return v7
+   }
+ }
+ --- End ---
+diff --git a/cinderx/RuntimeTests/udf_data_intrinsic_test.cpp b/cinderx/RuntimeTests/udf_data_intrinsic_test.cpp
+index bdacc28..a5d2f3d 100644
+--- a/cinderx/RuntimeTests/udf_data_intrinsic_test.cpp
++++ b/cinderx/RuntimeTests/udf_data_intrinsic_test.cpp
+@@ -20,99 +20,146 @@
+ 
+ using UdfDataIntrinsicTest = RuntimeTest;
+ 
+-TEST_F(UdfDataIntrinsicTest, RuntimeHelpersEnforceBorrowAndLifetime) {
++TEST_F(UdfDataIntrinsicTest, RuntimeHelpersCoverTypedNullableLifecycle) {
+   runStockCode(R"(
+ import math
++import struct
+ 
+ from cinderjit import (
+     _udf_begin_scalar_slot_borrow,
+     _udf_create_scalar_slot,
++    _udf_data_is_null,
++    _udf_data_load_bool,
++    _udf_data_load_f32,
+     _udf_data_load_f64,
++    _udf_data_load_i32,
++    _udf_data_load_i64,
++    _udf_data_store_bool,
++    _udf_data_store_f32,
++    _udf_data_store_f64,
++    _udf_data_store_i32,
++    _udf_data_store_i64,
++    _udf_data_store_null,
+     _udf_end_scalar_slot_borrow,
+     _udf_guard_data_handle,
+     _udf_release_scalar_slot,
+     _udf_set_scalar_slot,
+ )
+ 
+-slot = _udf_create_scalar_slot()
+-
+-for operation in (
+-    lambda: _udf_set_scalar_slot(slot, 1.0),
+-    lambda: _udf_guard_data_handle(slot),
+-    lambda: _udf_data_load_f64(slot),
+-):
+-    try:
+-        operation()
+-    except RuntimeError:
+-        pass
+-    else:
+-        raise AssertionError("slot access outside an active borrow must fail")
+-
+-_udf_begin_scalar_slot_borrow(slot)
+-for operation in (
+-    lambda: _udf_guard_data_handle(slot),
+-    lambda: _udf_data_load_f64(slot),
+-):
+-    try:
+-        operation()
+-    except RuntimeError:
+-        pass
+-    else:
+-        raise AssertionError("a new borrow must be initialized before load")
+-for value in (0.0, -0.0, 1.25, float("inf"), float("-inf"), float("nan")):
+-    _udf_set_scalar_slot(slot, value)
+-    result = _udf_data_load_f64(_udf_guard_data_handle(slot))
+-    if math.isnan(value):
+-        assert math.isnan(result)
+-    else:
+-        assert result == value
+-        assert math.copysign(1.0, result) == math.copysign(1.0, value)
+-_udf_end_scalar_slot_borrow(slot)
+-
+-_udf_begin_scalar_slot_borrow(slot)
+-try:
+-    _udf_guard_data_handle(slot)
+-except RuntimeError:
+-    pass
+-else:
+-    raise AssertionError("a second borrow must not reuse the previous value")
+-_udf_end_scalar_slot_borrow(slot)
++cases = (
++    ("bool", _udf_data_load_bool, _udf_data_store_bool, (False, True)),
++    ("int32", _udf_data_load_i32, _udf_data_store_i32, (-(2**31), 0, 2**31 - 1)),
++    ("int64", _udf_data_load_i64, _udf_data_store_i64, (-(2**63), 0, 2**63 - 1)),
++    ("float32", _udf_data_load_f32, _udf_data_store_f32, (-0.0, 1.25, float("inf"))),
++    ("float64", _udf_data_load_f64, _udf_data_store_f64, (-0.0, 1.25, float("inf"))),
++)
++for scalar_type, load, store, values in cases:
++    source = _udf_create_scalar_slot(scalar_type, False)
++    target = _udf_create_scalar_slot(scalar_type, False)
++    for operation in (
++        lambda: _udf_guard_data_handle(source),
++        lambda: load(source),
++        lambda: store(target, values[0]),
++    ):
++        try:
++            operation()
++        except RuntimeError:
++            pass
++        else:
++            raise AssertionError("slot access outside an active borrow must fail")
++
++    _udf_begin_scalar_slot_borrow(source)
++    _udf_begin_scalar_slot_borrow(target)
++    guarded_source = _udf_guard_data_handle(source)
++    guarded_target = _udf_guard_data_handle(target)
++    for operation in (
++        lambda: load(guarded_source),
++        lambda: _udf_data_is_null(guarded_source),
++    ):
++        try:
++            operation()
++        except RuntimeError:
++            pass
++        else:
++            raise AssertionError("an uninitialized slot must not be readable")
++
++    for value in values:
++        _udf_set_scalar_slot(source, value)
++        result = load(_udf_guard_data_handle(source))
++        expected = (
++            struct.unpack("f", struct.pack("f", value))[0]
++            if scalar_type == "float32"
++            else value
++        )
++        assert result == expected
++        stored = store(_udf_guard_data_handle(target), result)
++        assert stored == result
++        assert load(_udf_guard_data_handle(target)) == expected
++        if isinstance(expected, float) and expected == 0.0:
++            assert math.copysign(1.0, result) == math.copysign(1.0, expected)
+ 
++    _udf_end_scalar_slot_borrow(source)
++    _udf_end_scalar_slot_borrow(target)
++    _udf_release_scalar_slot(source)
++    _udf_release_scalar_slot(source)
++    _udf_release_scalar_slot(target)
++    for operation in (
++        lambda: _udf_begin_scalar_slot_borrow(source),
++        lambda: _udf_guard_data_handle(source),
++    ):
++        try:
++            operation()
++        except RuntimeError:
++            pass
++        else:
++            raise AssertionError("released slots must stay invalid")
++
++nullable = _udf_create_scalar_slot("int64", True)
++_udf_begin_scalar_slot_borrow(nullable)
++_udf_set_scalar_slot(nullable, None)
++guarded = _udf_guard_data_handle(nullable)
++assert _udf_data_is_null(guarded)
+ try:
+-    _udf_set_scalar_slot(slot, 1)
+-except RuntimeError:
+-    # The borrow check is allowed to win before the exact-float check.
++    _udf_data_load_i64(guarded)
++except TypeError:
+     pass
+ else:
+-    raise AssertionError("setting outside an active borrow must fail")
+-
+-_udf_release_scalar_slot(slot)
+-_udf_release_scalar_slot(slot)
+-for operation in (
+-    lambda: _udf_begin_scalar_slot_borrow(slot),
+-    lambda: _udf_guard_data_handle(slot),
+-    lambda: _udf_data_load_f64(slot),
++    raise AssertionError("null must not be unboxed as int64")
++assert _udf_data_store_null(_udf_guard_data_handle(nullable)) is None
++_udf_end_scalar_slot_borrow(nullable)
++_udf_release_scalar_slot(nullable)
++
++non_nullable = _udf_create_scalar_slot("int32", False)
++_udf_begin_scalar_slot_borrow(non_nullable)
++for operation, error in (
++    (lambda: _udf_set_scalar_slot(non_nullable, None), TypeError),
++    (lambda: _udf_set_scalar_slot(non_nullable, True), TypeError),
++    (lambda: _udf_set_scalar_slot(non_nullable, 2**31), OverflowError),
++    (lambda: _udf_data_store_null(non_nullable), TypeError),
++    (lambda: _udf_data_load_i64(non_nullable), RuntimeError),
+ ):
+     try:
+         operation()
+-    except RuntimeError:
++    except error:
+         pass
+     else:
+-        raise AssertionError("released slots must stay invalid")
++        raise AssertionError("type, range, and nullability checks must be exact")
++_udf_end_scalar_slot_borrow(non_nullable)
++_udf_release_scalar_slot(non_nullable)
+ 
+-replacement = _udf_create_scalar_slot()
+-_udf_begin_scalar_slot_borrow(replacement)
+-_udf_set_scalar_slot(replacement, 9.5)
+-assert _udf_data_load_f64(_udf_guard_data_handle(replacement)) == 9.5
+-_udf_end_scalar_slot_borrow(replacement)
+-_udf_release_scalar_slot(replacement)
++try:
++    _udf_create_scalar_slot("uint64", False)
++except ValueError:
++    pass
++else:
++    raise AssertionError("unsupported physical types must fail")
+ 
+ try:
+     _udf_guard_data_handle(object())
+ except TypeError:
+     pass
+ else:
+-    raise AssertionError("forged handles must fail before data load")
++    raise AssertionError("forged handles must fail")
+ )");
+ }
+ 
+@@ -129,7 +176,7 @@ from cinderjit import (
+     _udf_release_scalar_slot,
+ )
+ 
+-slot = _udf_create_scalar_slot()
++slot = _udf_create_scalar_slot("float64", False)
+ _udf_begin_scalar_slot_borrow(slot)
+ pid = os.fork()
+ if pid == 0:
+@@ -153,26 +200,113 @@ _udf_release_scalar_slot(slot)
+ }
+ #endif
+ 
+-TEST_F(UdfDataIntrinsicTest, ExactGuardedLoadProducesPrimitiveHIR) {
++TEST_F(UdfDataIntrinsicTest, ExactGuardedOperationsProduceTypedHIR) {
+   runStockCode(R"(
+-import math
+-
+ import cinderx.jit as jit
+ from cinderjit import (
+     _udf_begin_scalar_slot_borrow,
+     _udf_create_scalar_slot,
++    _udf_data_is_null,
++    _udf_data_load_bool,
++    _udf_data_load_f32,
+     _udf_data_load_f64,
++    _udf_data_load_i32,
++    _udf_data_load_i64,
++    _udf_data_store_bool,
++    _udf_data_store_f32,
++    _udf_data_store_f64,
++    _udf_data_store_i32,
++    _udf_data_store_i64,
++    _udf_data_store_null,
+     _udf_end_scalar_slot_borrow,
+     _udf_guard_data_handle,
+     _udf_release_scalar_slot,
+     _udf_set_scalar_slot,
+ )
+ 
+-def calibrated(slot):
+-    return _udf_data_load_f64(_udf_guard_data_handle(slot)) * 2.0 - 1.0
+-
+-def unguarded(slot):
+-    return _udf_data_load_f64(slot)
++def copy_bool(source, target):
++    value = _udf_data_load_bool(_udf_guard_data_handle(source))
++    result = not value
++    return _udf_data_store_bool(_udf_guard_data_handle(target), result)
++
++def copy_i32(source, target):
++    value = _udf_data_load_i32(_udf_guard_data_handle(source))
++    result = value + 1 if value >= 0 else value - 1
++    return _udf_data_store_i32(_udf_guard_data_handle(target), result)
++
++def copy_i64(source, target):
++    value = _udf_data_load_i64(_udf_guard_data_handle(source))
++    result = value + 1 if value >= 0 else value - 1
++    return _udf_data_store_i64(_udf_guard_data_handle(target), result)
++
++def copy_f32(source, target):
++    value = _udf_data_load_f32(_udf_guard_data_handle(source))
++    result = value * 2.0
++    return _udf_data_store_f32(_udf_guard_data_handle(target), result)
++
++def copy_f64(source, target):
++    value = _udf_data_load_f64(_udf_guard_data_handle(source))
++    result = value * 2.0
++    return _udf_data_store_f64(_udf_guard_data_handle(target), result)
++
++def copy_nullable(source, target):
++    if _udf_data_is_null(_udf_guard_data_handle(source)):
++        return _udf_data_store_null(_udf_guard_data_handle(target))
++    value = _udf_data_load_i64(_udf_guard_data_handle(source))
++    return _udf_data_store_i64(_udf_guard_data_handle(target), value)
++
++cases = (
++    ("bool", copy_bool, "LoadUdfDataBool", "StoreUdfDataBool", True, False),
++    ("int32", copy_i32, "LoadUdfDataI32", "StoreUdfDataI32", 7, 8),
++    ("int64", copy_i64, "LoadUdfDataI64", "StoreUdfDataI64", -7, -8),
++    ("float32", copy_f32, "LoadUdfDataF32", "StoreUdfDataF32", 2.0, 4.0),
++    ("float64", copy_f64, "LoadUdfDataF64", "StoreUdfDataF64", 2.0, 4.0),
++)
++loads = {
++    "bool": _udf_data_load_bool,
++    "int32": _udf_data_load_i32,
++    "int64": _udf_data_load_i64,
++    "float32": _udf_data_load_f32,
++    "float64": _udf_data_load_f64,
++}
++for scalar_type, function, load_op, store_op, value, expected in cases:
++    assert jit.force_compile(function)
++    counts = jit.get_function_hir_opcode_counts(function)
++    assert counts.get(load_op, 0) == 1, counts
++    assert counts.get(store_op, 0) == 1, counts
++    source = _udf_create_scalar_slot(scalar_type, False)
++    target = _udf_create_scalar_slot(scalar_type, False)
++    _udf_begin_scalar_slot_borrow(source)
++    _udf_begin_scalar_slot_borrow(target)
++    _udf_set_scalar_slot(source, value)
++    assert function(source, target) == expected
++    assert loads[scalar_type](_udf_guard_data_handle(target)) == expected
++    _udf_end_scalar_slot_borrow(source)
++    _udf_end_scalar_slot_borrow(target)
++    _udf_release_scalar_slot(source)
++    _udf_release_scalar_slot(target)
++
++assert jit.force_compile(copy_nullable)
++counts = jit.get_function_hir_opcode_counts(copy_nullable)
++assert counts.get("IsUdfDataNull", 0) == 1, counts
++assert counts.get("LoadUdfDataI64", 0) == 1, counts
++assert counts.get("StoreUdfDataI64", 0) == 1, counts
++assert counts.get("StoreUdfDataNull", 0) == 1, counts
++for value in (None, 41):
++    source = _udf_create_scalar_slot("int64", True)
++    target = _udf_create_scalar_slot("int64", True)
++    _udf_begin_scalar_slot_borrow(source)
++    _udf_begin_scalar_slot_borrow(target)
++    _udf_set_scalar_slot(source, value)
++    copy_nullable(source, target)
++    guarded = _udf_guard_data_handle(target)
++    assert _udf_data_is_null(guarded) is (value is None)
++    if value is not None:
++        assert _udf_data_load_i64(guarded) == value
++    _udf_end_scalar_slot_borrow(source)
++    _udf_end_scalar_slot_borrow(target)
++    _udf_release_scalar_slot(source)
++    _udf_release_scalar_slot(target)
+ 
+ def passthrough(value):
+     return value
+@@ -180,73 +314,26 @@ def passthrough(value):
+ def wrong_guard(slot):
+     return _udf_data_load_f64(passthrough(slot))
+ 
+-def fake_load(value):
+-    return _udf_data_load_f64(value)
+-
+ def wrong_load(slot):
++    def fake_load(value):
++        return _udf_data_load_f64(value)
+     return fake_load(_udf_guard_data_handle(slot))
+ 
+-def end_between_guard_and_load(slot):
+-    guarded = _udf_guard_data_handle(slot)
+-    _udf_end_scalar_slot_borrow(slot)
+-    return _udf_data_load_f64(guarded)
+-
+-assert jit.force_compile(calibrated)
+-assert jit.force_compile(unguarded)
+ assert jit.force_compile(wrong_guard)
+ assert jit.force_compile(wrong_load)
+-assert jit.force_compile(end_between_guard_and_load)
+-assert jit.is_jit_compiled(calibrated)
+-
+-counts = jit.get_function_hir_opcode_counts(calibrated)
+-assert counts.get("LoadUdfDataF64", 0) == 1, counts
+-assert jit.get_function_hir_opcode_counts(unguarded).get("LoadUdfDataF64", 0) == 0
+ assert jit.get_function_hir_opcode_counts(wrong_guard).get("LoadUdfDataF64", 0) == 0
+ assert jit.get_function_hir_opcode_counts(wrong_load).get("LoadUdfDataF64", 0) == 0
+-assert jit.get_function_hir_opcode_counts(end_between_guard_and_load).get("LoadUdfDataF64", 0) == 0
+-
+-interposed_slot = _udf_create_scalar_slot()
+-_udf_begin_scalar_slot_borrow(interposed_slot)
+-_udf_set_scalar_slot(interposed_slot, 4.0)
+-try:
+-    end_between_guard_and_load(interposed_slot)
+-except RuntimeError:
+-    pass
+-else:
+-    raise AssertionError("load after end_borrow must retain interpreter failure")
+-_udf_release_scalar_slot(interposed_slot)
+-
+-slot = _udf_create_scalar_slot()
+-_udf_begin_scalar_slot_borrow(slot)
+-for value in (0.0, -0.0, 1.25, 1.7976931348623157e308, float("inf"), float("-inf"), float("nan")):
+-    _udf_set_scalar_slot(slot, value)
+-    expected = value * 2.0 - 1.0
+-    result = calibrated(slot)
+-    if math.isnan(expected):
+-        assert math.isnan(result)
+-    else:
+-        assert result == expected
+-        if expected == 0.0:
+-            assert math.copysign(1.0, result) == math.copysign(1.0, expected)
+-_udf_end_scalar_slot_borrow(slot)
+-_udf_release_scalar_slot(slot)
+-for invalid in (slot, object()):
+-    try:
+-        calibrated(invalid)
+-    except (RuntimeError, TypeError):
+-        pass
+-    else:
+-        raise AssertionError("descriptor guard must fail before native load")
+ )");
+ }
+ 
+-TEST_F(UdfDataIntrinsicTest, HIRMetadataMatchesPrimitiveRead) {
++TEST_F(UdfDataIntrinsicTest, HIRMetadataMatchesTypedReadAndWrite) {
+   auto function = jit::hir::HIRParser{}.ParseHIR(R"(
+ fun test {
+   bb 0 {
+     v0 = LoadArg<0>
+-    v1 = LoadUdfDataF64 v0
+-    v2 = PrimitiveBox<CDouble> v1 {
++    v1 = LoadUdfDataI64 v0
++    StoreUdfDataI64 v0 v1
++    v2 = PrimitiveBox<CInt64> v1 {
+       FrameState {
+         CurInstrOffset 0
+       }
+@@ -258,29 +345,37 @@ fun test {
+   ASSERT_NE(function, nullptr);
+ 
+   const jit::hir::Instr* load = nullptr;
++  const jit::hir::Instr* store = nullptr;
+   for (const auto& block : function->cfg.blocks) {
+     for (const auto& instr : block) {
+-      if (instr.IsLoadUdfDataF64()) {
++      if (instr.IsLoadUdfDataI64()) {
+         load = &instr;
++      } else if (instr.IsStoreUdfDataI64()) {
++        store = &instr;
+       }
+     }
+   }
+ 
+   ASSERT_NE(load, nullptr);
+-  EXPECT_EQ(jit::hir::outputType(*load), jit::hir::TCDouble);
++  ASSERT_NE(store, nullptr);
++  EXPECT_EQ(jit::hir::outputType(*load), jit::hir::TCInt64);
+   EXPECT_TRUE(load->isReplayable());
+   EXPECT_FALSE(jit::hir::isPassthrough(*load));
+   EXPECT_FALSE(jit::hir::hasArbitraryExecution(*load));
+   EXPECT_EQ(jit::hir::memoryEffects(*load).may_store, jit::hir::AEmpty);
++  EXPECT_FALSE(store->isReplayable());
++  EXPECT_FALSE(jit::hir::hasArbitraryExecution(*store));
++  EXPECT_EQ(jit::hir::memoryEffects(*store).may_store, jit::hir::AOther);
+ }
+ 
+-TEST_F(UdfDataIntrinsicTest, LIRCallsFloat64SlotLoadHelper) {
++TEST_F(UdfDataIntrinsicTest, LIRCallsTypedLoadAndStoreHelpers) {
+   auto function = jit::hir::HIRParser{}.ParseHIR(R"(
+ fun test {
+   bb 0 {
+     v0 = LoadArg<0>
+-    v1 = LoadUdfDataF64 v0
+-    v2 = PrimitiveBox<CDouble> v1 {
++    v1 = LoadUdfDataI64 v0
++    StoreUdfDataI64 v0 v1
++    v2 = PrimitiveBox<CInt64> v1 {
+       FrameState {
+         CurInstrOffset 0
+       }
+@@ -310,11 +405,14 @@ fun test {
+   stream << *lir;
+   const std::string text = stream.str();
+ 
+-  EXPECT_NE(text.find(":Double = Call"), std::string::npos) << text;
+   EXPECT_NE(
+       text.find(fmt::format(
+-          "{}",
+-          reinterpret_cast<uint64_t>(JITRT_LoadUdfDataF64Unchecked))),
++          "{}", reinterpret_cast<uint64_t>(JITRT_LoadUdfDataI64Unchecked))),
++      std::string::npos)
++      << text;
++  EXPECT_NE(
++      text.find(fmt::format(
++          "{}", reinterpret_cast<uint64_t>(JITRT_StoreUdfDataI64Unchecked))),
+       std::string::npos)
+       << text;
+ }
+diff --git a/cinderx/RuntimeTests/udf_descriptor_fuzz_test.cpp b/cinderx/RuntimeTests/udf_descriptor_fuzz_test.cpp
+new file mode 100644
+index 0000000..2a4bcda
+--- /dev/null
++++ b/cinderx/RuntimeTests/udf_descriptor_fuzz_test.cpp
+@@ -0,0 +1,114 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++
++#include "cinderx/RuntimeTests/fixtures.h"
++
++using UdfDescriptorFuzzTest = RuntimeTest;
++
++TEST_F(UdfDescriptorFuzzTest, DeterministicLifecycleAndTypeMatrix) {
++  runStockCode(R"(
++import random
++
++from cinderjit import (
++    _udf_begin_scalar_slot_borrow,
++    _udf_create_scalar_slot,
++    _udf_data_is_null,
++    _udf_data_load_bool,
++    _udf_data_load_f32,
++    _udf_data_load_f64,
++    _udf_data_load_i32,
++    _udf_data_load_i64,
++    _udf_data_store_bool,
++    _udf_data_store_f32,
++    _udf_data_store_f64,
++    _udf_data_store_i32,
++    _udf_data_store_i64,
++    _udf_data_store_null,
++    _udf_end_scalar_slot_borrow,
++    _udf_guard_data_handle,
++    _udf_release_scalar_slot,
++    _udf_set_scalar_slot,
++)
++
++rng = random.Random(0x554446)
++types = ("bool", "int32", "int64", "float32", "float64")
++loads = {
++    "bool": _udf_data_load_bool,
++    "int32": _udf_data_load_i32,
++    "int64": _udf_data_load_i64,
++    "float32": _udf_data_load_f32,
++    "float64": _udf_data_load_f64,
++}
++stores = {
++    "bool": _udf_data_store_bool,
++    "int32": _udf_data_store_i32,
++    "int64": _udf_data_store_i64,
++    "float32": _udf_data_store_f32,
++    "float64": _udf_data_store_f64,
++}
++values = {
++    "bool": (False, True),
++    "int32": (-(2**31), -1, 0, 1, 2**31 - 1),
++    "int64": (-(2**63), -(2**40), 0, 2**40, 2**63 - 1),
++    "float32": (-3.25, -0.0, 0.0, 1.5, float("inf"), float("-inf")),
++    "float64": (-3.25, -0.0, 0.0, 1.5, float("inf"), float("-inf")),
++}
++
++for iteration in range(500):
++    scalar_type = rng.choice(types)
++    nullable = bool(rng.getrandbits(1))
++    slot = _udf_create_scalar_slot(scalar_type, nullable)
++    _udf_begin_scalar_slot_borrow(slot)
++    guarded = _udf_guard_data_handle(slot)
++
++    if nullable and rng.randrange(4) == 0:
++        if rng.getrandbits(1):
++            _udf_set_scalar_slot(slot, None)
++        else:
++            _udf_data_store_null(guarded)
++        assert _udf_data_is_null(_udf_guard_data_handle(slot))
++        try:
++            loads[scalar_type](_udf_guard_data_handle(slot))
++        except TypeError:
++            pass
++        else:
++            raise AssertionError("null value escaped through a typed load")
++    else:
++        value = rng.choice(values[scalar_type])
++        if rng.getrandbits(1):
++            _udf_set_scalar_slot(slot, value)
++        else:
++            assert stores[scalar_type](guarded, value) == value
++        assert not _udf_data_is_null(_udf_guard_data_handle(slot))
++        loads[scalar_type](_udf_guard_data_handle(slot))
++
++    wrong_type = rng.choice(tuple(item for item in types if item != scalar_type))
++    try:
++        loads[wrong_type](_udf_guard_data_handle(slot))
++    except TypeError:
++        pass
++    else:
++        raise AssertionError("a mismatched typed load unexpectedly succeeded")
++
++    _udf_end_scalar_slot_borrow(slot)
++    for invalid_operation in (
++        lambda: _udf_guard_data_handle(slot),
++        lambda: loads[scalar_type](slot),
++    ):
++        try:
++            invalid_operation()
++        except RuntimeError:
++            pass
++        else:
++            raise AssertionError("ended borrow unexpectedly remained usable")
++    _udf_release_scalar_slot(slot)
++    _udf_release_scalar_slot(slot)
++
++for forged in (object(), None, 1, 1.0, "slot"):
++    try:
++        _udf_guard_data_handle(forged)
++    except TypeError:
++        pass
++    else:
++        raise AssertionError("forged descriptor unexpectedly passed its guard")
++)");
++}
