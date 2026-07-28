@@ -4,6 +4,7 @@ import math
 import os
 import socket
 import unittest
+from unittest.mock import patch
 
 from tests.fixtures.scalar_partitioned_projection import (
     build_partition_rows,
@@ -49,28 +50,40 @@ class DaftRayBaselineContractTests(unittest.TestCase):
 )
 class DaftRayLiveBaselineTests(unittest.TestCase):
     def test_partitioned_float_projection_runs_only_on_worker_nodes(self) -> None:
-        import daft
-        import ray
+        # Progress display is not part of this data-plane contract.  Disable
+        # it in both the Driver and Ray job so no tqdm object is left for
+        # interpreter finalization after datetime teardown on Python 3.14.
+        progress_environment = {
+            "DAFT_PROGRESS_BAR": "0",
+            "RAY_TQDM": "0",
+        }
+        with patch.dict(os.environ, progress_environment):
+            import daft
+            import ray
 
-        try:
-            daft.set_runner_ray(address="auto", noop_if_initialized=True)
-            projection = daft.func(_live_calibrate_measurement)
-            values = [0.0, 1.25, -2.5, 9.0]
-            result = (
-                daft.from_pydict({"x": values})
-                .repartition(2)
-                .with_column("y", projection(daft.col("x")))
-                .select("x", "y")
-                .to_pydict()
-            )
+            try:
+                ray.init(
+                    address="auto",
+                    runtime_env={"env_vars": progress_environment},
+                )
+                daft.set_runner_ray(address="auto", noop_if_initialized=True)
+                projection = daft.func(_live_calibrate_measurement)
+                values = [0.0, 1.25, -2.5, 9.0]
+                result = (
+                    daft.from_pydict({"x": values})
+                    .repartition(2)
+                    .with_column("y", projection(daft.col("x")))
+                    .select("x", "y")
+                    .to_pydict()
+                )
 
-            actual = sorted(zip(result["x"], result["y"], strict=True))
-            expected = sorted(
-                (value, value * 2.0 + 3.0) for value in values
-            )
-            self.assertEqual(actual, expected)
-        finally:
-            ray.shutdown()
+                actual = sorted(zip(result["x"], result["y"], strict=True))
+                expected = sorted(
+                    (value, value * 2.0 + 3.0) for value in values
+                )
+                self.assertEqual(actual, expected)
+            finally:
+                ray.shutdown()
 
 
 if __name__ == "__main__":
