@@ -1,8 +1,65 @@
+diff --git a/cinderx/Common/code_extra.h b/cinderx/Common/code_extra.h
+--- a/cinderx/Common/code_extra.h
++++ b/cinderx/Common/code_extra.h
+@@ -55,6 +55,9 @@ typedef struct CodeExtra {
+   uint32_t roi_deopt_count;
+   uint32_t roi_ctl;
+   uint64_t roi_recompile_floor;
++  // Explicit opt-in for UDF continuation GuardFailure observation.
++  // Zero-initialized CodeExtra instances remain disabled.
++  uint32_t udf_continuation_enabled;
+ } CodeExtra;
+
+ // Thread-safe accessors for CodeExtra::calls.
+@@ -136,6 +139,18 @@ static inline void Ci_code_extra_store_roi_recompile_floor_release(
+   __atomic_store_n(&extra->roi_recompile_floor, floor, __ATOMIC_RELEASE);
+ }
+
++static inline int Ci_code_extra_udf_continuation_enabled_acquire(
++    const CodeExtra* extra) {
++  return __atomic_load_n(
++             &extra->udf_continuation_enabled, __ATOMIC_ACQUIRE) != 0;
++}
++
++static inline void Ci_code_extra_enable_udf_continuation_release(
++    CodeExtra* extra) {
++  __atomic_store_n(
++      &extra->udf_continuation_enabled, 1, __ATOMIC_RELEASE);
++}
++
+ #else
+
+ static inline void Ci_code_extra_incr_calls(CodeExtra* extra) {
+@@ -209,6 +224,16 @@ static inline void Ci_code_extra_store_roi_recompile_floor_release(
+   extra->roi_recompile_floor = floor;
+ }
+
++static inline int Ci_code_extra_udf_continuation_enabled_acquire(
++    const CodeExtra* extra) {
++  return extra->udf_continuation_enabled != 0;
++}
++
++static inline void Ci_code_extra_enable_udf_continuation_release(
++    CodeExtra* extra) {
++  extra->udf_continuation_enabled = 1;
++}
++
+ #endif
+
+ #ifdef __cplusplus
 diff --git a/cinderx/Jit/deopt.cpp b/cinderx/Jit/deopt.cpp
 index 3b5d1ef05421b8ee5151429e9ac418c17b117a4a..afca77d98326ba912ac84fc17424c9ad6b66dab3 100644
 --- a/cinderx/Jit/deopt.cpp
 +++ b/cinderx/Jit/deopt.cpp
-@@ -20,6 +20,8 @@
+@@ -8,6 +8,7 @@
+
+ #include "internal/pycore_ceval.h"
+
++#include "cinderx/Common/code.h"
+ #include "cinderx/Common/py-portability.h"
+ #include "cinderx/Common/util.h"
+ #include "cinderx/Jit/bytecode.h"
+@@ -20,6 +21,8 @@
  #define USDT(...)
  #endif
  
@@ -11,7 +68,7 @@ index 3b5d1ef05421b8ee5151429e9ac418c17b117a4a..afca77d98326ba912ac84fc17424c9ad
  #include <shared_mutex>
  
  namespace jit {
-@@ -85,6 +87,163 @@ const char* deoptReasonName(DeoptReason reason) {
+@@ -85,6 +88,239 @@ const char* deoptReasonName(DeoptReason reason) {
    JIT_ABORT("Invalid DeoptReason {}", static_cast<int>(reason));
  }
  
@@ -66,6 +123,9 @@ index 3b5d1ef05421b8ee5151429e9ac418c17b117a4a..afca77d98326ba912ac84fc17424c9ad
 +}
 +
 +namespace {
++
++constexpr const char* kUdfContinuationDeoptFrameKey =
++    "_cinderx_udf_continuation_deopt_frame";
 +
 +bool isLowerHexDigest(std::string_view value) {
 +  if (value.size() != 64) {
@@ -172,9 +232,92 @@ index 3b5d1ef05421b8ee5151429e9ac418c17b117a4a..afca77d98326ba912ac84fc17424c9ad
 +  return UdfContinuationReject::kNone;
 +}
 +
++void noteUdfContinuationDeopt(
++    const DeoptMetadata& metadata,
++    _PyInterpreterFrame* region_frame) {
++  if (metadata.reason != DeoptReason::kGuardFailure ||
++      metadata.frame_meta.size() != 1 ||
++      metadata.innermostFrame().code == nullptr) {
++    return;
++  }
++  PyCodeObject* region_code = metadata.innermostFrame().code;
++  CodeExtra* extra = codeExtraIfExists(region_code);
++  if (extra == nullptr ||
++      !Ci_code_extra_udf_continuation_enabled_acquire(extra)) {
++    return;
++  }
++  if (region_frame == nullptr ||
++      validateUdfContinuationDeoptScope(
++          metadata, _PyFrame_GetCode(region_frame)) !=
++          UdfContinuationReject::kNone) {
++    return;
++  }
++  PyObject* saved_exception = PyErr_GetRaisedException();
++  PyObject* thread_dict = PyThreadState_GetDict();
++  if (thread_dict == nullptr) {
++    PyErr_Clear();
++    if (saved_exception != nullptr) {
++      PyErr_SetRaisedException(saved_exception);
++    }
++    return;
++  }
++  if (PyDict_DelItemString(thread_dict, kUdfContinuationDeoptFrameKey) < 0) {
++    PyErr_Clear();
++  }
++  PyFrameObject* frame_object = _PyFrame_GetFrameObject(region_frame);
++  if (frame_object == nullptr ||
++      PyDict_SetItemString(
++          thread_dict,
++          kUdfContinuationDeoptFrameKey,
++          reinterpret_cast<PyObject*>(frame_object)) < 0) {
++    PyErr_Clear();
++  }
++  PyErr_Clear();
++  if (saved_exception != nullptr) {
++    PyErr_SetRaisedException(saved_exception);
++  }
++}
++
++bool consumeUdfContinuationGuardDeopt(_PyInterpreterFrame* region_frame) {
++  PyObject* saved_exception = PyErr_GetRaisedException();
++  PyObject* thread_dict = PyThreadState_GetDict();
++  if (thread_dict == nullptr) {
++    PyErr_Clear();
++    if (saved_exception != nullptr) {
++      PyErr_SetRaisedException(saved_exception);
++    }
++    return false;
++  }
++  PyObject* observed_frame =
++      PyDict_GetItemString(thread_dict, kUdfContinuationDeoptFrameKey);
++  PyFrameObject* current_frame = region_frame == nullptr
++      ? nullptr
++      : _PyFrame_GetFrameObject(region_frame);
++  bool matches = current_frame != nullptr &&
++      observed_frame == reinterpret_cast<PyObject*>(current_frame);
++  if (PyDict_DelItemString(thread_dict, kUdfContinuationDeoptFrameKey) < 0) {
++    PyErr_Clear();
++  }
++  PyErr_Clear();
++  if (saved_exception != nullptr) {
++    PyErr_SetRaisedException(saved_exception);
++  }
++  return matches;
++}
++
  BorrowedRef<> MemoryView::readBorrowed(const LiveValue& value) const {
    JIT_CHECK(
        value.value_kind == jit::hir::ValueKind::kObject,
+diff --git a/cinderx/Jit/codegen/gen_asm.cpp b/cinderx/Jit/codegen/gen_asm.cpp
+--- a/cinderx/Jit/codegen/gen_asm.cpp
++++ b/cinderx/Jit/codegen/gen_asm.cpp
+@@ -229,5 +229,6 @@ DeoptResult prepareForDeopt(
+     deopt_obj = profileDeopt(deopt_meta, mem);
+   }
++  noteUdfContinuationDeopt(deopt_meta, frame);
+   auto ctx = getContext();
+   ctx->recordDeopt(code_runtime, deopt_idx, deopt_obj);
+   releaseRefs(deopt_meta, mem);
 diff --git a/cinderx/Jit/deopt.h b/cinderx/Jit/deopt.h
 index c727c28b665a8e800f4aef9a868e5268af087c4c..b2eb282d8bf7e7d5b1998dc277ba08f93d85497b 100644
 --- a/cinderx/Jit/deopt.h
@@ -187,7 +330,7 @@ index c727c28b665a8e800f4aef9a868e5268af087c4c..b2eb282d8bf7e7d5b1998dc277ba08f9
  
  namespace jit {
  
-@@ -202,6 +203,56 @@ struct DeoptMetadata {
+@@ -202,6 +203,64 @@ struct DeoptMetadata {
    static DeoptMetadata fromInstr(const jit::hir::DeoptBase& instr);
  };
  
@@ -241,6 +384,14 @@ index c727c28b665a8e800f4aef9a868e5268af087c4c..b2eb282d8bf7e7d5b1998dc277ba08f9
 +    const DeoptMetadata& metadata,
 +    PyCodeObject* expected_region_code);
 +
++// Observe a real deoptimization without changing CinderX recovery semantics.
++// A continuation payload may consume the observation only from that Region's
++// reified interpreter frame.
++void noteUdfContinuationDeopt(
++    const DeoptMetadata& metadata,
++    _PyInterpreterFrame* region_frame);
++bool consumeUdfContinuationGuardDeopt(_PyInterpreterFrame* region_frame);
++
  using CiPyFrameObjType = _PyInterpreterFrame;
  
  // Update `frame` so that execution can resume in the interpreter.
@@ -248,7 +399,14 @@ diff --git a/cinderx/Jit/jit_rt.cpp b/cinderx/Jit/jit_rt.cpp
 index 15d84d0820cbbfcc62c720de354b5ef8ebd5e568..fc9dd8fc54086722b568264017cb15f18e6e3518 100644
 --- a/cinderx/Jit/jit_rt.cpp
 +++ b/cinderx/Jit/jit_rt.cpp
-@@ -17,6 +17,7 @@
+@@ -9,5 +9,6 @@
+ #include "internal/pycore_pystate.h"
+
++#include "cinderx/Common/code.h"
+ #include "cinderx/Common/log.h"
+ #include "cinderx/Common/py-portability.h"
+ #include "cinderx/Common/ref.h"
+@@ -17,6 +18,7 @@
  #include "cinderx/Jit/codegen/arch.h"
  #include "cinderx/Jit/compiled_function.h"
  #include "cinderx/Jit/context.h"
@@ -256,10 +414,35 @@ index 15d84d0820cbbfcc62c720de354b5ef8ebd5e568..fc9dd8fc54086722b568264017cb15f1
  #include "cinderx/Jit/frame.h"
  #include "cinderx/Jit/generators_rt.h"
  // NOLINTNEXTLINE(facebook-unused-include-check)
-@@ -713,6 +714,144 @@ void JITRT_StoreUdfDataNullUnchecked(PyObject* capsule) {
+@@ -713,6 +715,187 @@ void JITRT_StoreUdfDataNullUnchecked(PyObject* capsule) {
    slot->value = {};
  }
  
++PyObject* JITRT_UdfRegisterContinuationCode(PyObject*, PyObject* target) {
++  PyCodeObject* code = nullptr;
++  if (PyFunction_Check(target)) {
++    code = reinterpret_cast<PyCodeObject*>(PyFunction_GetCode(target));
++  } else if (PyCode_Check(target)) {
++    code = reinterpret_cast<PyCodeObject*>(target);
++  } else {
++    PyErr_SetString(
++        PyExc_TypeError,
++        "_udf_register_continuation_code expects a function or code object");
++    return nullptr;
++  }
++  if (code == nullptr) {
++    return nullptr;
++  }
++  CodeExtra* extra = codeExtra(code);
++  if (extra == nullptr) {
++    PyErr_SetString(
++        PyExc_RuntimeError, "udf_continuation_code_registration_failed");
++    return nullptr;
++  }
++  Ci_code_extra_enable_udf_continuation_release(extra);
++  Py_RETURN_TRUE;
++}
++
 +PyObject* JITRT_UdfBuildContinuationPayload(PyObject*, PyObject* args) {
 +  if (!PyTuple_CheckExact(args) || PyTuple_GET_SIZE(args) != 13) {
 +    PyErr_SetString(
@@ -299,10 +482,18 @@ index 15d84d0820cbbfcc62c720de354b5ef8ebd5e568..fc9dd8fc54086722b568264017cb15f1
 +
 +  long abi_version = PyLong_AsLong(abi_object);
 +  long first_line = PyLong_AsLong(first_line_object);
++  const char* reason = PyUnicode_AsUTF8(reason_object);
 +  const char* resume_id = PyUnicode_AsUTF8(resume_object);
 +  const char* namespace_sha256 = PyUnicode_AsUTF8(namespace_object);
 +  const char* code_sha256 = PyUnicode_AsUTF8(code_object);
 +  if (PyErr_Occurred()) {
++    return nullptr;
++  }
++  bool requires_guard_deopt = std::strcmp(reason, "cinderx_deopt") == 0;
++  bool is_explicit_region_exit = std::strcmp(reason, "python_region") == 0;
++  if (!requires_guard_deopt && !is_explicit_region_exit) {
++    PyErr_SetString(
++        PyExc_ValueError, "udf_continuation_reason_invalid");
 +    return nullptr;
 +  }
 +  auto identity_reject = jit::validateUdfContinuationIdentity(
@@ -384,6 +575,16 @@ index 15d84d0820cbbfcc62c720de354b5ef8ebd5e568..fc9dd8fc54086722b568264017cb15f1
 +    PyTuple_SET_ITEM(live_payloads, index, entry);
 +  }
 +
++  _PyInterpreterFrame* region_frame =
++      interpFrameFromThreadState(_PyThreadState_UncheckedGet());
++  bool guard_deopt_observed =
++      jit::consumeUdfContinuationGuardDeopt(region_frame);
++  if (requires_guard_deopt && !guard_deopt_observed) {
++    PyErr_SetString(
++        PyExc_ValueError, "udf_continuation_guard_deopt_required");
++    return nullptr;
++  }
++
 +  return PyTuple_Pack(
 +      10,
 +      abi_object,
@@ -405,10 +606,13 @@ diff --git a/cinderx/Jit/jit_rt.h b/cinderx/Jit/jit_rt.h
 index af3c5cebfb6a856525789e34286411897442694b..aeb134eb861089a9648e04e135c45f13d8befe1d 100644
 --- a/cinderx/Jit/jit_rt.h
 +++ b/cinderx/Jit/jit_rt.h
-@@ -49,6 +49,7 @@ PyObject* JITRT_UdfDataStoreI64(PyObject* module, PyObject* args);
+@@ -49,6 +49,10 @@ PyObject* JITRT_UdfDataStoreI64(PyObject* module, PyObject* args);
  PyObject* JITRT_UdfDataStoreF32(PyObject* module, PyObject* args);
  PyObject* JITRT_UdfDataStoreF64(PyObject* module, PyObject* args);
  PyObject* JITRT_UdfDataStoreNull(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfRegisterContinuationCode(
++    PyObject* module,
++    PyObject* target);
 +PyObject* JITRT_UdfBuildContinuationPayload(PyObject* module, PyObject* args);
  bool JITRT_IsUdfDataNullUnchecked(PyObject* capsule);
  bool JITRT_LoadUdfDataBoolUnchecked(PyObject* capsule);
@@ -417,10 +621,16 @@ diff --git a/cinderx/Jit/pyjit.cpp b/cinderx/Jit/pyjit.cpp
 index f8634373761ed3acc89d56c5935b4dfbcd665bcd..c021121ec1167a084a798da7ea4087585a14bad8 100644
 --- a/cinderx/Jit/pyjit.cpp
 +++ b/cinderx/Jit/pyjit.cpp
-@@ -3469,6 +3469,11 @@ void restoreSysSetProfileAndSetTrace() {
+@@ -3469,6 +3469,17 @@ void restoreSysSetProfileAndSetTrace() {
  }
  
  PyMethodDef jit_methods[] = {
++    {"_udf_register_continuation_code",
++     JITRT_UdfRegisterContinuationCode,
++     METH_O,
++     PyDoc_STR(
++         "Enable GuardFailure continuation observation for a function or "
++         "code object.")},
 +    {"_udf_build_continuation_payload",
 +     JITRT_UdfBuildContinuationPayload,
 +     METH_VARARGS,
@@ -434,7 +644,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc6081f4c7b3
 --- /dev/null
 +++ b/cinderx/RuntimeTests/udf_continuation_test.cpp
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,277 @@
 +// Copyright (c) Meta Platforms, Inc. and affiliates.
 +
 +#include "cinderx/Jit/deopt.h"
@@ -469,12 +679,17 @@ index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc60
 +      jit::UdfContinuationReject::kCrossCodeDeopt);
 +}
 +
-+TEST_F(UdfContinuationTest, RuntimePayloadPreservesTypedValuesAndAliases) {
++TEST_F(
++    UdfContinuationTest,
++    GuardDeoptReturnsVersionedSideExitPayload) {
 +  runStockCode(R"(
 +import struct
 +
 +import cinderx.jit
-+from cinderjit import _udf_build_continuation_payload
++from cinderjit import (
++    _udf_build_continuation_payload,
++    _udf_register_continuation_code,
++)
 +
 +digest = "a" * 64
 +resume_id = "v1:" + "b" * 64
@@ -495,9 +710,13 @@ index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc60
 +)
 +nullable = (False, False, False, False, False, False, False, True)
 +materialized = (True,) * len(values)
++effects = []
++guard_target = len
 +
 +def build():
-+    return _udf_build_continuation_payload(
++    effects.append(("compiled_prefix", 7))
++    guard_target(())
++    payload = _udf_build_continuation_payload(
 +        1,
 +        "cinderx_deopt",
 +        resume_id,
@@ -512,10 +731,41 @@ index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc60
 +        active,
 +        True,
 +    )
++    try:
++        _udf_build_continuation_payload(
++            1,
++            "cinderx_deopt",
++            resume_id,
++            digest,
++            digest,
++            12,
++            source_map,
++            values,
++            kinds,
++            nullable,
++            materialized,
++            active,
++            True,
++        )
++    except ValueError as error:
++        return payload, str(error)
++    raise AssertionError("a GuardFailure ticket was consumed twice")
 +
++assert _udf_register_continuation_code(build)
 +assert cinderx.jit.force_compile(build)
 +assert cinderx.jit.is_jit_compiled(build)
-+payload = build()
++cinderx.jit.clear_runtime_stats()
++guard_target = lambda _: 0
++payload, repeated_error = build()
++stats = cinderx.jit.get_and_clear_runtime_stats()
++deopts = [
++    event
++    for event in stats["deopt"]
++    if event["normal"]["func_qualname"] == "build"
++    and event["normal"]["reason"] == "GuardFailure"
++]
++assert sum(event["int"]["count"] for event in deopts) >= 1, stats
++assert effects == [("compiled_prefix", 7)]
 +assert type(payload) is tuple and len(payload) == 10
 +assert payload[:7] == (
 +    1,
@@ -534,6 +784,7 @@ index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc60
 +assert tuple(entry[3] for entry in live) == values
 +assert payload[8] is active
 +assert payload[9] is True
++assert "guard_deopt_required" in repeated_error, repeated_error
 +)");
 +}
 +
@@ -541,7 +792,11 @@ index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc60
 +  runStockCode(R"(
 +import struct
 +
-+from cinderjit import _udf_build_continuation_payload
++import cinderx.jit
++from cinderjit import (
++    _udf_build_continuation_payload,
++    _udf_register_continuation_code,
++)
 +
 +digest = "a" * 64
 +resume_id = "v1:" + "b" * 64
@@ -564,6 +819,7 @@ index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc60
 +
 +cases = (
 +    (0, 2, "abi_mismatch"),
++    (1, "unknown_exit", "reason_invalid"),
 +    (2, "v2:" + "b" * 64, "resume_id_invalid"),
 +    (3, "A" * 64, "source_identity_invalid"),
 +    (12, False, "commit_required"),
@@ -583,5 +839,86 @@ index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc60
 +        assert reason in str(error), (reason, error)
 +    else:
 +        raise AssertionError(f"unsafe continuation accepted: {reason}")
++
++try:
++    _udf_build_continuation_payload(*valid)
++except ValueError as error:
++    assert "guard_deopt_required" in str(error), error
++else:
++    raise AssertionError("continuation accepted without a Region guard deopt")
++
++try:
++    _udf_register_continuation_code(object())
++except TypeError as error:
++    assert "function or code object" in str(error), error
++else:
++    raise AssertionError("continuation registration accepted an invalid target")
++
++explicit_exit = valid.copy()
++explicit_exit[1] = "python_region"
++payload = _udf_build_continuation_payload(*explicit_exit)
++assert payload[1] == "python_region"
++
++unregistered_guard_target = len
++
++def unregistered_region():
++    unregistered_guard_target(())
++    return _udf_build_continuation_payload(*valid)
++
++assert cinderx.jit.force_compile(unregistered_region)
++assert cinderx.jit.is_jit_compiled(unregistered_region)
++cinderx.jit.clear_runtime_stats()
++unregistered_guard_target = lambda _: 0
++try:
++    unregistered_region()
++except ValueError as error:
++    assert "guard_deopt_required" in str(error), error
++else:
++    raise AssertionError("an unregistered Region produced a continuation ticket")
++stats = cinderx.jit.get_and_clear_runtime_stats()
++deopts = [
++    event
++    for event in stats["deopt"]
++    if event["normal"]["func_qualname"] == "unregistered_region"
++    and event["normal"]["reason"] == "GuardFailure"
++]
++assert sum(event["int"]["count"] for event in deopts) >= 1, stats
++
++explicit_guard_target = len
++
++def explicit_exit_after_guard():
++    explicit_guard_target(())
++    explicit_payload = _udf_build_continuation_payload(*explicit_exit)
++    try:
++        _udf_build_continuation_payload(*valid)
++    except ValueError as error:
++        return explicit_payload, str(error)
++    raise AssertionError("an explicit exit left a reusable GuardFailure ticket")
++
++assert _udf_register_continuation_code(explicit_exit_after_guard)
++assert cinderx.jit.force_compile(explicit_exit_after_guard)
++explicit_guard_target = lambda _: 0
++explicit_payload, explicit_followup_error = explicit_exit_after_guard()
++assert explicit_payload[1] == "python_region"
++assert "guard_deopt_required" in explicit_followup_error, explicit_followup_error
++
++guard_target = len
++
++def leave_stale_observation(build_payload):
++    guard_target(())
++    if build_payload:
++        return _udf_build_continuation_payload(*valid)
++
++assert _udf_register_continuation_code(leave_stale_observation.__code__)
++assert cinderx.jit.force_compile(leave_stale_observation)
++guard_target = lambda _: 0
++leave_stale_observation(False)
++guard_target = len
++try:
++    leave_stale_observation(True)
++except ValueError as error:
++    assert "guard_deopt_required" in str(error), error
++else:
++    raise AssertionError("a stale Region deopt observation was reused")
 +)");
 +}

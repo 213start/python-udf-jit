@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
   "baseline_runtime_tree_sha256": "d29b9cb3512f7cca22d9fefece56484f705c4049e724ec6e99f04153477ff5de",
-  "candidate_runtime_tree_sha256": "6a3c2d046b07e5ff349a1b826dabebfaeb8ee72da773f814a8c1246ea21a76c8",
+  "candidate_runtime_tree_sha256": "514ab2d5b61c73301b274db7ca740030e67ad9c143a67bd09a0c4c84bcc954f3",
   "patches": [
     {
       "path": "0001-runtime-candidate.patch",
@@ -16,12 +16,12 @@
     },
     {
       "path": "0003-continuation-deopt.patch",
-      "sha256": "79f887e4b47f8faa41cf60d01a02e4c1a80ba8780ef3f6cc6e4e98b13fda3506",
-      "changed_file_count": 6
+      "sha256": "fedfb7b3d1069a34e5c9cc7aa03e082099d89778b74b92d5a5ba6cb276d45184",
+      "changed_file_count": 8
     }
   ],
-  "patch_series_sha256": "28fb3ad10b2d2c64de54a74e3d326aaf05f49b3de16c54730e2d5dccbccf17f0",
-  "changed_file_count": 29,
+  "patch_series_sha256": "4600d750661b6fff20b9fa4c4ec8d5afc413a3feb9fd1297b0e0dada823c329a",
+  "changed_file_count": 31,
   "continuation_abi": {
     "version": 1,
     "resume_id_prefix": "v1:",
