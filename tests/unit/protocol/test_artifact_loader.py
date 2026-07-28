@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import sys
+import threading
+import types
 import unittest
+from unittest import mock
 
 from python_udf_jit.compiler.capture import CaptureRequest, capture
 from python_udf_jit.compiler.pipeline import compile_semantic
@@ -163,6 +168,44 @@ class ArtifactLoaderTest(unittest.TestCase):
 
         self.assertEqual(decode_count, 4)
         self.assertEqual(store.get_count, 4)
+
+        resolver_threads = []
+
+        def fake_ray_get(reference, *, timeout):
+            self.assertEqual(timeout, 30.0)
+            resolver_threads.append(threading.get_ident())
+            return store.values[reference]
+
+        async def load_from_actor_event_loop():
+            actor_thread = threading.get_ident()
+            loader = ArtifactLoader()
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "ray": types.SimpleNamespace(
+                        get=fake_ray_get,
+                    )
+                },
+            ):
+                loaded = loader.load(
+                    carrier.handle,
+                    LoaderNamespace(
+                        "async-actor-job",
+                        "tenant-a",
+                        "process-1",
+                    ),
+                )
+            return actor_thread, loaded
+
+        actor_thread, loaded = asyncio.run(
+            load_from_actor_event_loop()
+        )
+        self.assertEqual(
+            loaded.content_sha256,
+            carrier.handle.content_sha256,
+        )
+        self.assertEqual(len(resolver_threads), 1)
+        self.assertNotEqual(resolver_threads[0], actor_thread)
 
     def test_missing_or_corrupt_object_is_negative_cached_in_its_namespace(self):
         encoded = _encoded()

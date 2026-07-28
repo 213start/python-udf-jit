@@ -4,6 +4,7 @@ import hashlib
 import importlib.metadata
 import secrets
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Callable
@@ -17,6 +18,9 @@ from python_udf_jit.protocol.manifest import (
     DEFAULT_MANIFEST,
     ArtifactManifest,
 )
+
+
+_RAY_GET_TIMEOUT_SECONDS = 30.0
 
 
 class ArtifactLoadRejectCode(StrEnum):
@@ -81,9 +85,33 @@ def _ray_get(reference: object) -> bytes:
     # verified by ArtifactLoader before decoding.
     if isinstance(reference, bytes):
         return reference
-    import ray
 
-    value = ray.get(reference)
+    def resolve() -> object:
+        import ray
+
+        return ray.get(
+            reference,
+            timeout=_RAY_GET_TIMEOUT_SECONDS,
+        )
+
+    try:
+        import asyncio
+
+        asyncio.get_running_loop()
+    except RuntimeError:
+        value = resolve()
+    else:
+        # Daft's RaySwordfishActor is asynchronous while the scalar UDF call
+        # is synchronous. Calling ray.get on that event-loop thread can
+        # deadlock the Actor. The process-local loader remains synchronous to
+        # its caller, but object-store progress runs on this bounded resolver.
+        with ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="udfjit-object-ref",
+        ) as executor:
+            value = executor.submit(resolve).result(
+                timeout=_RAY_GET_TIMEOUT_SECONDS + 1.0
+            )
     if not isinstance(value, bytes):
         raise TypeError("Ray object does not contain artifact bytes")
     return value
