@@ -210,7 +210,7 @@ SemanticRegion {
 
 - **接口原型：** `run(operation, analysis_manager) -> PassResult`
 - **约束：** 声明输入 IR 层、前置 Analysis、Preserved Analysis 和修改范围；禁止访问 Worker Buffer/ABI。
-- **变更说明：** 新 Operation 或序列化属性需要升级 Core IR Minor Version；破坏语义需升级 Major Version。
+- **变更说明：** 当前语义核心 IR 是首个正式格式的一部分，字段和操作集合固定。新增操作、序列化属性或语义变化都必须作为新的协同发布重新设计；当前读取器一律拒绝，不提供主次版本兼容。
 
 ### 3.5.3 编程手册设计
 

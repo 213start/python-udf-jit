@@ -1,12 +1,12 @@
 # RFC-004：可移植制品
 
-**状态 (Status):** Draft
+**状态：** 草案
 
-**作者 (Authors):** Python UDF JIT 项目组
+**作者：** Python UDF JIT 项目组
 
-**创建日期 (Created):** 2026-07-17
+**创建日期：** 2026-07-17
 
-**更新日期 (Updated):** 2026-07-17
+**更新日期：** 2026-07-27
 
 **相关 Issue/PR:** 本地方案评审阶段，无外部 Issue/PR
 
@@ -22,29 +22,29 @@
 
 ## 1.1 简介
 
-本提案定义 Driver 与 Worker 之间的不可变信息交换边界 `PortableUdfArtifact`。制品以 Core UDF IR 为核心 Payload，同时携带 Semantic Region Graph、Candidate Region Plan、Guard Template、Source Map、原始语义引用、依赖和兼容性 Manifest；Worker 验证后再结合实际 Schema/Layout/ABI/CPU 生成目标绑定产物。
+本提案定义驱动节点与工作节点之间的不可变信息交换边界 `PortableUdfArtifact`。穿刺期制品不构成任何已发布版本；当前制品格式 1.0 是项目的首个正式格式，不提供穿刺格式读取或迁移路径。制品携带语义核心 IR、语义区域图、物理布局访问规格、守卫模板、回退身份以及精确的运行目标和依赖清单；工作节点验证后再结合实际数据模式、布局、ABI 和 CPU 生成目标绑定产物。
 
-Portable Artifact 不等于 UDF IR，也不包含 Worker Buffer 地址、Layout Descriptor、CinderX HIR 或机器码。Daft 0.7.2 没有 Task Metadata 扩展 SPI，本期由生成的 UDF Wrapper/Expression 携带 Artifact Handle；小制品可内联，大制品通过 Ray ObjectRef 间接分发。
+可移植制品不等于 UDF IR，也不包含工作节点缓冲区地址、布局描述符、CinderX HIR 或机器码。Daft 0.7.2 没有任务元数据扩展 SPI，本期由生成的 UDF 包装器/表达式携带制品句柄；小制品内联，大制品通过 Ray `ObjectRef` 间接分发。
 
 ## 1.2 动机
 
-如果直接把 Driver 内 Python 对象或 CinderX HIR 发送给 Worker，产物会绑定进程地址、CPython/CinderX 版本或目标 CPU；如果只发送 UDF IR，又无法复现 Guard、Source Map、Fallback、依赖和分区决策。独立 Artifact Contract 能够：
+如果直接把驱动节点内的 Python 对象或 CinderX HIR 发送给工作节点，产物会绑定进程地址、CPython/CinderX 版本或目标 CPU；如果只发送 UDF IR，又无法复现守卫、回退身份、依赖和布局要求。独立制品契约能够：
 
-- 在 Head/Driver 与 Worker 之间保留足够语义而不固化目标布局；
-- 对内容做版本、Hash、签名和大小验证；
-- 支持 Ray 分发、Worker 缓存、Explain 和故障重建；
-- 将格式演进与内部内存对象解耦。
+- 在头节点/驱动节点与工作节点之间保留足够语义而不固化目标布局；
+- 对内容做精确版本、哈希和大小验证；
+- 支持 Ray 分发、工作节点缓存、解释信息和故障重建；
+- 把正式线格式与穿刺期内存对象完全隔离。
 
 ## 1.3 目标
 
 ### 目标
 
-1. 定义版本化、可验证、内容寻址的 Portable Artifact 格式。
-2. 包含 Core IR、Region 候选、Guard Template、Source Map、Fallback/原始语义引用和 Compatibility Manifest。
-3. 支持小 Payload 内联和大 Payload Ray ObjectRef 两种 Carrier。
-4. Worker 在反序列化、格式、Hash、签名、依赖和 ABI 校验后才交给 Physicalizer。
-5. Artifact 失败或丢失时执行原始 UDF，不影响 Daft/Ray 作业恢复。
-6. 为未来 Host Columnar/Vector 和 Accelerator Provider 保留能力声明，不包含目标机器码。
+1. 定义唯一、严格、可验证且内容寻址的正式可移植制品格式 1.0。
+2. 固定七个分段：`manifest`、`target`、`physical_layout`、`semantic_core_ir`、`semantic_region_graph`、`guard` 和 `fallback`。
+3. 支持小载荷内联和大载荷 Ray `ObjectRef` 两种载体。
+4. 工作节点完成格式、哈希、依赖、目标 ABI、语义 IR、区域图和布局访问规格校验后，才允许进入物理化。
+5. 制品内容失败或丢失时，在原可调用对象仍可安全执行的前提下改走原始 UDF。
+6. 为后续向量阶段保留明确的布局类型拒绝点，但本格式不承诺读取任何未来字段、分段或版本。
 
 ### 非目标
 
@@ -53,6 +53,9 @@ Portable Artifact 不等于 UDF IR，也不包含 Worker Buffer 地址、Layout 
 - 不替代 Ray Object Store 的生命周期、重试或容错。
 - 不把任意 pickle 反序列化当作可信 Artifact Codec。
 - 不在本 RFC 中定义数据布局或 CinderX 编译。
+- 不读取穿刺期制品，不提供格式迁移器，不跳过未知字段或未知分段。
+- 不提供前向兼容、后向兼容或混合版本执行能力。
+- 本期不实现制品签名、消息认证码、作业密钥、轮换或吊销通道。
 
 # 2. 用例分析
 
@@ -61,7 +64,7 @@ Portable Artifact 不等于 UDF IR，也不包含 Worker Buffer 地址、Layout 
 | 同一作业多个 Worker | 共享同一内容 Hash 的 Portable Artifact，各 Worker 独立目标特化 |
 | 异构 CPU Worker | Artifact 相同，RuntimeVariant 按 CPU/ABI Key 分离 |
 | Actor/Worker 重启 | 从 Wrapper Handle/ObjectRef 重新加载 Artifact，再编译或解释执行 |
-| Artifact 损坏/版本过新 | Loader 拒绝并记录原因，调用原始 UDF |
+| 制品损坏/格式不一致 | 加载器拒绝并记录原因，在满足安全回退前提时调用原始 UDF |
 | Explain 离线分析 | 不加载业务数据或执行代码即可查看 IR、Region、Guard 和 Source Map |
 | 大闭包或依赖对象 | Artifact 只保存受控引用/Hash，原始 Callable 由框架既有序列化载体承载 |
 
@@ -71,25 +74,25 @@ Portable Artifact 不等于 UDF IR，也不包含 Worker Buffer 地址、Layout 
 
 ```mermaid
 flowchart LR
-    CORE["CoreUdfModule<br/>SemanticRegionGraph"] --> BUILD["Artifact Builder"]
-    BUILD --> VERIFY["Format/IR/Policy Verifier"]
-    VERIFY --> HASH["Content Hash + Signature"]
-    HASH --> CHOICE{"payload size"}
-    CHOICE -->|"small"| INLINE["Inline Artifact Handle"]
-    CHOICE -->|"large"| OBJECT["Ray ObjectRef Handle"]
-    INLINE --> CARRIER["Generated UDF Wrapper/Expression"]
+    CORE["语义核心 IR<br/>语义区域图"] --> BUILD["制品构建器"]
+    BUILD --> VERIFY["格式、IR 和策略验证器"]
+    VERIFY --> HASH["内容哈希"]
+    HASH --> CHOICE{"载荷大小"}
+    CHOICE -->|"小"| INLINE["内联制品句柄"]
+    CHOICE -->|"大"| OBJECT["Ray ObjectRef 句柄"]
+    INLINE --> CARRIER["生成的 UDF 包装器/表达式"]
     OBJECT --> CARRIER
-    CARRIER --> LOADER["Worker Loader + Validator"]
-    LOADER --> PHYSICAL["RFC-005 Physicalization"]
+    CARRIER --> LOADER["工作节点加载器和验证器"]
+    LOADER --> PHYSICAL["RFC-005 物理化"]
 ```
 
-Artifact 采用 Envelope + Sections：Envelope 保存格式、Hash、兼容要求和 Section Directory；各 Section 单独设长度、Codec 和 Hash，允许未来增加可跳过的 Optional Section。
+制品采用“封装头 + 固定分段”结构。封装头保存精确格式号、总长度、分段数和主体哈希；每个分段单独保存名称、编解码器、长度和哈希。分段集合及顺序完全固定，任何未知、重复、缺失或乱序分段都被拒绝，不存在可跳过的可选分段。
 
 ## 3.2 技术选型
 
 | 方案 | 优点 | 缺点 | 结论 |
 |---|---|---|---|
-| 自描述 Envelope + 二进制 Sections | 可版本化、校验、跳过未知可选段 | 需维护 Schema/Codec | 本期采用 |
+| 自描述封装头 + 固定二进制分段 | 可精确校验、限制资源并稳定定位损坏 | 变更需要整套组件同步发布 | 本期采用 |
 | 直接 pickle 内存对象 | 实现快 | 安全风险、版本/类路径脆弱、不可跨 ABI | 不采用 |
 | CinderX HIR/机器码制品 | Worker 加载快 | 绑定 Runtime/CPU，失去可移植性 | 仅允许进入 SpecializedArtifact |
 | 独立 Registry 服务 | 全局复用和治理强 | 增加服务、网络和故障域 | 本期不采用 |
@@ -102,54 +105,50 @@ Artifact 采用 Envelope + Sections：Envelope 保存格式、Hash、兼容要�
 ```text
 PortableUdfArtifact {
   header: {
-    magic, format_major, format_minor,
-    semantic_hash, content_hash,
-    producer_manifest, compatibility_requirements
+    magic, format_major=1, format_minor=0,
+    total_length, section_count, body_hash
   },
-  core_ir,
+  manifest,
+  target,
+  physical_layout,
+  semantic_core_ir,
   semantic_region_graph,
-  candidate_region_plan,
-  guard_template,
-  effect_summary,
-  source_map,
-  planner_expression_candidates,
-  fallback_payload_ref,
-  dependency_manifest,
-  policy_fingerprint
+  guard,
+  fallback
 }
 
 ArtifactHandle = Inline(bytes) | RayObjectRef(object_id, content_hash)
 ```
 
-`fallback_payload_ref` 指向由框架正常序列化的原始 Callable/Expression，不要求 Artifact Codec 反序列化任意 Python 对象。Loader 先校验 Envelope、Section 长度和 Hash，再解析 IR；Optional Section 未识别时可跳过，Required Section 未识别时拒绝。
+`fallback` 只保存原可调用对象的稳定身份；原可调用对象仍由框架现有序列化路径承载，制品编解码器不会反序列化任意 Python 对象。加载器先校验封装头、固定分段名称与顺序、长度和哈希，再解析 IR。任何未定义内容都被拒绝。
 
 ### 兼容键
 
-Portable Artifact 声明：Format Version、Core IR Version、Framework Adapter ABI、最低 Runtime ABI、逻辑依赖版本范围。CPython/CinderX SOABI、CPU Feature、Arrow 具体布局只作为 Worker Binding 的输入，不固化为唯一可用目标；若 Artifact 含 Python Bytecode/Callable 引用，则同时声明其 CPython Code Format 约束。
+正式制品声明精确的制品格式、语义核心 IR 格式、语义区域图格式、框架适配器 ABI、运行时 ABI、Python 版本、SOABI 和依赖版本。驱动节点、工作节点与制品必须逐项完全一致；不存在“最低版本”“兼容范围”或主次版本容忍。CPU 特征和工作节点本地描述符进入变体键，不写入可移植制品。
 
 ### 性能与验收
 
 - Benchmark：主线 UDF 集分别生成 1、10、100、1000 个 Artifact，在本地与 Ray ObjectRef 两种 Carrier 下执行完整 Daft Job。
 - Candidate 与 baseline 都执行原始 UDF，仅开启/关闭 Artifact 构建、分发和 Worker 校验；稳态端到端中位数比 `>= 0.98`。
 - 同一 Content Hash 在单 Worker 进程只完成一次解析/验证；Actor/Worker 重启后能从 ObjectRef 重建。
-- 对截断、Section 越界、Hash 错误、Major Version 不兼容、依赖缺失和伪造签名分别拒绝，作业仍走原始 UDF。
-- Portable Artifact 不得包含地址样式的 Worker Pointer、机器码 Section 或真实 Buffer Descriptor；静态检查必须通过。
-- 本 RFC 不单独承担主线 `1.15x`，但 Artifact 分发失败不得破坏 RFC-007 的安全解释路径。
+- 对截断、分段越界、哈希错误、任意版本不一致、未知字段、未知分段、依赖缺失分别拒绝，作业在满足安全回退前提时走原始 UDF。
+- 可移植制品不得包含地址样式的工作节点指针、机器码分段或真实缓冲区描述符；静态检查必须通过。
+- 本 RFC 不单独承担主线 `1.15x`，但制品分发失败不得破坏 RFC-007 的安全解释路径。
 
 ## 3.4 安全隐私与DFX设计
 
 - 解析采用长度上限、深度上限、节点数上限和整数溢出检查；验证前不得映射可执行内存。
-- Content Hash 覆盖 Header 和所有 Required Sections；签名/发布来源策略由运行环境配置。
-- Artifact 不保存业务行值；Source Map/字段名按策略脱敏。
-- Ray ObjectRef 与 Job Namespace 绑定；跨租户缓存必须使用租户隔离和签名。
-- 格式 Major 不兼容时拒绝；Minor 只允许新增可跳过字段/Section。
-- Loader 失败写结构化诊断和负缓存，避免每批重复解析损坏 Artifact。
+- 内容哈希覆盖完整制品；分段哈希和主体哈希用于尽早定位损坏。
+- 制品不保存业务行值；事件和解释信息不得输出业务值、源码或绝对路径。
+- Ray `ObjectRef` 与作业和租户命名空间绑定；缓存不得跨命名空间命中。
+- 格式号必须精确等于 1.0，其他主版本或次版本一律拒绝。
+- 加载失败写结构化诊断和负缓存，避免每批重复解析损坏制品。
 
 ## 3.5 编程与调用设计
 
 ### 3.5.1 编程模型基本设计
 
-普通用户不直接构造 Artifact。编译器、Runtime 和离线工具共享生成式 Schema/Codec；开发者可用 `udfjitctl artifact inspect|verify` 查看不含业务值的结构和兼容结果。
+普通用户不直接构造制品。编译器、运行时和离线工具共享同一严格数据模式和编解码器；开发者可用 `udfjitctl artifact inspect|verify` 查看不含业务值的结构和验证结果。
 
 ### 3.5.2 接口定义与设计
 
@@ -157,7 +156,7 @@ Portable Artifact 声明：Format Version、Core IR Version、Framework Adapter 
 
 - **接口描述：** 从 Verified Core/Region 产物生成不可变 Artifact。
 - **接口原型：** `build_artifact(input, policy) -> ArtifactBuildResult`
-- **输入：** CoreUdfModule、SemanticRegionGraph、CandidateRegionPlan、Guard Template、Source Map、Fallback Ref、Manifest。
+- **输入：** 语义核心 IR、语义区域图、物理布局访问规格、守卫模板、回退身份和清单。
 - **输出：** Artifact bytes、Content Hash、ArtifactHandle、诊断。
 - **异常处理：** IR 未验证、Section 超限或 Codec 失败时返回拒绝，不产生部分制品。
 
@@ -166,9 +165,9 @@ Portable Artifact 声明：Format Version、Core IR Version、Framework Adapter 
 | 参数名称 | 输入/输出 | 类型 | 描述 | 取值范围 |
 |---|---|---|---|---|
 | `handle` | 输入 | ArtifactHandle | Inline 或 Ray ObjectRef | 必须含 Content Hash |
-| `runtime_manifest` | 输入 | Manifest | Worker 环境与 ABI | 只读 |
-| `artifact` | 输出 | VerifiedArtifact | 已解析只读对象 | 全部 Required Section 通过 |
-| `reject_reason` | 输出 | Enum | 失败原因 | Version/Hash/Signature/ABI/Codec 等 |
+| `runtime_manifest` | 输入 | Manifest | 工作节点环境与 ABI | 只读 |
+| `artifact` | 输出 | VerifiedArtifact | 已解析只读对象 | 全部固定分段通过 |
+| `reject_reason` | 输出 | Enum | 失败原因 | 版本、哈希、依赖、ABI、编解码器等 |
 
 #### 3.5.2.3 `IF-ARTIFACT-CARRIER-API`
 
@@ -178,13 +177,13 @@ Portable Artifact 声明：Format Version、Core IR Version、Framework Adapter 
 
 ### 3.5.3 编程手册设计
 
-运维/开发手册新增 Artifact 格式版本、兼容键、`inspect/verify`、Ray ObjectRef 生命周期、缓存清理和损坏制品诊断章节。
+运维/开发手册新增正式制品格式 1.0、精确准入键、`inspect/verify`、Ray `ObjectRef` 生命周期、缓存清理和损坏制品诊断章节。
 
 # 4. 缺点和风险
 
 | 风险 | 影响 | 应对 |
 |---|---|---|
-| 格式过早固化 | 后续 IR 演进困难 | Envelope/Sections、Major/Minor 规则、兼容测试 |
+| 格式需要变更 | 当前读取器不能接受新内容 | 作为新的协同发布项目设计；当前读取器严格拒绝，不在本期预埋兼容逻辑 |
 | Artifact 过大 | Driver 延迟和 Object Store 压力 | 常量外置、压缩、大小预算、内容去重 |
 | Fallback Callable 序列化失败 | Worker 无正确性路径 | Adapter 在发布前验证框架原始序列化能力；失败不替换原 Expression |
 | 反序列化攻击 | Crash/越界或资源耗尽 | 受控 Codec、边界检查、签名、预算、Verifier |
@@ -198,7 +197,7 @@ Portable Artifact 声明：Format Version、Core IR Version、Framework Adapter 
 
 # 6. 未解决问题
 
-本 RFC 无阻塞性未决问题。跨 Job/集群的全局 Artifact Registry 和远程签名服务属于后续运维演进，不进入本期。
+本 RFC 无阻塞性未决问题。跨作业/集群的全局制品注册表和制品认证机制不进入本期；如后续确有需求，必须单独设计并重新完成端到端资格验证。
 
 ---
 
@@ -218,4 +217,4 @@ Portable Artifact 声明：Format Version、Core IR Version、Framework Adapter 
 
 ## 附录 C：文档更新计划
 
-Core IR、Guard Template、Carrier 或 Compatibility Manifest 变化时更新；任何破坏 Required Section 语义的变化升级 Major Version。
+语义核心 IR、守卫模板、载体或清单发生任何结构变化时，当前格式 1.0 读取器继续严格拒绝新结构。是否设计下一正式格式由独立 RFC 决定，本 RFC 不承诺迁移或兼容路径。
