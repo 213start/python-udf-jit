@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import sys
 import threading
-import types
 import unittest
-from unittest import mock
 
 from python_udf_jit.compiler.capture import CaptureRequest, capture
 from python_udf_jit.compiler.pipeline import compile_semantic
@@ -171,30 +168,31 @@ class ArtifactLoaderTest(unittest.TestCase):
 
         resolver_threads = []
 
-        def fake_ray_get(reference, *, timeout):
-            self.assertEqual(timeout, 30.0)
-            resolver_threads.append(threading.get_ident())
-            return store.values[reference]
+        class AwaitableReference:
+            def __await__(self):
+                async def resolve():
+                    resolver_threads.append(
+                        threading.get_ident()
+                    )
+                    return encoded
+
+                return resolve().__await__()
 
         async def load_from_actor_event_loop():
             actor_thread = threading.get_ident()
             loader = ArtifactLoader()
-            with mock.patch.dict(
-                sys.modules,
-                {
-                    "ray": types.SimpleNamespace(
-                        get=fake_ray_get,
-                    )
-                },
-            ):
-                loaded = loader.load(
-                    carrier.handle,
-                    LoaderNamespace(
-                        "async-actor-job",
-                        "tenant-a",
-                        "process-1",
-                    ),
-                )
+            handle = dataclasses.replace(
+                carrier.handle,
+                reference=AwaitableReference(),
+            )
+            loaded = loader.load(
+                handle,
+                LoaderNamespace(
+                    "async-actor-job",
+                    "tenant-a",
+                    "process-1",
+                ),
+            )
             return actor_thread, loaded
 
         actor_thread, loaded = asyncio.run(

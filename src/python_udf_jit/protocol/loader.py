@@ -109,7 +109,16 @@ def _ray_get(reference: object) -> bytes:
             max_workers=1,
             thread_name_prefix="udfjit-object-ref",
         ) as executor:
-            value = executor.submit(resolve).result(
+            async def await_reference() -> object:
+                return await asyncio.wait_for(
+                    reference,  # type: ignore[arg-type]
+                    timeout=_RAY_GET_TIMEOUT_SECONDS,
+                )
+
+            value = executor.submit(
+                asyncio.run,
+                await_reference(),
+            ).result(
                 timeout=_RAY_GET_TIMEOUT_SECONDS + 1.0
             )
     if not isinstance(value, bytes):
