@@ -100,15 +100,36 @@ class _LocalProviderFactory:
     def compile(self, artifact, key):
         self.compile_count += 1
         registry = CapabilityRegistry(epoch=key.process.cluster_epoch)
-        handle = registry.register(LocalScalarSlotBackend())
+        input_spec = artifact.input_access_specs[0]
+        output_spec = artifact.output_access_spec
+        input_handle = registry.register(
+            LocalScalarSlotBackend(
+                scalar_type=input_spec.scalar_type,
+                nullable=input_spec.nullable,
+            )
+        )
+        output_handle = registry.register(
+            LocalScalarSlotBackend(
+                scalar_type=output_spec.scalar_type,
+                nullable=output_spec.nullable,
+            )
+        )
         compiled = compile_semantic_scalar_region(
             artifact.semantic_core_module,
             artifact.semantic_region_graph,
+            input_spec=input_spec,
+            output_spec=output_spec,
             registry=registry,
             execution_mode="python-interpreter-test-double",
         )
         return ScalarProviderVariant(
-            key, compiled, registry, handle, ScalarExecutor(registry), 0
+            key,
+            compiled,
+            registry,
+            input_handle,
+            output_handle,
+            ScalarExecutor(registry),
+            (),
         )
 
 

@@ -232,14 +232,17 @@ class ScalarSlotBackend(ABC):
     must never place the Capsule or a native address in ``ScalarSlotDescriptor``.
     """
 
+    @property
     @abstractmethod
-    def write_f64(self, value: float) -> None:
+    def scalar_type(self) -> str:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def nullable(self) -> bool:
         raise NotImplementedError
 
     @abstractmethod
-    def load_f64(self) -> float:
-        raise NotImplementedError
-
     def write_scalar(
         self,
         value: object,
@@ -247,28 +250,40 @@ class ScalarSlotBackend(ABC):
         scalar_type: str,
         nullable: bool,
     ) -> None:
-        normalized = normalize_scalar_value(
-            value,
-            scalar_type,
-            nullable=nullable,
-        )
-        if scalar_type != FLOAT64_SCALAR_TYPE or normalized is None:
-            raise TypeError(
-                "native scalar backend currently supports non-null float64"
-            )
-        self.write_f64(normalized)
+        raise NotImplementedError
 
+    @abstractmethod
     def load_scalar(
         self,
         *,
         scalar_type: str,
         nullable: bool,
     ) -> object:
-        if scalar_type != FLOAT64_SCALAR_TYPE or nullable:
+        raise NotImplementedError
+
+    def write_f64(self, value: float) -> None:
+        if self.scalar_type != FLOAT64_SCALAR_TYPE or self.nullable:
             raise TypeError(
-                "native scalar backend currently supports non-null float64"
+                "write_f64 requires a non-null float64 scalar slot"
             )
-        return self.load_f64()
+        self.write_scalar(
+            value,
+            scalar_type=FLOAT64_SCALAR_TYPE,
+            nullable=False,
+        )
+
+    def load_f64(self) -> float:
+        if self.scalar_type != FLOAT64_SCALAR_TYPE or self.nullable:
+            raise TypeError(
+                "load_f64 requires a non-null float64 scalar slot"
+            )
+        value = self.load_scalar(
+            scalar_type=FLOAT64_SCALAR_TYPE,
+            nullable=False,
+        )
+        if type(value) is not float:
+            raise TypeError("float64 scalar slot returned a non-float")
+        return value
 
     def borrow_keepalive(self) -> Any:
         return self
@@ -309,23 +324,20 @@ class LocalScalarSlotBackend(ScalarSlotBackend):
         self._value: object = _UNINITIALIZED
         self._closed = False
 
+    @property
+    def scalar_type(self) -> str:
+        return self._scalar_type
+
+    @property
+    def nullable(self) -> bool:
+        return self._nullable
+
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("scalar slot backend is closed")
 
     def write_f64(self, value: float) -> None:
-        if (
-            self._scalar_type != FLOAT64_SCALAR_TYPE
-            or self._nullable
-        ):
-            raise TypeError(
-                "write_f64 requires a non-null float64 local slot"
-            )
-        self.write_scalar(
-            value,
-            scalar_type=FLOAT64_SCALAR_TYPE,
-            nullable=False,
-        )
+        super().write_f64(value)
 
     def write_scalar(
         self,
@@ -347,20 +359,7 @@ class LocalScalarSlotBackend(ScalarSlotBackend):
         )
 
     def load_f64(self) -> float:
-        if (
-            self._scalar_type != FLOAT64_SCALAR_TYPE
-            or self._nullable
-        ):
-            raise TypeError(
-                "load_f64 requires a non-null float64 local slot"
-            )
-        value = self.load_scalar(
-            scalar_type=FLOAT64_SCALAR_TYPE,
-            nullable=False,
-        )
-        if type(value) is not float:
-            raise TypeError("float64 local slot returned a non-float")
-        return value
+        return super().load_f64()
 
     def load_scalar(
         self,
@@ -397,29 +396,70 @@ class CinderXScalarSlotBackend(ScalarSlotBackend):
     acquired only when this backend is first borrowed or accessed.
     """
 
-    _REQUIRED_HELPERS = (
+    _REQUIRED_COMMON_HELPERS = (
         "_udf_create_scalar_slot",
         "_udf_set_scalar_slot",
         "_udf_begin_scalar_slot_borrow",
         "_udf_end_scalar_slot_borrow",
         "_udf_release_scalar_slot",
         "_udf_guard_data_handle",
-        "_udf_data_load_f64",
+        "_udf_data_is_null",
+        "_udf_data_store_null",
     )
+    _HELPER_SUFFIX = {
+        BOOL_SCALAR_TYPE: "bool",
+        INT32_SCALAR_TYPE: "i32",
+        INT64_SCALAR_TYPE: "i64",
+        FLOAT32_SCALAR_TYPE: "f32",
+        FLOAT64_SCALAR_TYPE: "f64",
+    }
 
-    def __init__(self, *, module_name: str = "cinderjit") -> None:
+    def __init__(
+        self,
+        *,
+        scalar_type: str = FLOAT64_SCALAR_TYPE,
+        nullable: bool = False,
+        module_name: str = "cinderjit",
+    ) -> None:
         if not isinstance(module_name, str) or not module_name:
             raise ValueError("CinderX module name must be a non-empty string")
+        if scalar_type not in SUPPORTED_SCALAR_TYPES:
+            raise ValueError("unsupported scalar type")
+        if type(nullable) is not bool:
+            raise TypeError("nullable must be bool")
+        self._scalar_type = scalar_type
+        self._nullable = nullable
         self._module_name = module_name
         self._module: Any = None
         self._capsule: object | None = None
         self._borrowed = False
         self._closed = False
 
+    @property
+    def scalar_type(self) -> str:
+        return self._scalar_type
+
+    @property
+    def nullable(self) -> bool:
+        return self._nullable
+
+    @property
+    def helper_suffix(self) -> str:
+        return self._HELPER_SUFFIX[self._scalar_type]
+
     def _runtime(self) -> Any:
         if self._module is None:
             module = importlib.import_module(self._module_name)
-            missing = [name for name in self._REQUIRED_HELPERS if not callable(getattr(module, name, None))]
+            required = (
+                *self._REQUIRED_COMMON_HELPERS,
+                f"_udf_data_load_{self.helper_suffix}",
+                f"_udf_data_store_{self.helper_suffix}",
+            )
+            missing = [
+                name
+                for name in required
+                if not callable(getattr(module, name, None))
+            ]
             if missing:
                 raise RuntimeError(f"CinderX scalar runtime helpers missing: {','.join(missing)}")
             self._module = module
@@ -429,21 +469,60 @@ class CinderXScalarSlotBackend(ScalarSlotBackend):
         if self._closed:
             raise RuntimeError("CinderX scalar slot backend is closed")
         if self._capsule is None:
-            self._capsule = self._runtime()._udf_create_scalar_slot()
+            self._capsule = self._runtime()._udf_create_scalar_slot(
+                self._scalar_type,
+                self._nullable,
+            )
         return self._capsule
 
     def write_f64(self, value: float) -> None:
-        if type(value) is not float:
-            raise TypeError("scalar slot accepts exactly one Python float")
-        self._runtime()._udf_set_scalar_slot(self._ensure_capsule(), value)
+        super().write_f64(value)
+
+    def write_scalar(
+        self,
+        value: object,
+        *,
+        scalar_type: str,
+        nullable: bool,
+    ) -> None:
+        if scalar_type != self._scalar_type or nullable != self._nullable:
+            raise TypeError("scalar slot contract mismatch")
+        normalized = normalize_scalar_value(
+            value,
+            scalar_type,
+            nullable=nullable,
+        )
+        self._runtime()._udf_set_scalar_slot(
+            self._ensure_capsule(),
+            normalized,
+        )
 
     def load_f64(self) -> float:
+        return super().load_f64()
+
+    def load_scalar(
+        self,
+        *,
+        scalar_type: str,
+        nullable: bool,
+    ) -> object:
+        if scalar_type != self._scalar_type or nullable != self._nullable:
+            raise TypeError("scalar slot contract mismatch")
         runtime = self._runtime()
         guarded = runtime._udf_guard_data_handle(self._ensure_capsule())
-        value = runtime._udf_data_load_f64(guarded)
-        if type(value) is not float:
-            raise TypeError("CinderX scalar data load must return a Python float")
-        return value
+        if runtime._udf_data_is_null(guarded):
+            if not nullable:
+                raise RuntimeError("non-null scalar slot contains null")
+            return None
+        value = getattr(
+            runtime,
+            f"_udf_data_load_{self.helper_suffix}",
+        )(guarded)
+        return normalize_scalar_value(
+            value,
+            scalar_type,
+            nullable=nullable,
+        )
 
     def begin_borrow(self) -> object:
         if self._borrowed:

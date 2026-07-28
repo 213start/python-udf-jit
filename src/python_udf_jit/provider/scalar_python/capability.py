@@ -11,7 +11,6 @@ from typing import Any
 
 from python_udf_jit.runtime.guards import DescriptorGuardError, guard_descriptor
 from python_udf_jit.runtime.layout import (
-    FLOAT64_SCALAR_TYPE,
     SCALAR_SLOT_ABI_VERSION,
     ProcessIdentity,
     ScalarSlotBackend,
@@ -137,7 +136,14 @@ class BorrowedCapability(AbstractContextManager["BorrowedCapability"]):
         return self
 
     def write_f64(self, value: float) -> None:
-        self._registry._write_f64(self.handle, self._borrow_token, value)
+        self.write_scalar(value)
+
+    def write_scalar(self, value: object) -> None:
+        self._registry._write_scalar(
+            self.handle,
+            self._borrow_token,
+            value,
+        )
 
     @property
     def execution_handle(self) -> object:
@@ -208,10 +214,11 @@ class CapabilityRegistry:
             token = secrets.token_hex(32)
             descriptor = ScalarSlotDescriptor(
                 abi_version=SCALAR_SLOT_ABI_VERSION,
-                scalar_type=FLOAT64_SCALAR_TYPE,
+                scalar_type=backend.scalar_type,
                 epoch=self._epoch,
                 access_id=access_id,
                 process=self._identity,
+                nullable=backend.nullable,
                 descriptor_generation=generation,
             )
             self._entries[access_id] = _Entry(
@@ -267,24 +274,34 @@ class CapabilityRegistry:
             return _GuardedSlot(handle, entry.borrow_token)
 
     def data_load_f64(self, guarded: object) -> float:
+        value = self.data_load_scalar(guarded)
+        if type(value) is not float:
+            raise TypeError("float64 capability returned a non-float")
+        return value
+
+    def data_load_scalar(self, guarded: object) -> object:
         with self._lock:
-            if not isinstance(guarded, _GuardedSlot):
-                raise CapabilityError(
-                    CapabilityRejectCode.BORROW_MISMATCH
-                )
-            entry = self._resolve(guarded.handle)
-            if entry.borrow_token is None:
-                raise CapabilityError(
-                    CapabilityRejectCode.NOT_BORROWED
-                )
-            if not hmac.compare_digest(
-                entry.borrow_token,
-                guarded.borrow_token,
-            ):
-                raise CapabilityError(
-                    CapabilityRejectCode.BORROW_MISMATCH
-                )
-            return entry.backend.load_f64()
+            entry = self._resolve_guarded(guarded)
+            return entry.backend.load_scalar(
+                scalar_type=entry.descriptor.scalar_type,
+                nullable=entry.descriptor.nullable,
+            )
+
+    def data_is_null(self, guarded: object) -> bool:
+        return self.data_load_scalar(guarded) is None
+
+    def data_store_scalar(self, guarded: object, value: object) -> object:
+        with self._lock:
+            entry = self._resolve_guarded(guarded)
+            entry.backend.write_scalar(
+                value,
+                scalar_type=entry.descriptor.scalar_type,
+                nullable=entry.descriptor.nullable,
+            )
+        return value
+
+    def data_store_null(self, guarded: object) -> None:
+        self.data_store_scalar(guarded, None)
 
     def release(self, handle: CapabilityHandle) -> None:
         with self._lock:
@@ -324,13 +341,42 @@ class CapabilityRegistry:
                 expected_epoch=self._epoch,
                 expected_access_id=handle.access_id,
                 expected_process=self._identity,
+                expected_scalar_type=entry.descriptor.scalar_type,
+                expected_nullable=entry.descriptor.nullable,
+                expected_ownership=entry.descriptor.ownership,
+                expected_access_mode=entry.descriptor.access_mode,
+                expected_capacity=entry.descriptor.capacity,
                 expected_descriptor_generation=handle.generation,
             )
         except DescriptorGuardError as error:
             raise CapabilityError(CapabilityRejectCode.DESCRIPTOR_MISMATCH) from error
         return entry
 
-    def _write_f64(self, handle: CapabilityHandle, borrow_token: str, value: float) -> None:
+    def _resolve_guarded(self, guarded: object) -> _Entry:
+        if not isinstance(guarded, _GuardedSlot):
+            raise CapabilityError(
+                CapabilityRejectCode.BORROW_MISMATCH
+            )
+        entry = self._resolve(guarded.handle)
+        if entry.borrow_token is None:
+            raise CapabilityError(
+                CapabilityRejectCode.NOT_BORROWED
+            )
+        if not hmac.compare_digest(
+            entry.borrow_token,
+            guarded.borrow_token,
+        ):
+            raise CapabilityError(
+                CapabilityRejectCode.BORROW_MISMATCH
+            )
+        return entry
+
+    def _write_scalar(
+        self,
+        handle: CapabilityHandle,
+        borrow_token: str,
+        value: object,
+    ) -> None:
         with self._lock:
             entry = self._resolve(handle)
             if entry.borrow_token is None:
@@ -344,7 +390,11 @@ class CapabilityRegistry:
                 raise CapabilityError(
                     CapabilityRejectCode.BORROW_MISMATCH
                 )
-            entry.backend.write_f64(value)
+            entry.backend.write_scalar(
+                value,
+                scalar_type=entry.descriptor.scalar_type,
+                nullable=entry.descriptor.nullable,
+            )
 
     def _execution_handle(self, handle: CapabilityHandle, borrow_token: str) -> object:
         with self._lock:

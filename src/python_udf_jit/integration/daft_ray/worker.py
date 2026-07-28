@@ -460,6 +460,7 @@ class WorkerScalarAdapter:
                     isinstance(self._provider_factory, CinderXScalarProviderFactory)
                     and variant.execution_mode == "cinderx-jit"
                     and variant.intrinsic_load_count == 1
+                    and variant.intrinsic_store_count >= 1
                 )
                 self._emit(
                     "jit" if is_production_jit else "provider",
@@ -480,6 +481,7 @@ class WorkerScalarAdapter:
                     isinstance(self._provider_factory, CinderXScalarProviderFactory)
                     and variant.execution_mode == "cinderx-jit"
                     and variant.intrinsic_load_count == 1
+                    and variant.intrinsic_store_count >= 1
                 )
                 self._emit(
                     "jit" if is_production_jit else "provider",
@@ -537,10 +539,6 @@ class WorkerScalarAdapter:
             )
             with frame:
                 physical_value = frame.load_input()
-                if type(physical_value) is not float:
-                    raise PreSemanticsExecutionError(
-                        "physicalized_input_type_mismatch"
-                    )
                 semantics_entered = True
                 result = variant.execute(physical_value)
                 frame.stage_output(result)
