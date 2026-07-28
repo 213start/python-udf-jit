@@ -11,7 +11,7 @@ from typing import Any, Mapping
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
-EXPECTED_RUNTIME_TOTALS = (1176, 66, 130)
+EXPECTED_RUNTIME_TOTALS = (1177, 66, 130)
 EXPECTED_UDF_RUNTIME_CASES = (
     "UdfDataIntrinsicTest.RuntimeHelpersEnforceBorrowAndLifetime",
     "UdfDataIntrinsicTest.RuntimeHelpersRejectCrossProcessCapsule",
@@ -177,7 +177,7 @@ def _python_tests(
         r"\[([0-9]+) passed, ([0-9]+) skipped, ([0-9]+) deselected\]",
         release_log,
     )
-    if release is None or tuple(map(int, release.groups())) != (1331, 63, 8):
+    if release is None or tuple(map(int, release.groups())) != (1332, 63, 8):
         raise CinderXEvidenceError("release_pytest_totals_invalid")
 
     adaptive = _libtest_summary(
@@ -199,13 +199,13 @@ def _python_tests(
     if "All 26 tests OK." not in official_log:
         raise CinderXEvidenceError("official_skip_libtest_log_invalid")
 
-    targeted = re.search(r"(^|\n)5 passed in [0-9.]+s(?:\n|$)", targeted_log)
+    targeted = re.search(r"(^|\n)6 passed in [0-9.]+s(?:\n|$)", targeted_log)
     if targeted is None:
         raise CinderXEvidenceError("targeted_udf_python_tests_invalid")
 
     return {
         "release_pytest": {
-            "passed": 1331,
+            "passed": 1332,
             "failed": 0,
             "errors": 0,
             "skipped": 63,
@@ -213,7 +213,7 @@ def _python_tests(
         },
         "adaptive_libtest": adaptive,
         "official_skip_libtest": official,
-        "udf_data_intrinsic": {"passed": 5, "failed": 0},
+        "udf_data_intrinsic": {"passed": 6, "failed": 0},
     }
 
 
@@ -334,7 +334,7 @@ def validate_cinderx_evidence(proof: object) -> str:
         return "fail"
 
     runtime_totals = {
-        "normal": 1176,
+        "normal": 1177,
         "lightweight_frames_deopt": 66,
         "osr": 130,
     }
@@ -350,7 +350,7 @@ def validate_cinderx_evidence(proof: object) -> str:
     targeted = python_tests.get("udf_data_intrinsic")
     python_valid = (
         isinstance(release, Mapping)
-        and release.get("passed") == 1331
+        and release.get("passed") == 1332
         and release.get("failed") == 0
         and release.get("errors") == 0
         and release.get("skipped") == 63
@@ -368,7 +368,7 @@ def validate_cinderx_evidence(proof: object) -> str:
         and official.get("adaptive_compile_after") == 24
         and official.get("returncode") == 0
         and isinstance(targeted, Mapping)
-        and targeted.get("passed") == 5
+        and targeted.get("passed") == 6
         and targeted.get("failed") == 0
     )
     expected_artifacts = {

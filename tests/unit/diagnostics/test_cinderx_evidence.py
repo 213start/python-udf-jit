@@ -33,7 +33,7 @@ def _runtime_log() -> str:
     )
     return (
         f"{cases}\n"
-        "100% tests passed, 0 tests failed out of 1176\n"
+        "100% tests passed, 0 tests failed out of 1177\n"
         "100% tests passed, 0 tests failed out of 66\n"
         "100% tests passed, 0 tests failed out of 130\n"
     )
@@ -71,13 +71,13 @@ class CinderXEvidenceTests(unittest.TestCase):
             "release": (
                 "[       OK ] setup_release (/logs/setup_release.log)\n"
                 "[       OK ] test_cinderx_release "
-                "[1331 passed, 63 skipped, 8 deselected] (/logs/release.log)\n"
+                "[1332 passed, 63 skipped, 8 deselected] (/logs/release.log)\n"
             ),
             "adaptive_summary": _libtest(456),
             "adaptive_log": "423 tests OK.\n",
             "official_summary": _libtest(26),
             "official_log": "All 26 tests OK.\n",
-            "targeted_log": "..... [100%]\n5 passed in 0.06s\n",
+            "targeted_log": "...... [100%]\n6 passed in 0.06s\n",
         }
         self.paths = {
             name: self.root / f"{name}.{'json' if isinstance(value, dict) else 'log'}"
@@ -126,11 +126,11 @@ class CinderXEvidenceTests(unittest.TestCase):
             proof["identity"]["cinderx_wheel_sha256"],
             "e" * 64,
         )
-        self.assertEqual(proof["runtime_tests"]["normal"]["passed"], 1176)
+        self.assertEqual(proof["runtime_tests"]["normal"]["passed"], 1177)
         self.assertEqual(len(proof["runtime_tests"]["udf_cases"]), 6)
         self.assertEqual(
             proof["python_tests"]["release_pytest"]["passed"],
-            1331,
+            1332,
         )
         self.assertEqual(
             proof["python_tests"]["adaptive_libtest"]["module_count"],
@@ -142,7 +142,7 @@ class CinderXEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(
             proof["python_tests"]["udf_data_intrinsic"]["passed"],
-            5,
+            6,
         )
         self.assertRegex(proof["proof_sha256"], r"^[0-9a-f]{64}$")
         self.assertTrue(
