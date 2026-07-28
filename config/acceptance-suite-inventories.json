@@ -100,7 +100,7 @@
             "test_exact_live_topology_is_accepted",
             "test_partitioned_float_projection_runs_only_on_worker_nodes",
             "test_head_owned_object_ref_reaches_both_workers",
-            "test_both_workers_execute_region_driven_cinderx_scalar_load",
+            "test_both_workers_execute_full_cinderx_scalar_matrix",
             "test_same_production_plan_compiles_and_executes_on_each_worker"
           ],
           "expected_test_count": 36,

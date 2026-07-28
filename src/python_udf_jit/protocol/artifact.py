@@ -7,6 +7,7 @@ from typing import Any
 
 from python_udf_jit.compiler.capture import FallbackIdentity
 from python_udf_jit.compiler.core_ir import (
+    LogicalType,
     SemanticCoreModule,
     SemanticOperation,
 )
@@ -101,11 +102,68 @@ class PortableUdfArtifact:
         )
 
 
+def _logical_type_for_scalar(scalar_type: str) -> LogicalType:
+    if scalar_type == "bool":
+        return LogicalType.BOOL
+    if scalar_type in {"int32", "int64"}:
+        return LogicalType.INT64
+    if scalar_type in {"float32", "float64"}:
+        return LogicalType.FLOAT64
+    raise ValueError("formal artifact has an unsupported scalar type")
+
+
+def _validate_physical_scalar_contract(
+    semantic_core_module: SemanticCoreModule,
+    input_access_specs: tuple[AccessSpec, ...],
+    output_access_spec: AccessSpec,
+) -> None:
+    if (
+        len(semantic_core_module.input_types) != 1
+        or len(input_access_specs) != 1
+    ):
+        raise ValueError("formal artifact requires exactly one scalar input")
+    for index, spec in enumerate(input_access_specs):
+        expected_nullable = (
+            semantic_core_module.input_nullability[index].value
+            != "non_null"
+        )
+        if (
+            spec
+            != scalar_input_spec(
+                spec.scalar_type,
+                nullable=expected_nullable,
+            )
+            or _logical_type_for_scalar(spec.scalar_type)
+            is not semantic_core_module.input_types[index]
+        ):
+            raise ValueError(
+                "physical input layout does not match semantic Core IR"
+            )
+    expected_output_nullable = (
+        semantic_core_module.output_nullability.value != "non_null"
+    )
+    if (
+        output_access_spec
+        != scalar_output_spec(
+            output_access_spec.scalar_type,
+            nullable=expected_output_nullable,
+        )
+        or _logical_type_for_scalar(output_access_spec.scalar_type)
+        is not semantic_core_module.output_type
+    ):
+        raise ValueError(
+            "physical output layout does not match semantic Core IR"
+        )
+
+
 def build_artifact(
     semantic_core_module: SemanticCoreModule,
     semantic_region_graph: SemanticRegionGraph,
     fallback_identity: FallbackIdentity,
     manifest: ArtifactManifest = DEFAULT_MANIFEST,
+    *,
+    input_access_specs: tuple[AccessSpec, ...] | None = None,
+    output_access_spec: AccessSpec | None = None,
 ) -> PortableUdfArtifact:
     verify_semantic_module(
         semantic_core_module,
@@ -129,44 +187,53 @@ def build_artifact(
         raise ValueError(
             "semantic Core IR must match the fallback code identity"
         )
-    if (
-        tuple(value.value for value in semantic_core_module.input_types)
-        != ("float64",)
-        or semantic_core_module.output_type.value != "float64"
-    ):
-        raise ValueError("formal artifact supports only the scalar path")
+    resolved_inputs = (
+        tuple(
+            scalar_input_spec(
+                value.value,
+                nullable=(
+                    semantic_core_module.input_nullability[index].value
+                    != "non_null"
+                ),
+            )
+            for index, value in enumerate(
+                semantic_core_module.input_types
+            )
+        )
+        if input_access_specs is None
+        else input_access_specs
+    )
+    resolved_output = (
+        scalar_output_spec(
+            semantic_core_module.output_type.value,
+            nullable=(
+                semantic_core_module.output_nullability.value
+                != "non_null"
+            ),
+        )
+        if output_access_spec is None
+        else output_access_spec
+    )
+    _validate_physical_scalar_contract(
+        semantic_core_module,
+        resolved_inputs,
+        resolved_output,
+    )
     guard = {
-        "input_types": ["float64"],
-        "output_type": "float64",
+        "input_types": [
+            spec.scalar_type for spec in resolved_inputs
+        ],
+        "output_type": resolved_output.scalar_type,
         "semantic_core_hash": semantic_core_module.semantic_hash,
         "semantic_region_hash": semantic_region_graph.semantic_hash,
         "target_python": manifest.target_python,
     }
-    input_access_specs = tuple(
-        scalar_input_spec(
-            value.value,
-            nullable=(
-                semantic_core_module.input_nullability[index].value
-                != "non_null"
-            ),
-        )
-        for index, value in enumerate(
-            semantic_core_module.input_types
-        )
-    )
-    output_access_spec = scalar_output_spec(
-        semantic_core_module.output_type.value,
-        nullable=(
-            semantic_core_module.output_nullability.value
-            != "non_null"
-        ),
-    )
     return PortableUdfArtifact(
         manifest,
         semantic_core_module,
         semantic_region_graph,
-        input_access_specs,
-        output_access_spec,
+        resolved_inputs,
+        resolved_output,
         guard,
         fallback_identity,
     )
@@ -250,8 +317,10 @@ def artifact_from_documents(
     fallback = FallbackIdentity.from_document(documents["fallback"])
     guard = documents["guard"]
     expected_guard = {
-        "input_types": ["float64"],
-        "output_type": "float64",
+        "input_types": [
+            spec.scalar_type for spec in input_access_specs
+        ],
+        "output_type": output_access_spec.scalar_type,
         "semantic_core_hash": semantic_module.semantic_hash,
         "semantic_region_hash": semantic_graph.semantic_hash,
         "target_python": manifest.target_python,
@@ -266,29 +335,11 @@ def artifact_from_documents(
     verify_semantic_region_graph(semantic_module, semantic_graph)
     if semantic_module.function_id != fallback.code_sha256:
         raise ValueError("semantic Core IR fallback identity mismatch")
-    expected_inputs = tuple(
-        scalar_input_spec(
-            value.value,
-            nullable=(
-                semantic_module.input_nullability[index].value
-                != "non_null"
-            ),
-        )
-        for index, value in enumerate(semantic_module.input_types)
+    _validate_physical_scalar_contract(
+        semantic_module,
+        input_access_specs,
+        output_access_spec,
     )
-    expected_output = scalar_output_spec(
-        semantic_module.output_type.value,
-        nullable=(
-            semantic_module.output_nullability.value != "non_null"
-        ),
-    )
-    if (
-        input_access_specs != expected_inputs
-        or output_access_spec != expected_output
-    ):
-        raise ValueError(
-            "physical layout does not match semantic Core IR"
-        )
     return PortableUdfArtifact(
         manifest,
         semantic_module,

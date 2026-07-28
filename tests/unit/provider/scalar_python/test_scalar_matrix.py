@@ -4,6 +4,7 @@ import math
 import hashlib
 import unittest
 
+from python_udf_jit.compiler.capture import FallbackIdentity
 from python_udf_jit.compiler.core_ir import (
     Determinism,
     EffectKind,
@@ -16,6 +17,11 @@ from python_udf_jit.compiler.core_ir import (
     build_semantic_module,
 )
 from python_udf_jit.compiler.region import form_semantic_region_graph
+from python_udf_jit.protocol.artifact import build_artifact
+from python_udf_jit.protocol.codec import (
+    decode_artifact,
+    encode_artifact,
+)
 from python_udf_jit.provider.scalar_python.capability import (
     CapabilityRegistry,
 )
@@ -364,6 +370,58 @@ class ScalarTypeMatrixTest(unittest.TestCase):
                     registry.release(output_handle)
                     registry.release(input_handle)
         self.assertEqual(len(code_hashes), 5)
+
+    def test_five_scalar_types_roundtrip_through_formal_artifact_layout(
+        self,
+    ) -> None:
+        for scalar_type, logical_type in _LOGICAL_TYPES.items():
+            for nullable in (False, True):
+                with self.subTest(
+                    scalar_type=scalar_type,
+                    nullable=nullable,
+                ):
+                    module = _identity_module(
+                        logical_type,
+                        nullable=nullable,
+                    )
+                    artifact = build_artifact(
+                        module,
+                        form_semantic_region_graph(module),
+                        FallbackIdentity(
+                            "tests.scalar_matrix",
+                            "identity",
+                            module.function_id,
+                        ),
+                        input_access_specs=(
+                            scalar_input_spec(
+                                scalar_type,
+                                nullable=nullable,
+                            ),
+                        ),
+                        output_access_spec=scalar_output_spec(
+                            scalar_type,
+                            nullable=nullable,
+                        ),
+                    )
+                    restored = decode_artifact(
+                        encode_artifact(artifact)
+                    )
+                    self.assertEqual(
+                        restored.input_access_specs,
+                        artifact.input_access_specs,
+                    )
+                    self.assertEqual(
+                        restored.output_access_spec,
+                        artifact.output_access_spec,
+                    )
+                    self.assertEqual(
+                        restored.guard_template["input_types"],
+                        [scalar_type],
+                    )
+                    self.assertEqual(
+                        restored.guard_template["output_type"],
+                        scalar_type,
+                    )
 
     def test_nullable_matrix_preserves_null_without_loading_a_value(
         self,

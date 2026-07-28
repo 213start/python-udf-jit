@@ -65,7 +65,7 @@
     "integration.cinderx_runtime": {
       "tier": "integration",
       "description": "Static-CPython RuntimeTests, release pytest, both lib-test gates, the five intrinsic Python tests, and the live two-Worker slot smoke all pass.",
-      "test_targets": ["tests.unit.diagnostics.test_cinderx_evidence.CinderXEvidenceTests.test_exact_static_runtime_and_python_gates_produce_proof", "tests.integration.test_ray_cinderx_scalar_slot_smoke.RayCinderXScalarSlotSmokeTests.test_both_workers_execute_region_driven_cinderx_scalar_load"]
+      "test_targets": ["tests.unit.diagnostics.test_cinderx_evidence.CinderXEvidenceTests.test_exact_static_runtime_and_python_gates_produce_proof", "tests.integration.test_ray_cinderx_scalar_slot_smoke.RayCinderXScalarSlotSmokeTests.test_both_workers_execute_full_cinderx_scalar_matrix"]
     },
     "integration.worker_pool_qualification": {
       "tier": "integration",
