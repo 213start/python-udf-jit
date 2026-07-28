@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
   "baseline_runtime_tree_sha256": "d29b9cb3512f7cca22d9fefece56484f705c4049e724ec6e99f04153477ff5de",
-  "candidate_runtime_tree_sha256": "b27d10bdaa47d1d4407fa9751e101c576fad7ebad77d5c67bf34fd186c72064c",
+  "candidate_runtime_tree_sha256": "6a3c2d046b07e5ff349a1b826dabebfaeb8ee72da773f814a8c1246ea21a76c8",
   "patches": [
     {
       "path": "0001-runtime-candidate.patch",
@@ -13,10 +13,48 @@
       "path": "0002-primitive-data-intrinsics.patch",
       "sha256": "cad210f4f748340771c611ad65128b4d59d79d2b020ccce348aca4bebdf2b312",
       "changed_file_count": 16
+    },
+    {
+      "path": "0003-continuation-deopt.patch",
+      "sha256": "79f887e4b47f8faa41cf60d01a02e4c1a80ba8780ef3f6cc6e4e98b13fda3506",
+      "changed_file_count": 6
     }
   ],
-  "patch_series_sha256": "19c877bd060f7601eec31121745e4d22a4ae6e99c01e71a68b259fecf50b7220",
-  "changed_file_count": 26,
+  "patch_series_sha256": "28fb3ad10b2d2c64de54a74e3d326aaf05f49b3de16c54730e2d5dccbccf17f0",
+  "changed_file_count": 29,
+  "continuation_abi": {
+    "version": 1,
+    "resume_id_prefix": "v1:",
+    "native_resume_scope": "region_code_only",
+    "cross_code_resume": "python_interpreter_continuation",
+    "payload_field_order": [
+      "abi_version",
+      "reason",
+      "resume_id",
+      "namespace_sha256",
+      "code_sha256",
+      "first_line",
+      "source_position",
+      "live_values",
+      "active_exception",
+      "committed"
+    ],
+    "live_value_entry_field_order": [
+      "kind",
+      "nullable",
+      "materialized",
+      "value"
+    ],
+    "live_value_kinds": [
+      "python_object",
+      "bool",
+      "int32",
+      "int64",
+      "float32",
+      "float64"
+    ],
+    "post_commit_whole_function_replay": false
+  },
   "excluded_paths": [
     "*.egg-info",
     ".gitcode",

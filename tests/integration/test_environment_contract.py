@@ -139,6 +139,7 @@ class EnvironmentContractTests(unittest.TestCase):
             [
                 "0001-runtime-candidate.patch",
                 "0002-primitive-data-intrinsics.patch",
+                "0003-continuation-deopt.patch",
             ],
         )
         for entry in patches:
@@ -188,6 +189,47 @@ class EnvironmentContractTests(unittest.TestCase):
         self.assertIn(
             "cinderx/RuntimeTests/udf_descriptor_fuzz_test.cpp",
             all_changed,
+        )
+        self.assertIn(
+            "cinderx/RuntimeTests/udf_continuation_test.cpp",
+            all_changed,
+        )
+        self.assertEqual(
+            manifest["continuation_abi"],
+            {
+                "version": 1,
+                "resume_id_prefix": "v1:",
+                "native_resume_scope": "region_code_only",
+                "cross_code_resume":
+                    "python_interpreter_continuation",
+                "payload_field_order": [
+                    "abi_version",
+                    "reason",
+                    "resume_id",
+                    "namespace_sha256",
+                    "code_sha256",
+                    "first_line",
+                    "source_position",
+                    "live_values",
+                    "active_exception",
+                    "committed",
+                ],
+                "live_value_entry_field_order": [
+                    "kind",
+                    "nullable",
+                    "materialized",
+                    "value",
+                ],
+                "live_value_kinds": [
+                    "python_object",
+                    "bool",
+                    "int32",
+                    "int64",
+                    "float32",
+                    "float64",
+                ],
+                "post_commit_whole_function_replay": False,
+            },
         )
 
     def test_compose_network_plan_does_not_overlap_blue_98_routes(self) -> None:

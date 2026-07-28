@@ -1,0 +1,587 @@
+diff --git a/cinderx/Jit/deopt.cpp b/cinderx/Jit/deopt.cpp
+index 3b5d1ef05421b8ee5151429e9ac418c17b117a4a..afca77d98326ba912ac84fc17424c9ad6b66dab3 100644
+--- a/cinderx/Jit/deopt.cpp
++++ b/cinderx/Jit/deopt.cpp
+@@ -20,6 +20,8 @@
+ #define USDT(...)
+ #endif
+ 
++#include <cmath>
++#include <limits>
+ #include <shared_mutex>
+ 
+ namespace jit {
+@@ -85,6 +87,163 @@ const char* deoptReasonName(DeoptReason reason) {
+   JIT_ABORT("Invalid DeoptReason {}", static_cast<int>(reason));
+ }
+ 
++const char* udfContinuationRejectName(UdfContinuationReject reason) {
++  switch (reason) {
++    case UdfContinuationReject::kNone:
++      return "none";
++    case UdfContinuationReject::kAbiMismatch:
++      return "abi_mismatch";
++    case UdfContinuationReject::kResumeIdInvalid:
++      return "resume_id_invalid";
++    case UdfContinuationReject::kSourceIdentityInvalid:
++      return "source_identity_invalid";
++    case UdfContinuationReject::kCommitRequired:
++      return "commit_required";
++    case UdfContinuationReject::kMaterializationFailed:
++      return "materialization_failed";
++    case UdfContinuationReject::kValueKindMismatch:
++      return "value_kind_mismatch";
++    case UdfContinuationReject::kValueTypeMismatch:
++      return "value_type_mismatch";
++    case UdfContinuationReject::kFrameMetadataMissing:
++      return "frame_metadata_missing";
++    case UdfContinuationReject::kCrossCodeDeopt:
++      return "cross_code_deopt";
++  }
++  JIT_ABORT("Invalid UdfContinuationReject {}", static_cast<int>(reason));
++}
++
++bool parseUdfContinuationValueKind(
++    std::string_view name,
++    UdfContinuationValueKind* result) {
++  if (result == nullptr) {
++    return false;
++  }
++  if (name == "python_object") {
++    *result = UdfContinuationValueKind::kPythonObject;
++  } else if (name == "bool") {
++    *result = UdfContinuationValueKind::kBool;
++  } else if (name == "int32") {
++    *result = UdfContinuationValueKind::kInt32;
++  } else if (name == "int64") {
++    *result = UdfContinuationValueKind::kInt64;
++  } else if (name == "float32") {
++    *result = UdfContinuationValueKind::kFloat32;
++  } else if (name == "float64") {
++    *result = UdfContinuationValueKind::kFloat64;
++  } else {
++    return false;
++  }
++  return true;
++}
++
++namespace {
++
++bool isLowerHexDigest(std::string_view value) {
++  if (value.size() != 64) {
++    return false;
++  }
++  for (char character : value) {
++    if (!((character >= '0' && character <= '9') ||
++          (character >= 'a' && character <= 'f'))) {
++      return false;
++    }
++  }
++  return true;
++}
++
++} // namespace
++
++UdfContinuationReject validateUdfContinuationIdentity(
++    int abi_version,
++    std::string_view resume_id,
++    std::string_view namespace_sha256,
++    std::string_view code_sha256,
++    int first_line,
++    bool committed) {
++  if (abi_version != kUdfContinuationAbiVersion) {
++    return UdfContinuationReject::kAbiMismatch;
++  }
++  if (resume_id.size() != 67 || resume_id.substr(0, 3) != "v1:" ||
++      !isLowerHexDigest(resume_id.substr(3))) {
++    return UdfContinuationReject::kResumeIdInvalid;
++  }
++  if (!isLowerHexDigest(namespace_sha256) || !isLowerHexDigest(code_sha256) ||
++      first_line <= 0) {
++    return UdfContinuationReject::kSourceIdentityInvalid;
++  }
++  if (!committed) {
++    return UdfContinuationReject::kCommitRequired;
++  }
++  return UdfContinuationReject::kNone;
++}
++
++UdfContinuationReject validateUdfContinuationValue(
++    UdfContinuationValueKind kind,
++    bool nullable,
++    bool materialized,
++    PyObject* value) {
++  if (!materialized) {
++    return UdfContinuationReject::kMaterializationFailed;
++  }
++  if (value == Py_None) {
++    return nullable ? UdfContinuationReject::kNone
++                    : UdfContinuationReject::kValueTypeMismatch;
++  }
++  switch (kind) {
++    case UdfContinuationValueKind::kPythonObject:
++      return UdfContinuationReject::kNone;
++    case UdfContinuationValueKind::kBool:
++      return PyBool_Check(value) ? UdfContinuationReject::kNone
++                                 : UdfContinuationReject::kValueTypeMismatch;
++    case UdfContinuationValueKind::kInt32:
++    case UdfContinuationValueKind::kInt64: {
++      if (!PyLong_CheckExact(value)) {
++        return UdfContinuationReject::kValueTypeMismatch;
++      }
++      int overflow = 0;
++      long long converted = PyLong_AsLongLongAndOverflow(value, &overflow);
++      if (overflow != 0 || PyErr_Occurred()) {
++        PyErr_Clear();
++        return UdfContinuationReject::kValueTypeMismatch;
++      }
++      if (kind == UdfContinuationValueKind::kInt32 &&
++          (converted < std::numeric_limits<int32_t>::min() ||
++           converted > std::numeric_limits<int32_t>::max())) {
++        return UdfContinuationReject::kValueTypeMismatch;
++      }
++      return UdfContinuationReject::kNone;
++    }
++    case UdfContinuationValueKind::kFloat32:
++    case UdfContinuationValueKind::kFloat64: {
++      if (!PyFloat_CheckExact(value)) {
++        return UdfContinuationReject::kValueTypeMismatch;
++      }
++      double converted = PyFloat_AS_DOUBLE(value);
++      if (kind == UdfContinuationValueKind::kFloat32 &&
++          std::isfinite(converted) &&
++          static_cast<double>(static_cast<float>(converted)) != converted) {
++        return UdfContinuationReject::kValueTypeMismatch;
++      }
++      return UdfContinuationReject::kNone;
++    }
++  }
++  return UdfContinuationReject::kValueKindMismatch;
++}
++
++UdfContinuationReject validateUdfContinuationDeoptScope(
++    const DeoptMetadata& metadata,
++    PyCodeObject* expected_region_code) {
++  if (expected_region_code == nullptr || metadata.frame_meta.size() != 1 ||
++      metadata.innermostFrame().code == nullptr) {
++    return UdfContinuationReject::kFrameMetadataMissing;
++  }
++  if (metadata.innermostFrame().code != expected_region_code) {
++    return UdfContinuationReject::kCrossCodeDeopt;
++  }
++  return UdfContinuationReject::kNone;
++}
++
+ BorrowedRef<> MemoryView::readBorrowed(const LiveValue& value) const {
+   JIT_CHECK(
+       value.value_kind == jit::hir::ValueKind::kObject,
+diff --git a/cinderx/Jit/deopt.h b/cinderx/Jit/deopt.h
+index c727c28b665a8e800f4aef9a868e5268af087c4c..b2eb282d8bf7e7d5b1998dc277ba08f93d85497b 100644
+--- a/cinderx/Jit/deopt.h
++++ b/cinderx/Jit/deopt.h
+@@ -13,6 +13,7 @@
+ #include <fmt/ranges.h>
+ 
+ #include <cstdint>
++#include <string_view>
+ 
+ namespace jit {
+ 
+@@ -202,6 +203,56 @@ struct DeoptMetadata {
+   static DeoptMetadata fromInstr(const jit::hir::DeoptBase& instr);
+ };
+ 
++constexpr int kUdfContinuationAbiVersion = 1;
++
++enum class UdfContinuationValueKind : char {
++  kPythonObject,
++  kBool,
++  kInt32,
++  kInt64,
++  kFloat32,
++  kFloat64,
++};
++
++enum class UdfContinuationReject : char {
++  kNone,
++  kAbiMismatch,
++  kResumeIdInvalid,
++  kSourceIdentityInvalid,
++  kCommitRequired,
++  kMaterializationFailed,
++  kValueKindMismatch,
++  kValueTypeMismatch,
++  kFrameMetadataMissing,
++  kCrossCodeDeopt,
++};
++
++const char* udfContinuationRejectName(UdfContinuationReject reason);
++
++bool parseUdfContinuationValueKind(
++    std::string_view name,
++    UdfContinuationValueKind* result);
++
++UdfContinuationReject validateUdfContinuationIdentity(
++    int abi_version,
++    std::string_view resume_id,
++    std::string_view namespace_sha256,
++    std::string_view code_sha256,
++    int first_line,
++    bool committed);
++
++UdfContinuationReject validateUdfContinuationValue(
++    UdfContinuationValueKind kind,
++    bool nullable,
++    bool materialized,
++    PyObject* value);
++
++// Native deoptimization may only reconstruct the compiled Region frame.
++// Crossing back into the original UDF is handled by an explicit SideExit.
++UdfContinuationReject validateUdfContinuationDeoptScope(
++    const DeoptMetadata& metadata,
++    PyCodeObject* expected_region_code);
++
+ using CiPyFrameObjType = _PyInterpreterFrame;
+ 
+ // Update `frame` so that execution can resume in the interpreter.
+diff --git a/cinderx/Jit/jit_rt.cpp b/cinderx/Jit/jit_rt.cpp
+index 15d84d0820cbbfcc62c720de354b5ef8ebd5e568..fc9dd8fc54086722b568264017cb15f18e6e3518 100644
+--- a/cinderx/Jit/jit_rt.cpp
++++ b/cinderx/Jit/jit_rt.cpp
+@@ -17,6 +17,7 @@
+ #include "cinderx/Jit/codegen/arch.h"
+ #include "cinderx/Jit/compiled_function.h"
+ #include "cinderx/Jit/context.h"
++#include "cinderx/Jit/deopt.h"
+ #include "cinderx/Jit/frame.h"
+ #include "cinderx/Jit/generators_rt.h"
+ // NOLINTNEXTLINE(facebook-unused-include-check)
+@@ -713,6 +714,144 @@ void JITRT_StoreUdfDataNullUnchecked(PyObject* capsule) {
+   slot->value = {};
+ }
+ 
++PyObject* JITRT_UdfBuildContinuationPayload(PyObject*, PyObject* args) {
++  if (!PyTuple_CheckExact(args) || PyTuple_GET_SIZE(args) != 13) {
++    PyErr_SetString(
++        PyExc_TypeError,
++        "_udf_build_continuation_payload expects exactly 13 arguments");
++    return nullptr;
++  }
++  PyObject* abi_object = PyTuple_GET_ITEM(args, 0);
++  PyObject* reason_object = PyTuple_GET_ITEM(args, 1);
++  PyObject* resume_object = PyTuple_GET_ITEM(args, 2);
++  PyObject* namespace_object = PyTuple_GET_ITEM(args, 3);
++  PyObject* code_object = PyTuple_GET_ITEM(args, 4);
++  PyObject* first_line_object = PyTuple_GET_ITEM(args, 5);
++  PyObject* source_map = PyTuple_GET_ITEM(args, 6);
++  PyObject* values = PyTuple_GET_ITEM(args, 7);
++  PyObject* kinds = PyTuple_GET_ITEM(args, 8);
++  PyObject* nullable = PyTuple_GET_ITEM(args, 9);
++  PyObject* materialized = PyTuple_GET_ITEM(args, 10);
++  PyObject* active_exception = PyTuple_GET_ITEM(args, 11);
++  PyObject* committed_object = PyTuple_GET_ITEM(args, 12);
++
++  if (!PyLong_CheckExact(abi_object) || !PyUnicode_CheckExact(reason_object) ||
++      PyUnicode_GET_LENGTH(reason_object) == 0 ||
++      !PyUnicode_CheckExact(resume_object) ||
++      !PyUnicode_CheckExact(namespace_object) ||
++      !PyUnicode_CheckExact(code_object) ||
++      !PyLong_CheckExact(first_line_object) ||
++      !PyTuple_CheckExact(source_map) || !PyTuple_CheckExact(values) ||
++      !PyTuple_CheckExact(kinds) || !PyTuple_CheckExact(nullable) ||
++      !PyTuple_CheckExact(materialized) ||
++      !(active_exception == Py_None ||
++        PyExceptionInstance_Check(active_exception)) ||
++      !PyBool_Check(committed_object)) {
++    PyErr_SetString(PyExc_TypeError, "invalid UDF continuation payload shape");
++    return nullptr;
++  }
++
++  long abi_version = PyLong_AsLong(abi_object);
++  long first_line = PyLong_AsLong(first_line_object);
++  const char* resume_id = PyUnicode_AsUTF8(resume_object);
++  const char* namespace_sha256 = PyUnicode_AsUTF8(namespace_object);
++  const char* code_sha256 = PyUnicode_AsUTF8(code_object);
++  if (PyErr_Occurred()) {
++    return nullptr;
++  }
++  auto identity_reject = jit::validateUdfContinuationIdentity(
++      static_cast<int>(abi_version),
++      resume_id,
++      namespace_sha256,
++      code_sha256,
++      static_cast<int>(first_line),
++      committed_object == Py_True);
++  if (identity_reject != jit::UdfContinuationReject::kNone) {
++    PyErr_Format(
++        PyExc_ValueError,
++        "udf_continuation_%s",
++        jit::udfContinuationRejectName(identity_reject));
++    return nullptr;
++  }
++
++  if (PyTuple_GET_SIZE(source_map) != 6) {
++    PyErr_SetString(PyExc_ValueError, "udf_continuation_source_map_invalid");
++    return nullptr;
++  }
++  for (Py_ssize_t index = 0; index < 6; index++) {
++    PyObject* item = PyTuple_GET_ITEM(source_map, index);
++    if (item != Py_None && !PyLong_CheckExact(item)) {
++      PyErr_SetString(PyExc_ValueError, "udf_continuation_source_map_invalid");
++      return nullptr;
++    }
++  }
++
++  Py_ssize_t value_count = PyTuple_GET_SIZE(values);
++  if (PyTuple_GET_SIZE(kinds) != value_count ||
++      PyTuple_GET_SIZE(nullable) != value_count ||
++      PyTuple_GET_SIZE(materialized) != value_count) {
++    PyErr_SetString(
++        PyExc_ValueError, "udf_continuation_live_value_shape_mismatch");
++    return nullptr;
++  }
++
++  Ref<> live_payloads = Ref<>::steal(PyTuple_New(value_count));
++  if (live_payloads == nullptr) {
++    return nullptr;
++  }
++  for (Py_ssize_t index = 0; index < value_count; index++) {
++    PyObject* value = PyTuple_GET_ITEM(values, index);
++    PyObject* kind_object = PyTuple_GET_ITEM(kinds, index);
++    PyObject* nullable_object = PyTuple_GET_ITEM(nullable, index);
++    PyObject* materialized_object = PyTuple_GET_ITEM(materialized, index);
++    if (!PyUnicode_CheckExact(kind_object) || !PyBool_Check(nullable_object) ||
++        !PyBool_Check(materialized_object)) {
++      PyErr_SetString(
++          PyExc_TypeError, "invalid UDF continuation live value shape");
++      return nullptr;
++    }
++    const char* kind_name = PyUnicode_AsUTF8(kind_object);
++    jit::UdfContinuationValueKind kind;
++    if (kind_name == nullptr ||
++        !jit::parseUdfContinuationValueKind(kind_name, &kind)) {
++      PyErr_SetString(PyExc_ValueError, "udf_continuation_value_kind_mismatch");
++      return nullptr;
++    }
++    auto value_reject = jit::validateUdfContinuationValue(
++        kind,
++        nullable_object == Py_True,
++        materialized_object == Py_True,
++        value);
++    if (value_reject != jit::UdfContinuationReject::kNone) {
++      PyErr_Format(
++          PyExc_ValueError,
++          "udf_continuation_%s:%zd",
++          jit::udfContinuationRejectName(value_reject),
++          index);
++      return nullptr;
++    }
++    PyObject* entry = PyTuple_Pack(
++        4, kind_object, nullable_object, materialized_object, value);
++    if (entry == nullptr) {
++      return nullptr;
++    }
++    PyTuple_SET_ITEM(live_payloads, index, entry);
++  }
++
++  return PyTuple_Pack(
++      10,
++      abi_object,
++      reason_object,
++      resume_object,
++      namespace_object,
++      code_object,
++      first_line_object,
++      source_map,
++      live_payloads.get(),
++      active_exception,
++      committed_object);
++}
++
+ // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
+ // We use the same logic to turn **args, nargsf, and kwnames into
+ // **args / nargsf.
+diff --git a/cinderx/Jit/jit_rt.h b/cinderx/Jit/jit_rt.h
+index af3c5cebfb6a856525789e34286411897442694b..aeb134eb861089a9648e04e135c45f13d8befe1d 100644
+--- a/cinderx/Jit/jit_rt.h
++++ b/cinderx/Jit/jit_rt.h
+@@ -49,6 +49,7 @@ PyObject* JITRT_UdfDataStoreI64(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfDataStoreF32(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfDataStoreF64(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfDataStoreNull(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfBuildContinuationPayload(PyObject* module, PyObject* args);
+ bool JITRT_IsUdfDataNullUnchecked(PyObject* capsule);
+ bool JITRT_LoadUdfDataBoolUnchecked(PyObject* capsule);
+ int32_t JITRT_LoadUdfDataI32Unchecked(PyObject* capsule);
+diff --git a/cinderx/Jit/pyjit.cpp b/cinderx/Jit/pyjit.cpp
+index f8634373761ed3acc89d56c5935b4dfbcd665bcd..c021121ec1167a084a798da7ea4087585a14bad8 100644
+--- a/cinderx/Jit/pyjit.cpp
++++ b/cinderx/Jit/pyjit.cpp
+@@ -3469,6 +3469,11 @@ void restoreSysSetProfileAndSetTrace() {
+ }
+ 
+ PyMethodDef jit_methods[] = {
++    {"_udf_build_continuation_payload",
++     JITRT_UdfBuildContinuationPayload,
++     METH_VARARGS,
++     PyDoc_STR(
++         "Validate and materialize an immutable UDF continuation payload.")},
+     {"_udf_create_scalar_slot",
+      JITRT_UdfCreateScalarSlot,
+      METH_VARARGS,
+diff --git a/cinderx/RuntimeTests/udf_continuation_test.cpp b/cinderx/RuntimeTests/udf_continuation_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5500835dcf1f7952a789b4d22520dc6081f4c7b3
+--- /dev/null
++++ b/cinderx/RuntimeTests/udf_continuation_test.cpp
+@@ -0,0 +1,150 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++
++#include "cinderx/Jit/deopt.h"
++#include "cinderx/RuntimeTests/fixtures.h"
++
++using UdfContinuationTest = RuntimeTest;
++
++TEST_F(UdfContinuationTest, NativeDeoptScopeRejectsCrossCodeRecovery) {
++  Ref<> region_code = Ref<>::steal(
++      Py_CompileString("value = 1", "<udf-region>", Py_file_input));
++  Ref<> source_code = Ref<>::steal(
++      Py_CompileString("value = 2", "<source-udf>", Py_file_input));
++  ASSERT_NE(region_code, nullptr);
++  ASSERT_NE(source_code, nullptr);
++
++  jit::DeoptMetadata metadata;
++  EXPECT_EQ(
++      jit::validateUdfContinuationDeoptScope(
++          metadata, reinterpret_cast<PyCodeObject*>(region_code.get())),
++      jit::UdfContinuationReject::kFrameMetadataMissing);
++
++  metadata.frame_meta.resize(1);
++  metadata.frame_meta[0].code =
++      reinterpret_cast<PyCodeObject*>(region_code.get());
++  EXPECT_EQ(
++      jit::validateUdfContinuationDeoptScope(
++          metadata, reinterpret_cast<PyCodeObject*>(region_code.get())),
++      jit::UdfContinuationReject::kNone);
++  EXPECT_EQ(
++      jit::validateUdfContinuationDeoptScope(
++          metadata, reinterpret_cast<PyCodeObject*>(source_code.get())),
++      jit::UdfContinuationReject::kCrossCodeDeopt);
++}
++
++TEST_F(UdfContinuationTest, RuntimePayloadPreservesTypedValuesAndAliases) {
++  runStockCode(R"(
++import struct
++
++import cinderx.jit
++from cinderjit import _udf_build_continuation_payload
++
++digest = "a" * 64
++resume_id = "v1:" + "b" * 64
++source_map = (1, 18, 40, 4, 40, 18)
++marker = []
++active = LookupError("active")
++f32 = struct.unpack("f", struct.pack("f", 1.1))[0]
++values = (marker, marker, True, 7, 2**40, f32, -3.5, None)
++kinds = (
++    "python_object",
++    "python_object",
++    "bool",
++    "int32",
++    "int64",
++    "float32",
++    "float64",
++    "python_object",
++)
++nullable = (False, False, False, False, False, False, False, True)
++materialized = (True,) * len(values)
++
++def build():
++    return _udf_build_continuation_payload(
++        1,
++        "cinderx_deopt",
++        resume_id,
++        digest,
++        digest,
++        12,
++        source_map,
++        values,
++        kinds,
++        nullable,
++        materialized,
++        active,
++        True,
++    )
++
++assert cinderx.jit.force_compile(build)
++assert cinderx.jit.is_jit_compiled(build)
++payload = build()
++assert type(payload) is tuple and len(payload) == 10
++assert payload[:7] == (
++    1,
++    "cinderx_deopt",
++    resume_id,
++    digest,
++    digest,
++    12,
++    source_map,
++)
++live = payload[7]
++assert all(entry[2] is True for entry in live)
++assert live[0][3] is marker
++assert live[1][3] is marker
++assert live[0][3] is live[1][3]
++assert tuple(entry[3] for entry in live) == values
++assert payload[8] is active
++assert payload[9] is True
++)");
++}
++
++TEST_F(UdfContinuationTest, RuntimePayloadRejectsUnsafeResumeMatrix) {
++  runStockCode(R"(
++import struct
++
++from cinderjit import _udf_build_continuation_payload
++
++digest = "a" * 64
++resume_id = "v1:" + "b" * 64
++source_map = (1, 18, 40, 4, 40, 18)
++valid = [
++    1,
++    "cinderx_deopt",
++    resume_id,
++    digest,
++    digest,
++    12,
++    source_map,
++    (7,),
++    ("int32",),
++    (False,),
++    (True,),
++    None,
++    True,
++]
++
++cases = (
++    (0, 2, "abi_mismatch"),
++    (2, "v2:" + "b" * 64, "resume_id_invalid"),
++    (3, "A" * 64, "source_identity_invalid"),
++    (12, False, "commit_required"),
++    (7, (), "live_value_shape_mismatch"),
++    (10, (False,), "materialization_failed"),
++    (7, (2**31,), "value_type_mismatch"),
++    (7, (1.1,), "value_type_mismatch"),
++)
++for index, replacement, reason in cases:
++    arguments = valid.copy()
++    arguments[index] = replacement
++    if index == 7 and isinstance(replacement, tuple) and replacement == (1.1,):
++        arguments[8] = ("float32",)
++    try:
++        _udf_build_continuation_payload(*arguments)
++    except (TypeError, ValueError) as error:
++        assert reason in str(error), (reason, error)
++    else:
++        raise AssertionError(f"unsafe continuation accepted: {reason}")
++)");
++}
