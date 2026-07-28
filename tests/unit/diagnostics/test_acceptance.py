@@ -12,6 +12,9 @@ from python_udf_jit.diagnostics.acceptance import (
     aggregate_formal_acceptance,
     load_acceptance_contract,
 )
+from python_udf_jit.diagnostics.cinderx_evidence import (
+    EXPECTED_UDF_RUNTIME_CASES,
+)
 from python_udf_jit.diagnostics.environment_evidence import (
     seal_environment_proof,
 )
@@ -298,14 +301,7 @@ def _evidence() -> dict[str, object]:
             "normal": {"passed": 1177, "failed": 0},
             "lightweight_frames_deopt": {"passed": 66, "failed": 0},
             "osr": {"passed": 130, "failed": 0},
-            "udf_cases": [
-                "UdfDataIntrinsicTest.RuntimeHelpersEnforceBorrowAndLifetime",
-                "UdfDataIntrinsicTest.RuntimeHelpersRejectCrossProcessCapsule",
-                "UdfDataIntrinsicTest.ExactGuardedLoadProducesPrimitiveHIR",
-                "UdfDataIntrinsicTest.HIRMetadataMatchesPrimitiveRead",
-                "UdfDataIntrinsicTest.LIRCallsFloat64SlotLoadHelper",
-                "UdfDataIntrinsicHIRTest.ParserPrinterAndOutputTypePreserveGuardedPrimitiveLoad",
-            ],
+            "udf_cases": list(EXPECTED_UDF_RUNTIME_CASES),
         },
         "python_tests": {
             "release_pytest": {

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from python_udf_jit.diagnostics.cinderx_evidence import (
     CinderXEvidenceError,
+    EXPECTED_UDF_RUNTIME_CASES,
     build_cinderx_evidence,
     validate_cinderx_evidence,
 )
@@ -16,14 +17,7 @@ from python_udf_jit.diagnostics.cinderx_evidence import (
 
 HEX_64 = "a" * 64
 COMMIT = "b" * 40
-UDF_CASES = (
-    "UdfDataIntrinsicTest.RuntimeHelpersEnforceBorrowAndLifetime",
-    "UdfDataIntrinsicTest.RuntimeHelpersRejectCrossProcessCapsule",
-    "UdfDataIntrinsicTest.ExactGuardedLoadProducesPrimitiveHIR",
-    "UdfDataIntrinsicTest.HIRMetadataMatchesPrimitiveRead",
-    "UdfDataIntrinsicTest.LIRCallsFloat64SlotLoadHelper",
-    "UdfDataIntrinsicHIRTest.ParserPrinterAndOutputTypePreserveGuardedPrimitiveLoad",
-)
+UDF_CASES = EXPECTED_UDF_RUNTIME_CASES
 
 
 def _runtime_log() -> str:
@@ -130,7 +124,7 @@ class CinderXEvidenceTests(unittest.TestCase):
             "e" * 64,
         )
         self.assertEqual(proof["runtime_tests"]["normal"]["passed"], 1177)
-        self.assertEqual(len(proof["runtime_tests"]["udf_cases"]), 6)
+        self.assertEqual(len(proof["runtime_tests"]["udf_cases"]), 7)
         self.assertEqual(
             proof["python_tests"]["release_pytest"]["passed"],
             1332,

@@ -13,12 +13,13 @@ _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 EXPECTED_RUNTIME_TOTALS = (1177, 66, 130)
 EXPECTED_UDF_RUNTIME_CASES = (
-    "UdfDataIntrinsicTest.RuntimeHelpersEnforceBorrowAndLifetime",
+    "UdfDataIntrinsicTest.RuntimeHelpersCoverTypedNullableLifecycle",
     "UdfDataIntrinsicTest.RuntimeHelpersRejectCrossProcessCapsule",
-    "UdfDataIntrinsicTest.ExactGuardedLoadProducesPrimitiveHIR",
-    "UdfDataIntrinsicTest.HIRMetadataMatchesPrimitiveRead",
-    "UdfDataIntrinsicTest.LIRCallsFloat64SlotLoadHelper",
-    "UdfDataIntrinsicHIRTest.ParserPrinterAndOutputTypePreserveGuardedPrimitiveLoad",
+    "UdfDataIntrinsicTest.ExactGuardedOperationsProduceTypedHIR",
+    "UdfDataIntrinsicTest.HIRMetadataMatchesTypedReadAndWrite",
+    "UdfDataIntrinsicTest.LIRCallsTypedLoadAndStoreHelpers",
+    "UdfDataIntrinsicHIRTest.ParserPrinterAndOutputTypesPreserveTypedReadsAndWrites",
+    "UdfDescriptorFuzzTest.DeterministicLifecycleAndTypeMatrix",
 )
 
 
