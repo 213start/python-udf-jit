@@ -199,7 +199,10 @@ def _python_tests(
     if "All 26 tests OK." not in official_log:
         raise CinderXEvidenceError("official_skip_libtest_log_invalid")
 
-    targeted = re.search(r"(^|\n)6 passed in [0-9.]+s(?:\n|$)", targeted_log)
+    targeted = re.search(
+        r"(^|\n)6 passed, 22 subtests passed in [0-9.]+s(?:\n|$)",
+        targeted_log,
+    )
     if targeted is None:
         raise CinderXEvidenceError("targeted_udf_python_tests_invalid")
 
@@ -213,7 +216,11 @@ def _python_tests(
         },
         "adaptive_libtest": adaptive,
         "official_skip_libtest": official,
-        "udf_data_intrinsic": {"passed": 6, "failed": 0},
+        "udf_data_intrinsic": {
+            "passed": 6,
+            "subtests_passed": 22,
+            "failed": 0,
+        },
     }
 
 
@@ -369,6 +376,7 @@ def validate_cinderx_evidence(proof: object) -> str:
         and official.get("returncode") == 0
         and isinstance(targeted, Mapping)
         and targeted.get("passed") == 6
+        and targeted.get("subtests_passed") == 22
         and targeted.get("failed") == 0
     )
     expected_artifacts = {

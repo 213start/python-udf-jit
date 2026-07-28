@@ -77,7 +77,10 @@ class CinderXEvidenceTests(unittest.TestCase):
             "adaptive_log": "423 tests OK.\n",
             "official_summary": _libtest(26),
             "official_log": "All 26 tests OK.\n",
-            "targeted_log": "...... [100%]\n6 passed in 0.06s\n",
+            "targeted_log": (
+                "...... [100%]\n"
+                "6 passed, 22 subtests passed in 0.06s\n"
+            ),
         }
         self.paths = {
             name: self.root / f"{name}.{'json' if isinstance(value, dict) else 'log'}"

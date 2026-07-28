@@ -329,7 +329,11 @@ def _evidence() -> dict[str, object]:
                 "adaptive_compile_after": 24,
                 "returncode": 0,
             },
-            "udf_data_intrinsic": {"passed": 6, "failed": 0},
+            "udf_data_intrinsic": {
+                "passed": 6,
+                "subtests_passed": 22,
+                "failed": 0,
+            },
         },
         "artifacts": {
             name: str(index) * 64
