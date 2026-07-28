@@ -11,9 +11,7 @@ from typing import Any, Callable
 
 from python_udf_jit.compiler.capture import CaptureIR, CaptureRequest, try_capture
 from python_udf_jit.compiler.capture_cache import CaptureCache
-from python_udf_jit.compiler.core_ir import lower_capture
 from python_udf_jit.compiler.pipeline import compile_semantic
-from python_udf_jit.compiler.region import form_verified_region
 from python_udf_jit.diagnostics import events
 from python_udf_jit.diagnostics.events import DecisionEvent
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
@@ -413,12 +411,11 @@ class CandidateRegistry:
                         record.semantic_region_hash = (
                             semantic.region_graph.semantic_hash
                         )
-                        legacy_module = lower_capture(record.capture_ir)
                         artifact_bytes = encode_artifact(
                             build_artifact(
-                                legacy_module,
-                                form_verified_region(legacy_module),
-                                legacy_module.fallback_identity,
+                                semantic.core_module,
+                                semantic.region_graph,
+                                record.capture_ir.fallback_identity,
                             )
                         )
                     except Exception:

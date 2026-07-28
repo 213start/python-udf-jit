@@ -19,6 +19,10 @@
             "tests.unit.integration.daft_ray.test_worker_runtime",
             "tests.unit.integration.daft_ray.test_wrapper_serialization",
             "tests.unit.protocol.test_artifact_codec",
+            "tests.unit.protocol.test_artifact_contract",
+            "tests.unit.protocol.test_artifact_loader",
+            "tests.unit.protocol.test_component_admission",
+            "tests.unit.mainline.test_rfc004",
             "tests.unit.provider.scalar_python.test_capability",
             "tests.unit.provider.scalar_python.test_compiler_template",
             "tests.unit.provider.scalar_python.test_executor",
@@ -57,7 +61,7 @@
             "test_runtime_binding_is_exact_and_reversible",
             "test_successful_compose_down_still_verifies_no_resources_remain"
           ],
-          "expected_test_count": 134,
+          "expected_test_count": 147,
           "allow_skips": false
         },
         "integration": {
@@ -69,6 +73,9 @@
             "tests.integration.test_driver_worker_carrier_probe",
             "tests.integration.test_driver_worker_isolation",
             "tests.integration.test_environment_contract",
+            "tests.integration.test_artifact_objectref_recovery",
+            "tests.integration.test_component_admission",
+            "tests.integration.test_rfc004_mainline",
             "tests.integration.test_per_worker_artifact_qualification",
             "tests.integration.test_ray_cinderx_scalar_slot_smoke",
             "tests.integration.test_ray_object_store_data_plane",
@@ -83,7 +90,7 @@
             "test_both_workers_execute_region_driven_cinderx_scalar_load",
             "test_same_production_plan_compiles_and_executes_on_each_worker"
           ],
-          "expected_test_count": 29,
+          "expected_test_count": 33,
           "allow_skips": false
         },
         "live": {
@@ -91,15 +98,18 @@
           "tier": "system",
           "arguments": [
             "tests.e2e.test_scalar_mainline_piercing",
+            "tests.e2e.test_mainline_production",
             "-v"
           ],
           "required_tests": [
             "test_ae1_to_ae8_pass_and_keep_natural_coverage_separate",
             "test_live_evidence_is_supplied_by_the_external_harness",
             "test_ray_state_join_never_starts_a_query_after_budget_expires",
-            "test_zero_row_counts_are_derived_from_observed_runtime_events"
+            "test_zero_row_counts_are_derived_from_observed_runtime_events",
+            "test_rfc003_system_contract",
+            "test_rfc004_system_contract"
           ],
-          "expected_test_count": 14,
+          "expected_test_count": 16,
           "allow_skips": false
         }
       }

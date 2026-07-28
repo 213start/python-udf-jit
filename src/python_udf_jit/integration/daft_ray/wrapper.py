@@ -7,6 +7,7 @@ from typing import Any, Callable
 from python_udf_jit.diagnostics import events
 from python_udf_jit.diagnostics.events import DecisionEvent
 from python_udf_jit.integration.daft_ray.carrier import (
+    DEFAULT_INLINE_ARTIFACT_THRESHOLD,
     ProductionCarrierState,
     ScalarCallView,
 )
@@ -45,7 +46,26 @@ class FallbackOnlyWrapper:
         self.logical_schema = logical_schema
         self.usage_context = usage_context
         if artifact is not None:
-            self.carrier = self.carrier.finalize(artifact)
+            publisher = None
+            threshold = DEFAULT_INLINE_ARTIFACT_THRESHOLD
+            if len(artifact) > threshold:
+                try:
+                    import ray
+
+                    if ray.is_initialized():
+                        publisher = ray.put
+                except Exception:
+                    publisher = None
+                if publisher is None:
+                    # Correctness is more important than the size optimization.
+                    # A later initialized Driver may republish another artifact;
+                    # this immutable carrier remains a valid inline fallback.
+                    threshold = len(artifact)
+            self.carrier = self.carrier.finalize(
+                artifact,
+                inline_threshold=threshold,
+                publisher=publisher,
+            )
         return True
 
     def __getstate__(self) -> dict[str, Any]:

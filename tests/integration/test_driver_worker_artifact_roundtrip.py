@@ -15,8 +15,7 @@ from pathlib import Path
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
 from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
 from python_udf_jit.compiler.capture import CaptureRequest, capture
-from python_udf_jit.compiler.core_ir import lower_capture
-from python_udf_jit.compiler.region import form_verified_region
+from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.protocol.artifact import build_artifact
 from python_udf_jit.protocol.codec import encode_artifact
 
@@ -94,12 +93,13 @@ print(json.dumps({
         def affine(value):
             return value * 2.0 + 3.0
 
-        module = lower_capture(capture(CaptureRequest(affine)))
+        captured = capture(CaptureRequest(affine))
+        compiled = compile_semantic(captured)
         encoded = encode_artifact(
             build_artifact(
-                module,
-                form_verified_region(module),
-                module.fallback_identity,
+                compiled.core_module,
+                compiled.region_graph,
+                captured.fallback_identity,
             )
         )
         wrapper = FallbackOnlyWrapper(
@@ -117,7 +117,7 @@ wrapper = pickle.loads(base64.b64decode(os.environ['UDFJIT_WRAPPER']))
 artifact = decode_artifact(wrapper.carrier.artifact_bytes)
 print(json.dumps({
     'content_hash': artifact.content_sha256,
-    'semantic_hash': artifact.core_module.semantic_hash,
+    'semantic_hash': artifact.semantic_core_module.semantic_hash,
     'fallback_result': wrapper(19, 23),
 }))
 """
@@ -133,7 +133,10 @@ print(json.dumps({
         self.assertEqual(completed.returncode, 0, completed.stderr)
         observation = json.loads(completed.stdout)
         self.assertEqual(observation["content_hash"], hashlib.sha256(encoded).hexdigest())
-        self.assertEqual(observation["semantic_hash"], module.semantic_hash)
+        self.assertEqual(
+            observation["semantic_hash"],
+            compiled.core_module.semantic_hash,
+        )
         self.assertEqual(observation["fallback_result"], 42)
 
     def test_hash_valid_carrier_with_invalid_artifact_fails_open_once_in_worker_process(self):

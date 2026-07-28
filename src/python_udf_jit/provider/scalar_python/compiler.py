@@ -7,9 +7,22 @@ from dataclasses import dataclass
 from types import CodeType, FunctionType
 from typing import Callable, Literal
 
-from python_udf_jit.compiler.core_ir import CoreNode, CoreUdfModule
-from python_udf_jit.compiler.region import VerifiedRegion
-from python_udf_jit.compiler.verifier import verify_core_module, verify_region
+from python_udf_jit.compiler.core_ir import (
+    CoreNode,
+    CoreUdfModule,
+    SemanticCoreModule,
+    SemanticOperation,
+)
+from python_udf_jit.compiler.region import (
+    SemanticRegionGraph,
+    VerifiedRegion,
+    verify_semantic_region_graph,
+)
+from python_udf_jit.compiler.verifier import (
+    verify_core_module,
+    verify_region,
+    verify_semantic_module,
+)
 from python_udf_jit.provider.scalar_python.capability import CapabilityRegistry
 
 
@@ -162,6 +175,171 @@ def compile_scalar_region(
         raise RuntimeError("controlled scalar lowering did not create a function")
     code_hash = hashlib.sha256(
         b"python-udf-jit-scalar-code-v1\0"
+        + module.semantic_hash.encode("ascii")
+        + marshal.dumps(function.__code__)
+    ).hexdigest()
+    return CompiledScalarFunction(
+        module.semantic_hash,
+        code_hash,
+        execution_mode,
+        function.__code__,
+        function,
+        registry_id,
+        argument_kind,
+    )
+
+
+def _semantic_binary_expression(
+    operation: SemanticOperation,
+) -> ast.expr:
+    operators: dict[str, type[ast.operator]] = {
+        "binary.add": ast.Add,
+        "binary.sub": ast.Sub,
+        "binary.mul": ast.Mult,
+    }
+    operator = operators.get(operation.op)
+    if operator is None:
+        raise ValueError(
+            f"unsupported semantic scalar operation: {operation.op}"
+        )
+    left, right = operation.operands
+    return ast.BinOp(
+        left=ast.Name(id=_value_name(left), ctx=ast.Load()),
+        op=operator(),
+        right=ast.Name(id=_value_name(right), ctx=ast.Load()),
+    )
+
+
+def _build_semantic_function_ast(
+    module: SemanticCoreModule,
+    graph: SemanticRegionGraph,
+) -> ast.Module:
+    if (
+        len(graph.regions) != 1
+        or graph.regions[0].provider_candidates
+        != ("scalar_cinderx",)
+    ):
+        raise ValueError(
+            "semantic artifact has no single scalar CinderX region"
+        )
+    selected = set(graph.regions[0].operation_ids)
+    body: list[ast.stmt] = []
+    for operation in module.operations:
+        if operation.operation_id not in selected:
+            raise ValueError(
+                "semantic scalar region does not cover the function"
+            )
+        if operation.op == "return":
+            body.append(
+                ast.Return(
+                    value=ast.Name(
+                        id=_value_name(operation.operands[0]),
+                        ctx=ast.Load(),
+                    )
+                )
+            )
+            continue
+        if operation.op == "argument":
+            expression = _load_expression()
+        elif operation.op == "constant":
+            if operation.literal is None:
+                raise ValueError(
+                    "semantic scalar constant has no literal"
+                )
+            expression = ast.Constant(
+                value=operation.literal.value
+            )
+        else:
+            expression = _semantic_binary_expression(operation)
+        body.append(
+            ast.Assign(
+                targets=[
+                    ast.Name(
+                        id=_value_name(operation.result_id or ""),
+                        ctx=ast.Store(),
+                    )
+                ],
+                value=expression,
+            )
+        )
+    function = ast.FunctionDef(
+        name="_verified_semantic_scalar_region",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg="slot")],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=body,
+        decorator_list=[],
+    )
+    return ast.fix_missing_locations(
+        ast.Module(body=[function], type_ignores=[])
+    )
+
+
+def compile_semantic_scalar_region(
+    module: SemanticCoreModule,
+    graph: SemanticRegionGraph,
+    *,
+    registry: CapabilityRegistry | None = None,
+    guard_function: GuardFunction | None = None,
+    load_function: LoadFunction | None = None,
+    execution_mode: str = "python-interpreter",
+    argument_kind: Literal["capability", "backend"] | None = None,
+) -> CompiledScalarFunction:
+    """Materialize process-local scalar code from the formal semantic artifact."""
+
+    verify_semantic_module(module)
+    verify_semantic_region_graph(module, graph)
+    if registry is not None:
+        if guard_function is not None or load_function is not None:
+            raise ValueError(
+                "pass either registry or explicit lowering hooks"
+            )
+        guard_function = registry.guard_data_handle
+        load_function = registry.data_load_f64
+        registry_id: str | None = registry.registry_id
+        if argument_kind not in (None, "capability"):
+            raise ValueError(
+                "registry lowering accepts capability arguments"
+            )
+        argument_kind = "capability"
+    else:
+        registry_id = None
+        if argument_kind is None:
+            argument_kind = "backend"
+    if guard_function is None or load_function is None:
+        raise ValueError(
+            "scalar lowering requires guard and load functions"
+        )
+    if not isinstance(execution_mode, str) or not execution_mode:
+        raise ValueError(
+            "execution mode must be a non-empty string"
+        )
+
+    generated = _build_semantic_function_ast(module, graph)
+    module_code = compile(
+        generated,
+        f"<python-udf-jit-semantic:{module.semantic_hash}>",
+        "exec",
+        dont_inherit=True,
+        optimize=2,
+    )
+    namespace = {
+        "__builtins__": {},
+        "_udf_guard_data_handle": guard_function,
+        "_udf_data_load_f64": load_function,
+    }
+    exec(module_code, namespace)
+    function = namespace["_verified_semantic_scalar_region"]
+    if not isinstance(function, FunctionType):
+        raise RuntimeError(
+            "semantic scalar lowering did not create a function"
+        )
+    code_hash = hashlib.sha256(
+        b"python-udf-jit-semantic-scalar-code-v1\0"
         + module.semantic_hash.encode("ascii")
         + marshal.dumps(function.__code__)
     ).hexdigest()

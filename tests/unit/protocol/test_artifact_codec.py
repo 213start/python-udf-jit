@@ -10,8 +10,7 @@ import sys
 import unittest
 
 from python_udf_jit.compiler.capture import CaptureRequest, capture
-from python_udf_jit.compiler.core_ir import lower_capture, reference_execute
-from python_udf_jit.compiler.region import form_verified_region
+from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.protocol.artifact import PortableUdfArtifact, build_artifact
 from python_udf_jit.protocol.codec import (
     ARTIFACT_HEADER,
@@ -30,11 +29,21 @@ def affine(x):
 
 
 def artifact() -> PortableUdfArtifact:
-    module = lower_capture(capture(CaptureRequest(affine)))
-    return build_artifact(module, form_verified_region(module), module.fallback_identity)
+    captured = capture(CaptureRequest(affine))
+    compiled = compile_semantic(captured)
+    return build_artifact(
+        compiled.core_module,
+        compiled.region_graph,
+        captured.fallback_identity,
+    )
 
 
-def raw_envelope(section_documents, *, major=1, minor=0):
+def raw_envelope(
+    section_documents,
+    *,
+    major=DEFAULT_MANIFEST.artifact_format_major,
+    minor=0,
+):
     body_parts = []
     for name, document in section_documents:
         name_bytes = name.encode("ascii")
@@ -44,11 +53,13 @@ def raw_envelope(section_documents, *, major=1, minor=0):
             payload = json.dumps(
                 document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
             ).encode("ascii")
-        body_parts.append(
-            SECTION_HEADER.pack(len(name_bytes), len(payload), hashlib.sha256(payload).digest())
-            + name_bytes
-            + payload
+        header = SECTION_HEADER.pack(
+            1,
+            len(name_bytes),
+            len(payload),
+            hashlib.sha256(payload).digest(),
         )
+        body_parts.append(header + name_bytes + payload)
     body = b"".join(body_parts)
     total = ARTIFACT_HEADER.size + len(body)
     return ARTIFACT_HEADER.pack(
@@ -64,17 +75,25 @@ class ArtifactCodecTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(hashlib.sha256(first).hexdigest(), artifact().content_sha256)
         self.assertNotIn(b"pickle", first.lower())
-        for forbidden in (b"address", b"descriptor", b"hir", b"lir", b"machine_code", b"source"):
+        for forbidden in (
+            b"address",
+            b"descriptor",
+            b"hir",
+            b"lir",
+            b"machine_code",
+            b"source_text",
+            b"filename",
+        ):
             self.assertNotIn(forbidden, first.lower())
 
     def test_roundtrip_across_an_independent_python_process(self):
         encoded = encode_artifact(artifact())
         script = """
 import base64, json, os
-from python_udf_jit.compiler.core_ir import reference_execute
+from python_udf_jit.compiler.reference import reference_execute_semantic
 from python_udf_jit.protocol.codec import decode_artifact
 loaded = decode_artifact(base64.b64decode(os.environ['ARTIFACT']))
-print(json.dumps({'hash': loaded.content_sha256, 'result': reference_execute(loaded.core_module, 4.0)}))
+print(json.dumps({'hash': loaded.content_sha256, 'result': reference_execute_semantic(loaded.semantic_core_module, (4.0,))}))
 """
         completed = subprocess.run(
             [sys.executable, "-c", script],
@@ -98,7 +117,12 @@ print(json.dumps({'hash': loaded.content_sha256, 'result': reference_execute(loa
         tampered[-1] ^= 1
         cases.append((bytes(tampered), ArtifactRejectCode.HASH_MISMATCH))
         newer = bytearray(encoded)
-        struct.pack_into(">H", newer, len(ARTIFACT_MAGIC), 2)
+        struct.pack_into(
+            ">H",
+            newer,
+            len(ARTIFACT_MAGIC),
+            DEFAULT_MANIFEST.artifact_format_major + 1,
+        )
         cases.append((bytes(newer), ArtifactRejectCode.UNSUPPORTED_VERSION))
 
         for payload, code in cases:
@@ -110,14 +134,14 @@ print(json.dumps({'hash': loaded.content_sha256, 'result': reference_execute(loa
     def test_rejects_missing_fields_duplicate_keys_and_incompatible_manifest(self):
         valid = artifact().section_documents()
         missing_core = dict(valid)
-        missing_core["core_ir"] = {"format_version": 1}
+        missing_core["semantic_core_ir"] = {"format_version": 2}
 
         duplicate_manifest = b'{"artifact_format_major":1,"artifact_format_major":1}'
 
         incompatible = dict(valid)
-        manifest = dict(incompatible["manifest"])
-        manifest["target_python"] = "3.14.4"
-        incompatible["manifest"] = manifest
+        target = dict(incompatible["target"])
+        target["target_python"] = "3.14.4"
+        incompatible["target"] = target
 
         cases = (
             (
@@ -172,8 +196,10 @@ print(json.dumps({'hash': loaded.content_sha256, 'result': reference_execute(loa
 
     def test_rejects_node_and_constant_limits_at_encode(self):
         built = artifact()
-        nodes = built.core_module.nodes
-        oversized = built.with_core_nodes(nodes * 60)
+        operations = built.semantic_core_module.operations
+        oversized = built.with_semantic_operations(
+            operations * (DEFAULT_MANIFEST.max_nodes + 1)
+        )
 
         with self.assertRaises(ArtifactCodecError) as raised:
             encode_artifact(oversized)

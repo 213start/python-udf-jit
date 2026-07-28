@@ -3,10 +3,16 @@ from __future__ import annotations
 import operator
 import os
 import pickle
+import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
-from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
+from python_udf_jit.integration.daft_ray.carrier import (
+    DEFAULT_INLINE_ARTIFACT_THRESHOLD,
+    ObjectRefArtifactHandle,
+    ProductionCarrierState,
+)
 from python_udf_jit.integration.daft_ray.wrapper import (
     WRAPPER_SERIALIZATION_VERSION,
     FallbackOnlyWrapper,
@@ -130,6 +136,32 @@ class WrapperSerializationTest(unittest.TestCase):
         self.assertEqual(restored.logical_schema, "{'x': 'float64'}")
         self.assertEqual(restored.usage_context, "projection")
         self.assertEqual(restored(20, 22), 42)
+
+    def test_large_artifact_uses_ray_object_ref_when_driver_is_initialized(self):
+        wrapper = make_wrapper()
+        reference = ("ray-object-ref", "opaque")
+        fake_ray = SimpleNamespace(
+            is_initialized=mock.Mock(return_value=True),
+            put=mock.Mock(return_value=reference),
+        )
+
+        with mock.patch.dict(sys.modules, {"ray": fake_ray}):
+            self.assertTrue(
+                wrapper.finalize(
+                    "{'x': 'float64'}",
+                    "projection",
+                    b"x" * (DEFAULT_INLINE_ARTIFACT_THRESHOLD + 1),
+                )
+            )
+
+        self.assertIsInstance(
+            wrapper.carrier.handle,
+            ObjectRefArtifactHandle,
+        )
+        self.assertEqual(wrapper.carrier.handle.reference, reference)
+        fake_ray.put.assert_called_once()
+        restored = pickle.loads(pickle.dumps(wrapper))
+        self.assertEqual(restored.carrier.handle.reference, reference)
 
     def test_auto_mode_delegates_to_process_local_adapter_without_fallback(self):
         original = CountingCallable()

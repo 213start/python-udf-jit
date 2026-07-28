@@ -4,11 +4,14 @@ import hashlib
 import base64
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 class CarrierContractError(ValueError):
     """Raised when carrier state or runtime evidence is not trustworthy."""
+
+
+DEFAULT_INLINE_ARTIFACT_THRESHOLD = 4096
 
 
 def _sha256(payload: bytes) -> str:
@@ -26,6 +29,19 @@ class InlineArtifactHandle:
     content_sha256: str
     size_bytes: int
     payload: bytes | None = None
+
+
+@dataclass(frozen=True)
+class ObjectRefArtifactHandle:
+    """Opaque framework object reference plus content-addressed metadata."""
+
+    kind: str
+    content_sha256: str
+    size_bytes: int
+    reference: object
+
+
+ArtifactHandle = InlineArtifactHandle | ObjectRefArtifactHandle
 
 
 @dataclass(frozen=True)
@@ -128,7 +144,8 @@ class ScalarCallView:
             or type(self.usage_context) is not str
             or self.usage_context not in {"filter", "selection", "projection"}
             or type(self.handle_kind) is not str
-            or self.handle_kind not in {"placeholder", "inline-artifact"}
+            or self.handle_kind
+            not in {"placeholder", "inline-artifact", "object-ref"}
             or type(self.size_bytes) is not int
             or self.size_bytes < 0
             or type(self.logical_schema_sha256) is not str
@@ -146,7 +163,7 @@ class ProductionCarrierState:
     schema_version: int
     candidate_id: str
     manifest_sha256: str
-    handle: InlineArtifactHandle
+    handle: ArtifactHandle
 
     @classmethod
     def placeholder(
@@ -167,30 +184,78 @@ class ProductionCarrierState:
 
     @property
     def finalized(self) -> bool:
-        return self.handle.kind == "inline-artifact"
+        return self.handle.kind in {"inline-artifact", "object-ref"}
 
     @property
     def state_sha256(self) -> str:
-        return _sha256(self.to_bytes())
+        payload = json.dumps(
+            self._document(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return _sha256(payload)
 
-    def finalize(self, artifact: bytes) -> "ProductionCarrierState":
+    def finalize(
+        self,
+        artifact: bytes,
+        *,
+        inline_threshold: int = 65536,
+        publisher: Callable[[bytes], object] | None = None,
+    ) -> "ProductionCarrierState":
         if not isinstance(artifact, bytes) or not artifact:
             raise CarrierContractError("artifact must be non-empty bytes")
+        if type(inline_threshold) is not int or inline_threshold < 0:
+            raise CarrierContractError(
+                "inline_threshold must be a non-negative integer"
+            )
         artifact_hash = _sha256(artifact)
         if self.finalized:
             if self.handle.content_sha256 != artifact_hash or self.handle.size_bytes != len(artifact):
                 raise CarrierContractError("carrier is already finalized with a different artifact")
             return self
+        if len(artifact) > inline_threshold:
+            if publisher is None:
+                raise CarrierContractError(
+                    "large artifact requires an object-store publisher"
+                )
+            try:
+                reference = publisher(artifact)
+            except Exception as error:
+                raise CarrierContractError(
+                    f"object-store publication failed: {type(error).__name__}"
+                ) from error
+            if reference is None:
+                raise CarrierContractError(
+                    "object-store publisher returned no reference"
+                )
+            handle: ArtifactHandle = ObjectRefArtifactHandle(
+                "object-ref",
+                artifact_hash,
+                len(artifact),
+                reference,
+            )
+        else:
+            handle = InlineArtifactHandle(
+                "inline-artifact",
+                artifact_hash,
+                len(artifact),
+                artifact,
+            )
         return ProductionCarrierState(
             self.schema_version,
             self.candidate_id,
             self.manifest_sha256,
-            InlineArtifactHandle("inline-artifact", artifact_hash, len(artifact), artifact),
+            handle,
         )
 
     @property
     def artifact_bytes(self) -> bytes:
-        if not self.finalized or self.handle.payload is None:
+        if (
+            not self.finalized
+            or not isinstance(self.handle, InlineArtifactHandle)
+            or self.handle.payload is None
+        ):
             raise CarrierContractError("carrier does not contain a finalized inline artifact")
         return self.handle.payload
 
@@ -200,18 +265,27 @@ class ProductionCarrierState:
             "handle": {
                 "content_sha256": self.handle.content_sha256,
                 "kind": self.handle.kind,
-                "payload_b64": (
-                    None
-                    if self.handle.payload is None
-                    else base64.b64encode(self.handle.payload).decode("ascii")
-                ),
+                "payload_b64": self._payload_b64(),
                 "size_bytes": self.handle.size_bytes,
             },
             "manifest_sha256": self.manifest_sha256,
             "schema_version": self.schema_version,
         }
 
+    def _payload_b64(self) -> str | None:
+        if isinstance(self.handle, ObjectRefArtifactHandle):
+            return None
+        return (
+            None
+            if self.handle.payload is None
+            else base64.b64encode(self.handle.payload).decode("ascii")
+        )
+
     def to_bytes(self) -> bytes:
+        if isinstance(self.handle, ObjectRefArtifactHandle):
+            raise CarrierContractError(
+                "object reference stays in the framework carrier"
+            )
         return json.dumps(
             self._document(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("ascii")
@@ -265,21 +339,42 @@ class ProductionCarrierState:
             raise CarrierContractError("unsupported or incomplete carrier state")
         _require_sha256(self.manifest_sha256, "manifest_sha256")
         _require_sha256(self.handle.content_sha256, "handle.content_sha256")
-        if self.handle.kind not in {"placeholder", "inline-artifact"}:
+        if self.handle.kind not in {
+            "placeholder",
+            "inline-artifact",
+            "object-ref",
+        }:
             raise CarrierContractError("unsupported carrier handle kind")
         if self.handle.size_bytes < 0 or (
             self.handle.kind == "placeholder" and self.handle.size_bytes != 0
         ):
             raise CarrierContractError("invalid carrier handle size")
         if self.handle.kind == "placeholder":
+            if not isinstance(self.handle, InlineArtifactHandle):
+                raise CarrierContractError(
+                    "placeholder must use an inline handle"
+                )
             if self.handle.payload is not None:
                 raise CarrierContractError("placeholder carrier must not contain payload bytes")
+        elif self.handle.kind == "inline-artifact":
+            if (
+                not isinstance(self.handle, InlineArtifactHandle)
+                or self.handle.payload is None
+                or len(self.handle.payload) != self.handle.size_bytes
+                or _sha256(self.handle.payload)
+                != self.handle.content_sha256
+            ):
+                raise CarrierContractError(
+                    "inline artifact payload does not match its hash and size"
+                )
         elif (
-            self.handle.payload is None
-            or len(self.handle.payload) != self.handle.size_bytes
-            or _sha256(self.handle.payload) != self.handle.content_sha256
+            not isinstance(self.handle, ObjectRefArtifactHandle)
+            or self.handle.reference is None
+            or self.handle.size_bytes <= 0
         ):
-            raise CarrierContractError("inline artifact payload does not match its hash and size")
+            raise CarrierContractError(
+                "object-ref artifact handle is incomplete"
+            )
 
 
 @dataclass(frozen=True)

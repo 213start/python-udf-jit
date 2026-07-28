@@ -163,14 +163,18 @@ def _result_digest(document: dict[str, list[Any]]) -> str:
 
 def _make_artifact(function: Callable[[float], float]) -> bytes:
     from python_udf_jit.compiler.capture import CaptureRequest, capture
-    from python_udf_jit.compiler.core_ir import lower_capture
-    from python_udf_jit.compiler.region import form_verified_region
+    from python_udf_jit.compiler.pipeline import compile_semantic
     from python_udf_jit.protocol.artifact import build_artifact
     from python_udf_jit.protocol.codec import encode_artifact
 
-    module = lower_capture(capture(CaptureRequest(function)))
+    captured = capture(CaptureRequest(function))
+    compiled = compile_semantic(captured)
     return encode_artifact(
-        build_artifact(module, form_verified_region(module), module.fallback_identity)
+        build_artifact(
+            compiled.core_module,
+            compiled.region_graph,
+            captured.fallback_identity,
+        )
     )
 
 

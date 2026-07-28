@@ -8,7 +8,7 @@ from python_udf_jit.protocol.artifact import PortableUdfArtifact
 from python_udf_jit.provider.scalar_python.capability import CapabilityHandle, CapabilityRegistry
 from python_udf_jit.provider.scalar_python.compiler import (
     CompiledScalarFunction,
-    compile_scalar_region,
+    compile_semantic_scalar_region,
 )
 from python_udf_jit.runtime.layout import CinderXScalarSlotBackend
 from python_udf_jit.runtime.variant import VariantKey
@@ -161,9 +161,9 @@ class CinderXScalarProviderFactory:
             CinderXScalarSlotBackend(module_name=self._runtime_module_name)
         )
         try:
-            compiled = compile_scalar_region(
-                artifact.core_module,
-                artifact.region,
+            compiled = compile_semantic_scalar_region(
+                artifact.semantic_core_module,
+                artifact.semantic_region_graph,
                 guard_function=runtime._udf_guard_data_handle,
                 load_function=runtime._udf_data_load_f64,
                 execution_mode="cinderx-jit",

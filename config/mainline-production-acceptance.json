@@ -111,9 +111,17 @@
       "test_control_flow_and_effect_boundaries_never_merge",
       "test_multiple_effects_receive_explicit_order_edges",
       "test_semantic_verifier_rejects_exception_cfg_and_python_region_drift",
-      "test_rfc003_unit_contract"
+      "test_rfc003_unit_contract",
+      "test_any_other_major_or_minor_is_rejected",
+      "test_unknown_section_is_rejected_without_forward_compatibility",
+      "test_unknown_manifest_field_is_rejected",
+      "test_1_10_100_1000_artifacts_parse_once_per_content",
+      "test_dependency_rejection_falls_back_once_before_provider_entry",
+      "test_large_artifact_uses_ray_object_ref_when_driver_is_initialized",
+      "test_only_exact_formal_component_contract_is_admitted",
+      "test_rfc004_unit_contract"
       ],
-      "expected_test_count": 225,
+      "expected_test_count": 238,
       "allow_skips": false
     },
     "integration": {
@@ -130,11 +138,15 @@
         "test_off_and_observe_match_without_repeating_side_effects",
         "test_off_and_observe_preserve_real_daft_exception_semantics",
         "test_explicit_pth_bootstrap_hooks_fresh_driver_and_worker_interpreters",
-        "test_scalar_call_view_is_address_free_and_stable_across_worker_pickle",
+      "test_scalar_call_view_is_address_free_and_stable_across_worker_pickle",
       "test_driver_frontend_round_trips_in_fresh_worker_process",
-      "test_rfc003_integration_contract"
+      "test_rfc003_integration_contract",
+      "test_object_ref_survives_framework_pickle_and_rebuilds_after_restart",
+      "test_lost_object_is_negative_cached_without_cross_job_reuse",
+      "test_driver_worker_mismatch_rejects_before_resource_qualification",
+      "test_rfc004_integration_contract"
       ],
-      "expected_test_count": 46,
+      "expected_test_count": 50,
       "allow_skips": false
     },
     "live": {
@@ -150,9 +162,10 @@
         "test_live_evidence_is_supplied_by_the_external_harness",
         "test_same_production_plan_compiles_and_executes_on_each_worker",
       "test_rfc002_frontend_verifies_on_each_worker",
-      "test_rfc003_system_contract"
+      "test_rfc003_system_contract",
+      "test_rfc004_system_contract"
       ],
-      "expected_test_count": 17,
+      "expected_test_count": 18,
       "allow_skips": false
     }
   },

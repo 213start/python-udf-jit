@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from python_udf_jit.compiler.capture import CaptureRequest, FallbackIdentity, capture
-from python_udf_jit.compiler.verifier import verify_core_module, verify_region
+from python_udf_jit.compiler.region import verify_semantic_region_graph
+from python_udf_jit.compiler.verifier import (
+    verify_semantic_module,
+)
 from python_udf_jit.diagnostics.report import (
     DEFAULT_RUNTIME_REPORT,
     RuntimeEvent,
@@ -18,8 +21,12 @@ from python_udf_jit.diagnostics.report import (
 )
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
 from python_udf_jit.protocol.artifact import PortableUdfArtifact
-from python_udf_jit.protocol.codec import decode_artifact
-from python_udf_jit.protocol.manifest import DEFAULT_MANIFEST
+from python_udf_jit.protocol.loader import (
+    ArtifactLoadError,
+    ArtifactLoader,
+    ArtifactLoadRejectCode,
+    LoaderNamespace,
+)
 from python_udf_jit.provider.scalar_python.executor import (
     CinderXScalarProviderFactory,
     PreSemanticsExecutionError,
@@ -43,6 +50,7 @@ from python_udf_jit.runtime.variant import (
 
 
 _PROCESS_GENERATION = secrets.token_hex(16)
+_PROCESS_ARTIFACT_LOADER = ArtifactLoader()
 
 
 def _sha256_text(value: str) -> str:
@@ -67,6 +75,7 @@ class WorkerRuntimeContext:
     partition_id: str = ""
     task_attempt: str = ""
     refresh_partition_from_ray: bool = False
+    tenant_namespace: str = "default"
 
     @classmethod
     def from_environment(cls) -> "WorkerRuntimeContext":
@@ -77,6 +86,10 @@ class WorkerRuntimeContext:
         partition_id = os.environ.get("UDFJIT_PARTITION_ID", "")
         refresh_partition_from_ray = not partition_id
         task_attempt = os.environ.get("UDFJIT_TASK_ATTEMPT", "")
+        tenant_namespace = os.environ.get(
+            "UDFJIT_TENANT_NAMESPACE",
+            "default",
+        )
         if not node_id or not actor_worker_id or not partition_id:
             try:
                 import ray
@@ -108,6 +121,7 @@ class WorkerRuntimeContext:
             partition_id,
             task_attempt,
             refresh_partition_from_ray,
+            tenant_namespace,
         )
 
     def event_attribution(self) -> tuple[str, str]:
@@ -217,6 +231,7 @@ class WorkerScalarAdapter:
         target_provider: Callable[[], RuntimeTarget] = RuntimeTarget.current,
         provider_factory: ScalarProviderFactory | None = None,
         event_sink: RuntimeEventSink = DEFAULT_RUNTIME_REPORT,
+        artifact_loader: ArtifactLoader = _PROCESS_ARTIFACT_LOADER,
     ) -> None:
         if not candidate_id or not callable(original_callable):
             raise ValueError("invalid_worker_candidate")
@@ -232,6 +247,12 @@ class WorkerScalarAdapter:
         self._target_provider = target_provider
         self._provider_factory = provider_factory or CinderXScalarProviderFactory()
         self._event_sink = event_sink
+        self._artifact_loader = artifact_loader
+        self._loader_namespace = LoaderNamespace(
+            context.run_id,
+            context.tenant_namespace,
+            context.process.process_generation,
+        )
         self._cache: ProcessVariantCache[ScalarProviderVariant] = ProcessVariantCache(
             context.process
         )
@@ -286,24 +307,32 @@ class WorkerScalarAdapter:
     ) -> tuple[PortableUdfArtifact, VariantKey]:
         if self._artifact is not None and self._key is not None:
             return self._artifact, self._key
-        artifact_bytes = self.carrier.artifact_bytes
-        payload_hash = hashlib.sha256(artifact_bytes).hexdigest()
-        if (
-            self.carrier.handle.size_bytes != len(artifact_bytes)
-            or not secrets.compare_digest(
-                self.carrier.handle.content_sha256, payload_hash
+        payload_hash = self.carrier.handle.content_sha256
+        try:
+            artifact = self._artifact_loader.load(
+                self.carrier.handle,
+                self._loader_namespace,
             )
-        ):
-            raise OuterGuardError(OuterGuardRejectCode.ARTIFACT_MISMATCH)
-        artifact = decode_artifact(artifact_bytes, DEFAULT_MANIFEST)
+        except ArtifactLoadError as error:
+            if error.code in {
+                ArtifactLoadRejectCode.HANDLE_INVALID,
+                ArtifactLoadRejectCode.CONTENT_MISMATCH,
+            }:
+                raise OuterGuardError(
+                    OuterGuardRejectCode.ARTIFACT_MISMATCH
+                ) from error
+            raise
         if not secrets.compare_digest(artifact.content_sha256, payload_hash):
             raise OuterGuardError(OuterGuardRejectCode.ARTIFACT_MISMATCH)
-        verify_core_module(
-            artifact.core_module,
+        verify_semantic_module(
+            artifact.semantic_core_module,
             max_nodes=artifact.manifest.max_nodes,
             max_constants=artifact.manifest.max_constants,
         )
-        verify_region(artifact.core_module, artifact.region)
+        verify_semantic_region_graph(
+            artifact.semantic_core_module,
+            artifact.semantic_region_graph,
+        )
         identity = _fallback_identity(self.original_callable)
         if identity != artifact.fallback_identity:
             raise OuterGuardError(OuterGuardRejectCode.CALLABLE_MISMATCH)
@@ -317,7 +346,7 @@ class WorkerScalarAdapter:
         expectation = OuterGuardExpectation(
             artifact_hash,
             self.carrier.manifest_sha256,
-            artifact.core_module.semantic_hash,
+            artifact.semantic_core_module.semantic_hash,
             schema_hash,
             identity.code_sha256,
             artifact.manifest.target_python,
@@ -327,7 +356,7 @@ class WorkerScalarAdapter:
         key = VariantKey(
             self.context.process,
             artifact_hash,
-            artifact.core_module.semantic_hash,
+            artifact.semantic_core_module.semantic_hash,
             schema_hash,
             identity.code_sha256,
             artifact.manifest.sha256,
@@ -360,7 +389,8 @@ class WorkerScalarAdapter:
         return OuterGuardObservation(
             override.artifact_content_sha256 or self.carrier.handle.content_sha256,
             override.experiment_manifest_sha256 or self.carrier.manifest_sha256,
-            override.semantic_hash or artifact.core_module.semantic_hash,
+            override.semantic_hash
+            or artifact.semantic_core_module.semantic_hash,
             _sha256_text(override.logical_schema or self.logical_schema),
             override.callable_code_sha256 or identity.code_sha256,
             override.target_python or target.python_version,

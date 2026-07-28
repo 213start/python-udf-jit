@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import json
@@ -10,8 +11,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from python_udf_jit.compiler.capture import CaptureRequest, capture
-from python_udf_jit.compiler.core_ir import lower_capture
-from python_udf_jit.compiler.region import form_verified_region
+from python_udf_jit.compiler.core_ir import rehash_semantic_module
+from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.diagnostics.report import InMemoryRuntimeReport
 from python_udf_jit.integration.daft_ray.carrier import (
     InlineArtifactHandle,
@@ -30,8 +31,15 @@ from python_udf_jit.protocol.codec import (
     SECTION_HEADER,
     encode_artifact,
 )
+from python_udf_jit.protocol.loader import ArtifactLoader
+from python_udf_jit.protocol.manifest import (
+    DEFAULT_MANIFEST,
+    DependencyRequirement,
+)
 from python_udf_jit.provider.scalar_python.capability import CapabilityRegistry
-from python_udf_jit.provider.scalar_python.compiler import compile_scalar_region
+from python_udf_jit.provider.scalar_python.compiler import (
+    compile_semantic_scalar_region,
+)
 from python_udf_jit.provider.scalar_python.executor import (
     PreSemanticsExecutionError,
     ScalarExecutor,
@@ -46,9 +54,14 @@ def affine(value):
 
 
 def encoded_artifact() -> bytes:
-    module = lower_capture(capture(CaptureRequest(affine)))
+    captured = capture(CaptureRequest(affine))
+    compiled = compile_semantic(captured)
     return encode_artifact(
-        build_artifact(module, form_verified_region(module), module.fallback_identity)
+        build_artifact(
+            compiled.core_module,
+            compiled.region_graph,
+            captured.fallback_identity,
+        )
     )
 
 
@@ -61,6 +74,7 @@ def raw_envelope(documents) -> bytes:
         ).encode("ascii")
         body_parts.append(
             SECTION_HEADER.pack(
+                1,
                 len(name_bytes), len(payload), hashlib.sha256(payload).digest()
             )
             + name_bytes
@@ -87,9 +101,9 @@ class _LocalProviderFactory:
         self.compile_count += 1
         registry = CapabilityRegistry(epoch=key.process.cluster_epoch)
         handle = registry.register(LocalScalarSlotBackend())
-        compiled = compile_scalar_region(
-            artifact.core_module,
-            artifact.region,
+        compiled = compile_semantic_scalar_region(
+            artifact.semantic_core_module,
+            artifact.semantic_region_graph,
             registry=registry,
             execution_mode="python-interpreter-test-double",
         )
@@ -153,8 +167,8 @@ class WorkerRuntimeTest(unittest.TestCase):
         )
         self.report = InMemoryRuntimeReport()
 
-    def adapter(self, provider):
-        return WorkerScalarAdapter(
+    def adapter(self, provider, *, artifact_loader=None):
+        arguments = dict(
             candidate_id="candidate-a",
             original_callable=self.original,
             carrier=self.carrier,
@@ -164,6 +178,9 @@ class WorkerRuntimeTest(unittest.TestCase):
             provider_factory=provider,
             event_sink=self.report,
         )
+        if artifact_loader is not None:
+            arguments["artifact_loader"] = artifact_loader
+        return WorkerScalarAdapter(**arguments)
 
     def test_first_call_compiles_and_second_call_hits_same_process_variant(self):
         provider = _LocalProviderFactory()
@@ -380,12 +397,34 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(calls, [2.0])
 
     def test_hash_self_consistent_illegal_opcode_is_rejected_before_provider(self):
-        valid = build_artifact(
-            lower_capture(capture(CaptureRequest(affine))),
-            form_verified_region(lower_capture(capture(CaptureRequest(affine)))),
-            capture(CaptureRequest(affine)).fallback_identity,
-        ).section_documents()
-        valid["core_ir"]["nodes"][2]["op"] = "div.f64"
+        captured = capture(CaptureRequest(affine))
+        compiled = compile_semantic(captured)
+        built = build_artifact(
+            compiled.core_module,
+            compiled.region_graph,
+            captured.fallback_identity,
+        )
+        operations = list(compiled.core_module.operations)
+        binary_index = next(
+            index
+            for index, operation in enumerate(operations)
+            if operation.op == "binary.mul"
+        )
+        operations[binary_index] = dataclasses.replace(
+            operations[binary_index],
+            op="binary.div",
+        )
+        invalid_module = rehash_semantic_module(
+            dataclasses.replace(
+                compiled.core_module,
+                operations=tuple(operations),
+            )
+        )
+        valid = built.section_documents()
+        valid["semantic_core_ir"] = invalid_module.to_document()
+        valid["guard"]["semantic_core_hash"] = (
+            invalid_module.semantic_hash
+        )
         invalid = raw_envelope(valid)
         self.carrier = ProductionCarrierState.placeholder(
             "candidate-a", "a" * 64
@@ -424,6 +463,52 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertTrue(
             any(
                 event.reason_code == "artifact_mismatch"
+                for event in self.report.snapshot()
+            )
+        )
+
+    def test_dependency_rejection_falls_back_once_before_provider_entry(self):
+        captured = capture(CaptureRequest(affine))
+        compiled = compile_semantic(captured)
+        manifest = dataclasses.replace(
+            DEFAULT_MANIFEST,
+            dependency_requirements=(
+                DependencyRequirement(
+                    "python-udf-jit-definitely-missing",
+                    "1.0.0",
+                ),
+            ),
+        )
+        self.carrier = ProductionCarrierState.placeholder(
+            "candidate-a",
+            "a" * 64,
+        ).finalize(
+            encode_artifact(
+                build_artifact(
+                    compiled.core_module,
+                    compiled.region_graph,
+                    captured.fallback_identity,
+                    manifest,
+                )
+            )
+        )
+        loader = ArtifactLoader(
+            dependency_resolver=lambda _distribution: None,
+        )
+        provider = _LocalProviderFactory()
+
+        result = self.adapter(
+            provider,
+            artifact_loader=loader,
+        ).invoke((None, 2.0), {})
+
+        self.assertEqual(result, 7.0)
+        self.assertEqual(self.calls, [2.0])
+        self.assertEqual(provider.compile_count, 0)
+        self.assertTrue(
+            any(
+                event.reason_code
+                == "pre_semantics_failure:ArtifactLoadError"
                 for event in self.report.snapshot()
             )
         )
