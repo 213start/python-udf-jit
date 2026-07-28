@@ -564,6 +564,134 @@ def python_continuation_module():
     )
 
 
+def python_continuation_cycle_module():
+    operations = (
+        SemanticOperation(
+            "op0",
+            "b0",
+            "argument",
+            (),
+            "%0",
+            LogicalType.INT64,
+            Nullability.NON_NULL,
+            EffectKind.PURE,
+            False,
+            None,
+            Determinism.DETERMINISTIC,
+            _attributes(index="0"),
+        ),
+        SemanticOperation(
+            "op1",
+            "b0",
+            "python.region",
+            ("%0",),
+            "%1",
+            LogicalType.INT64,
+            Nullability.NON_NULL,
+            EffectKind.PYTHON,
+            True,
+            0,
+            Determinism.UNKNOWN,
+            source_offset=10,
+            python_region_id="python:cycle",
+        ),
+        SemanticOperation(
+            "op2",
+            "b0",
+            "constant",
+            (),
+            "%2",
+            LogicalType.INT64,
+            Nullability.NON_NULL,
+            EffectKind.PURE,
+            False,
+            None,
+            Determinism.DETERMINISTIC,
+            literal=SemanticLiteral.from_value(0),
+        ),
+        SemanticOperation(
+            "op3",
+            "b0",
+            "compare.gt",
+            ("%1", "%2"),
+            "%3",
+            LogicalType.BOOL,
+            Nullability.NON_NULL,
+            EffectKind.PURE,
+            False,
+            None,
+            Determinism.DETERMINISTIC,
+        ),
+        SemanticOperation(
+            "op4",
+            "b0",
+            "branch",
+            ("%3",),
+            None,
+            LogicalType.BOOL,
+            Nullability.NON_NULL,
+            EffectKind.PURE,
+            False,
+            None,
+            Determinism.DETERMINISTIC,
+            _attributes(false_block="b1", true_block="b0"),
+        ),
+        SemanticOperation(
+            "op5",
+            "b1",
+            "return",
+            ("%1",),
+            None,
+            LogicalType.INT64,
+            Nullability.NON_NULL,
+            EffectKind.PURE,
+            False,
+            None,
+            Determinism.DETERMINISTIC,
+            source_offset=20,
+        ),
+    )
+    return build_semantic_module(
+        function_id=_hash("python-continuation-cycle"),
+        entry_block="b0",
+        input_types=(LogicalType.INT64,),
+        input_nullability=(Nullability.NON_NULL,),
+        output_type=LogicalType.INT64,
+        output_nullability=Nullability.NON_NULL,
+        blocks=(
+            SemanticBlock(
+                "b0",
+                tuple(
+                    operation.operation_id
+                    for operation in operations
+                    if operation.block_id == "b0"
+                ),
+            ),
+            SemanticBlock("b1", ("op5",)),
+        ),
+        control_edges=(
+            SemanticControlEdge("b0", "b0", "branch_true"),
+            SemanticControlEdge("b0", "b1", "branch_false"),
+        ),
+        operations=operations,
+        python_regions=(
+            SemanticPythonRegion(
+                "python:cycle",
+                "op1",
+                ("%0",),
+                ("%1",),
+                _hash("resume-cycle"),
+                EffectKind.PYTHON,
+                True,
+                (),
+                10,
+                20,
+            ),
+        ),
+        return_operation_id="op5",
+    )
+
+
 def branch_semantic_module():
     operations = (
         SemanticOperation(

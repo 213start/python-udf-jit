@@ -13,7 +13,14 @@ from python_udf_jit.provider.scalar_python.compiler import (
     ScalarLoweringHooks,
     compile_scalar_region,
 )
-from python_udf_jit.provider.scalar_python.executor import ScalarExecutor
+from python_udf_jit.provider.scalar_python.executor import (
+    PreSemanticsExecutionError,
+    ScalarExecutor,
+)
+from python_udf_jit.runtime.continuation import (
+    CommitBoundary,
+    CommitPhase,
+)
 from python_udf_jit.runtime.layout import CinderXScalarSlotBackend, LocalScalarSlotBackend
 
 
@@ -79,6 +86,56 @@ class _FakeCinderjit(ModuleType):
 
 
 class ExecutorTest(unittest.TestCase):
+    def test_guarded_setup_failure_stays_before_explicit_commit(self):
+        registry = CapabilityRegistry(epoch="epoch-a")
+        input_handle = registry.register(LocalScalarSlotBackend())
+        output_handle = registry.register(LocalScalarSlotBackend())
+        registry.release(input_handle)
+        boundary = CommitBoundary()
+        invoked = False
+
+        def compiled(_input, _output):
+            nonlocal invoked
+            invoked = True
+
+        with self.assertRaisesRegex(
+            PreSemanticsExecutionError,
+            "slot_setup_failed",
+        ):
+            ScalarExecutor(registry).execute_guarded(
+                compiled,
+                input_handle,
+                output_handle,
+                1.0,
+                boundary=boundary,
+            )
+
+        self.assertFalse(invoked)
+        self.assertIs(boundary.phase, CommitPhase.PRE_COMMIT)
+        registry.release(output_handle)
+
+    def test_guarded_compiled_failure_is_post_commit_and_never_reclassified(self):
+        registry = CapabilityRegistry(epoch="epoch-a")
+        input_handle = registry.register(LocalScalarSlotBackend())
+        output_handle = registry.register(LocalScalarSlotBackend())
+        boundary = CommitBoundary()
+
+        def compiled(_input, _output):
+            raise ArithmeticError("semantic failure")
+
+        with self.assertRaisesRegex(ArithmeticError, "semantic failure"):
+            ScalarExecutor(registry).execute_guarded(
+                compiled,
+                input_handle,
+                output_handle,
+                1.0,
+                boundary=boundary,
+            )
+
+        self.assertIs(boundary.phase, CommitPhase.COMMITTED)
+        registry.release(output_handle)
+        registry.release(input_handle)
+
     def test_exception_always_releases_synchronous_borrow(self):
         registry = CapabilityRegistry(epoch="epoch-a")
         input_handle = registry.register(LocalScalarSlotBackend())

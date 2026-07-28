@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import unittest
 
+from python_udf_jit.compiler.identity import capture_identities
 from python_udf_jit.runtime.continuation import (
+    CONTINUATION_ABI_VERSION,
     CommitBoundary,
     ContinuationContract,
     ContinuationError,
     ContinuationState,
     InterpreterContinuation,
+    LiveValueKind,
+    LiveValueSpec,
+    MaterializedLiveValue,
     RecoveryScope,
     ResumeSourceMap,
     SideExit,
@@ -62,6 +67,13 @@ def _source_map(offset: int, line: int) -> ResumeSourceMap:
     )
 
 
+def _materialized(kind, value):
+    return MaterializedLiveValue.materialized(kind, value)
+
+
+_SOURCE_IDENTITY = capture_identities(_whole_function).source
+
+
 class ContinuationBoundaryIntegrationTests(unittest.TestCase):
     def test_counterexample_matrix_resumes_suffix_exactly_once(self) -> None:
         for branch, value in ((True, {"value": 1}), (False, None)):
@@ -70,18 +82,31 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
                 effects_alias = effects
                 active = RuntimeError("active")
                 contract = ContinuationContract(
-                    contract_version=1,
+                    abi_version=CONTINUATION_ABI_VERSION,
                     resume_id="v1:join",
+                    source_identity=_SOURCE_IDENTITY,
                     source_code=_whole_function.__code__,
                     resume_code=_suffix.__code__,
                     source_map=_source_map(8, 20),
-                    live_names=("effects", "effects_alias", "merged"),
-                    nullable_names=("merged",),
-                    branch_join_names=("merged",),
-                    borrowed_names=("effects",),
-                    preserves_aliases=True,
+                    live_values=(
+                        LiveValueSpec(
+                            "effects",
+                            LiveValueKind.PYTHON_OBJECT,
+                            borrowed=True,
+                        ),
+                        LiveValueSpec(
+                            "effects_alias",
+                            LiveValueKind.PYTHON_OBJECT,
+                        ),
+                        LiveValueSpec(
+                            "merged",
+                            LiveValueKind.PYTHON_OBJECT,
+                            nullable=True,
+                            branch_join=True,
+                        ),
+                    ),
+                    alias_groups=(("effects", "effects_alias"),),
                     preserves_active_exception=True,
-                    commit_required=True,
                     proof_complete=True,
                 )
                 boundary = CommitBoundary()
@@ -90,9 +115,18 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
                 state = ContinuationState.capture(
                     contract,
                     {
-                        "effects": effects,
-                        "effects_alias": effects_alias,
-                        "merged": value if branch else None,
+                        "effects": _materialized(
+                            LiveValueKind.PYTHON_OBJECT,
+                            effects,
+                        ),
+                        "effects_alias": _materialized(
+                            LiveValueKind.PYTHON_OBJECT,
+                            effects_alias,
+                        ),
+                        "merged": _materialized(
+                            LiveValueKind.PYTHON_OBJECT,
+                            value if branch else None,
+                        ),
                     },
                     active_exception=active,
                     keepalives={"effects": effects},
@@ -100,8 +134,10 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
 
                 result = InterpreterContinuation(contract, _suffix).resume(
                     SideExit(
+                        abi_version=CONTINUATION_ABI_VERSION,
                         reason="branch_join",
                         resume_id="v1:join",
+                        source_identity=contract.source_identity,
                         source_map=contract.source_map,
                         state=state,
                         boundary=boundary,
@@ -125,23 +161,35 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
         effects = [("prefix", 7)]
         contracts = (
             ContinuationContract(
-                contract_version=1,
+                abi_version=CONTINUATION_ABI_VERSION,
                 resume_id="v1:first-break",
+                source_identity=_SOURCE_IDENTITY,
                 source_code=_whole_function.__code__,
                 resume_code=_first_suffix.__code__,
                 source_map=_source_map(10, 30),
-                live_names=("effects", "value"),
-                preserves_aliases=True,
+                live_values=(
+                    LiveValueSpec(
+                        "effects",
+                        LiveValueKind.PYTHON_OBJECT,
+                    ),
+                    LiveValueSpec("value", LiveValueKind.INT64),
+                ),
                 proof_complete=True,
             ),
             ContinuationContract(
-                contract_version=1,
+                abi_version=CONTINUATION_ABI_VERSION,
                 resume_id="v1:second-break",
+                source_identity=_SOURCE_IDENTITY,
                 source_code=_whole_function.__code__,
                 resume_code=_second_suffix.__code__,
                 source_map=_source_map(20, 31),
-                live_names=("effects", "value"),
-                preserves_aliases=True,
+                live_values=(
+                    LiveValueSpec(
+                        "effects",
+                        LiveValueKind.PYTHON_OBJECT,
+                    ),
+                    LiveValueSpec("value", LiveValueKind.INT64),
+                ),
                 proof_complete=True,
             ),
         )
@@ -151,12 +199,20 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
             boundary.commit()
             state = ContinuationState.capture(
                 contract,
-                {"effects": effects, "value": 7},
+                {
+                    "effects": _materialized(
+                        LiveValueKind.PYTHON_OBJECT,
+                        effects,
+                    ),
+                    "value": _materialized(LiveValueKind.INT64, 7),
+                },
             )
             exits.append(
                 SideExit(
+                    abi_version=CONTINUATION_ABI_VERSION,
                     reason="graph_break",
                     resume_id=contract.resume_id,
+                    source_identity=contract.source_identity,
                     source_map=contract.source_map,
                     state=state,
                     boundary=boundary,
@@ -195,38 +251,52 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
     ) -> None:
         effects = []
         contract = ContinuationContract(
-            contract_version=1,
+            abi_version=CONTINUATION_ABI_VERSION,
             resume_id="v1:failing-suffix",
+            source_identity=_SOURCE_IDENTITY,
             source_code=_whole_function.__code__,
             resume_code=_failing_suffix.__code__,
             source_map=_source_map(24, 40),
-            live_names=("effects", "value"),
-            preserves_aliases=True,
+            live_values=(
+                LiveValueSpec(
+                    "effects",
+                    LiveValueKind.PYTHON_OBJECT,
+                ),
+                LiveValueSpec("value", LiveValueKind.INT64),
+            ),
             proof_complete=True,
         )
         uncommitted = CommitBoundary()
         state = ContinuationState.capture(
             contract,
-            {"effects": effects, "value": 3},
-        )
-        uncommitted_exit = SideExit(
-            reason="pre_commit_failure",
-            resume_id=contract.resume_id,
-            source_map=contract.source_map,
-            state=state,
-            boundary=uncommitted,
-            origin=SideExitOrigin.INTERNAL_FAILURE,
+            {
+                "effects": _materialized(
+                    LiveValueKind.PYTHON_OBJECT,
+                    effects,
+                ),
+                "value": _materialized(LiveValueKind.INT64, 3),
+            },
         )
         continuation = InterpreterContinuation(contract, _failing_suffix)
 
         with self.assertRaisesRegex(
             ContinuationError,
-            "commit_required_before_suffix",
+            "side_exit_requires_commit",
         ):
-            continuation.resume(uncommitted_exit)
+            SideExit(
+                abi_version=CONTINUATION_ABI_VERSION,
+                reason="pre_commit_failure",
+                resume_id=contract.resume_id,
+                source_identity=contract.source_identity,
+                source_map=contract.source_map,
+                state=state,
+                boundary=uncommitted,
+                origin=SideExitOrigin.INTERNAL_FAILURE,
+            )
         self.assertEqual(effects, [])
         self.assertEqual(
             WholeFunctionInterpreter(_whole_function).execute(
+                uncommitted,
                 3,
                 True,
                 effects,
@@ -239,8 +309,10 @@ class ContinuationBoundaryIntegrationTests(unittest.TestCase):
         committed = CommitBoundary()
         committed.commit()
         committed_exit = SideExit(
+            abi_version=CONTINUATION_ABI_VERSION,
             reason="post_commit_failure",
             resume_id=contract.resume_id,
+            source_identity=contract.source_identity,
             source_map=contract.source_map,
             state=state,
             boundary=committed,

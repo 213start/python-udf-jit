@@ -22,6 +22,13 @@ from python_udf_jit.runtime.layout import (
     INT64_SCALAR_TYPE,
     CinderXScalarSlotBackend,
 )
+from python_udf_jit.runtime.continuation import (
+    CommitBoundary,
+    ContinuationError,
+    InterpreterContinuation,
+    SideExit,
+    side_exit_from_cinderx_result,
+)
 from python_udf_jit.runtime.variant import VariantKey
 
 
@@ -115,9 +122,15 @@ class ScalarExecutor:
         input_handle: CapabilityHandle,
         output_handle: CapabilityHandle,
         value: object,
+        *,
+        boundary: CommitBoundary,
+        continuation: InterpreterContinuation[object] | None = None,
     ) -> object:
         """Execute with an explicit no-replay commit at function entry."""
 
+        if not isinstance(boundary, CommitBoundary):
+            raise TypeError("commit boundary required")
+        boundary.require_pre_commit()
         try:
             compiled_registry_id = getattr(
                 compiled,
@@ -141,9 +154,28 @@ class ScalarExecutor:
                         input_borrowed.execution_handle,
                         output_borrowed.execution_handle,
                     )
-                    # Commit point: after this call begins, no exception is
-                    # eligible for whole-UDF fallback or replay.
-                    compiled(*arguments)
+                    # This explicit transition is the conservative semantic
+                    # entry. After it, no failure may replay the whole UDF.
+                    boundary.commit()
+                    region_result = compiled(*arguments)
+                    if continuation is not None:
+                        side_exit = side_exit_from_cinderx_result(
+                            region_result,
+                            contract=continuation.contract,
+                            boundary=boundary,
+                        )
+                        if side_exit is not None:
+                            region_result = side_exit
+                    if isinstance(region_result, SideExit):
+                        if region_result.boundary is not boundary:
+                            raise ContinuationError(
+                                "side_exit_boundary_mismatch"
+                            )
+                        if continuation is None:
+                            raise ContinuationError(
+                                "interpreter_continuation_missing"
+                            )
+                        return continuation.resume(region_result)
                     guarded_output = self._registry.guard_data_handle(
                         output_handle
                     )
@@ -153,7 +185,7 @@ class ScalarExecutor:
         except PreSemanticsExecutionError:
             raise
         except BaseException as error:
-            if "arguments" not in locals():
+            if not boundary.committed:
                 raise PreSemanticsExecutionError(
                     f"slot_setup_failed:{type(error).__name__}"
                 ) from error
@@ -202,13 +234,28 @@ class ScalarProviderVariant:
         self.registry.descriptor(self.input_handle)
         self.registry.descriptor(self.output_handle)
 
-    def execute(self, value: object) -> object:
-        self.preflight_descriptor()
+    def execute(
+        self,
+        value: object,
+        *,
+        boundary: CommitBoundary,
+        continuation: InterpreterContinuation[object] | None = None,
+    ) -> object:
+        try:
+            self.preflight_descriptor()
+        except PreSemanticsExecutionError:
+            raise
+        except BaseException as error:
+            raise PreSemanticsExecutionError(
+                f"descriptor_preflight_failed:{type(error).__name__}"
+            ) from error
         return self.executor.execute_guarded(
             self.compiled,
             self.input_handle,
             self.output_handle,
             value,
+            boundary=boundary,
+            continuation=continuation,
         )
 
     def close(self) -> None:

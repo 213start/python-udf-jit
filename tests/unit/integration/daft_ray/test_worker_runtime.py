@@ -147,7 +147,8 @@ class _PostEntryVariant:
     intrinsic_load_count = 0
     code_hash = "f" * 64
 
-    def execute(self, _value):
+    def execute(self, _value, *, boundary):
+        boundary.commit()
         raise ArithmeticError("controlled-post-entry")
 
 
@@ -157,7 +158,7 @@ class _PostEntryFactory:
 
 
 class _DescriptorMissVariant(_PostEntryVariant):
-    def execute(self, _value):
+    def execute(self, _value, *, boundary):
         raise PreSemanticsExecutionError("descriptor_epoch_mismatch")
 
 

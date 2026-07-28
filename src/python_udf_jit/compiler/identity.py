@@ -419,15 +419,23 @@ class CaptureIdentities:
         )
 
 
-def code_identity(function: types.FunctionType) -> CodeIdentity:
-    if type(function) is not types.FunctionType:
-        _fail(IdentityRejectCode.INVALID_FUNCTION)
-    document = _code_document(function.__code__)
+def code_identity_from_code(code: types.CodeType) -> CodeIdentity:
+    """Build the stable code identity used by local continuation contracts."""
+
+    if type(code) is not types.CodeType:
+        _fail(IdentityRejectCode.INVALID_FUNCTION, "code")
+    document = _code_document(code)
     return CodeIdentity(
         IDENTITY_VERSION,
         sys.implementation.cache_tag,
         _sha256(document),
     )
+
+
+def code_identity(function: types.FunctionType) -> CodeIdentity:
+    if type(function) is not types.FunctionType:
+        _fail(IdentityRejectCode.INVALID_FUNCTION)
+    return code_identity_from_code(function.__code__)
 
 
 def _entry(kind: str, name: str, value: object) -> DependencyEntry:

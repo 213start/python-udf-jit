@@ -40,6 +40,7 @@ from python_udf_jit.runtime.guards import (
     OuterGuardRejectCode,
     guard_outer_entry,
 )
+from python_udf_jit.runtime.continuation import CommitBoundary
 from python_udf_jit.runtime.layout import ProcessIdentity, SCALAR_SLOT_ABI_VERSION
 from python_udf_jit.runtime.physicalize import ScalarPhysicalizer
 from python_udf_jit.runtime.variant import (
@@ -529,7 +530,7 @@ class WorkerScalarAdapter:
                 attribution=attribution,
             )
 
-        semantics_entered = False
+        boundary = CommitBoundary()
         try:
             frame = self._physicalizer.open_call(
                 artifact.input_access_specs[0],
@@ -539,8 +540,10 @@ class WorkerScalarAdapter:
             )
             with frame:
                 physical_value = frame.load_input()
-                semantics_entered = True
-                result = variant.execute(physical_value)
+                result = variant.execute(
+                    physical_value,
+                    boundary=boundary,
+                )
                 frame.stage_output(result)
                 result = frame.publish_output()
         except PreSemanticsExecutionError as error:
@@ -552,7 +555,7 @@ class WorkerScalarAdapter:
                 attribution=attribution,
             )
         except Exception as error:
-            if not semantics_entered:
+            if not boundary.committed:
                 return self._fallback(
                     args,
                     kwargs,

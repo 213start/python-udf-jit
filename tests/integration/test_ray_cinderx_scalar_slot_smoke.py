@@ -31,6 +31,7 @@ class _WorkerScalarSlotProbe:
             SCALAR_SLOT_ABI_VERSION,
             normalize_scalar_value,
         )
+        from python_udf_jit.runtime.continuation import CommitBoundary
         from python_udf_jit.runtime.variant import (
             VariantKey,
             WorkerProcessKey,
@@ -140,7 +141,10 @@ class _WorkerScalarSlotProbe:
                     module=module,
                     label=f"identity_{scalar_type}",
                 )
-                actual = variant.execute(value)
+                actual = variant.execute(
+                    value,
+                    boundary=CommitBoundary(),
+                )
                 expected = normalize_scalar_value(
                     value,
                     scalar_type,
@@ -159,7 +163,13 @@ class _WorkerScalarSlotProbe:
                     raise AssertionError(
                         (scalar_type, actual, expected)
                     )
-                if variant.execute(None) is not None:
+                if (
+                    variant.execute(
+                        None,
+                        boundary=CommitBoundary(),
+                    )
+                    is not None
+                ):
                     raise AssertionError(
                         f"{scalar_type} null value was not preserved"
                     )
