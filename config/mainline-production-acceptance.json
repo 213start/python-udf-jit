@@ -119,9 +119,16 @@
       "test_dependency_rejection_falls_back_once_before_provider_entry",
       "test_large_artifact_uses_ray_object_ref_when_driver_is_initialized",
       "test_only_exact_formal_component_contract_is_admitted",
-      "test_rfc004_unit_contract"
+      "test_rfc004_unit_contract",
+      "test_five_scalar_types_have_stable_address_free_fingerprints",
+      "test_scalar_value_bounds_nullability_and_float32_rounding",
+      "test_vector_batch_and_unknown_layouts_are_stably_rejected",
+      "test_all_types_and_nulls_publish_atomically_with_value_free_metrics",
+      "test_failed_output_is_aborted_and_never_exposes_partial_value",
+      "test_concurrent_frames_are_isolated_and_old_process_is_rejected",
+      "test_rfc005_unit_contract"
       ],
-      "expected_test_count": 238,
+      "expected_test_count": 248,
       "allow_skips": false
     },
     "integration": {
@@ -144,9 +151,11 @@
       "test_object_ref_survives_framework_pickle_and_rebuilds_after_restart",
       "test_lost_object_is_negative_cached_without_cross_job_reuse",
       "test_driver_worker_mismatch_rejects_before_resource_qualification",
-      "test_rfc004_integration_contract"
+      "test_rfc004_integration_contract",
+      "test_five_scalar_layouts_materialize_in_a_fresh_worker_process",
+      "test_rfc005_integration_contract"
       ],
-      "expected_test_count": 50,
+      "expected_test_count": 52,
       "allow_skips": false
     },
     "live": {
@@ -163,9 +172,10 @@
         "test_same_production_plan_compiles_and_executes_on_each_worker",
       "test_rfc002_frontend_verifies_on_each_worker",
       "test_rfc003_system_contract",
-      "test_rfc004_system_contract"
+      "test_rfc004_system_contract",
+      "test_rfc005_system_contract"
       ],
-      "expected_test_count": 18,
+      "expected_test_count": 19,
       "allow_skips": false
     }
   },

@@ -53,6 +53,7 @@ class ArtifactRejectCode(StrEnum):
     MANIFEST_INCOMPATIBLE = "manifest_incompatible"
     NODE_LIMIT = "node_limit"
     CONSTANT_LIMIT = "constant_limit"
+    LAYOUT_UNSUPPORTED = "layout_unsupported"
 
 
 class ArtifactCodecError(ValueError):

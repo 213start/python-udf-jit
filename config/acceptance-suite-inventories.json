@@ -23,12 +23,17 @@
             "tests.unit.protocol.test_artifact_loader",
             "tests.unit.protocol.test_component_admission",
             "tests.unit.mainline.test_rfc004",
+            "tests.unit.mainline.test_rfc005",
             "tests.unit.provider.scalar_python.test_capability",
             "tests.unit.provider.scalar_python.test_compiler_template",
             "tests.unit.provider.scalar_python.test_executor",
             "tests.unit.runtime.test_descriptor_guards",
             "tests.unit.runtime.test_guards",
             "tests.unit.runtime.test_layout",
+            "tests.unit.runtime.test_layout_extension_contract",
+            "tests.unit.runtime.test_ownership",
+            "tests.unit.runtime.test_physicalize",
+            "tests.unit.runtime.test_scalar_descriptors",
             "tests.unit.runtime.test_variant",
             "tests.unit.system.test_assemble_infrastructure_evidence",
             "tests.unit.system.test_candidate_manifest",
@@ -61,7 +66,7 @@
             "test_runtime_binding_is_exact_and_reversible",
             "test_successful_compose_down_still_verifies_no_resources_remain"
           ],
-          "expected_test_count": 147,
+          "expected_test_count": 174,
           "allow_skips": false
         },
         "integration": {
@@ -75,7 +80,9 @@
             "tests.integration.test_environment_contract",
             "tests.integration.test_artifact_objectref_recovery",
             "tests.integration.test_component_admission",
+            "tests.integration.test_daft_scalar_physicalization",
             "tests.integration.test_rfc004_mainline",
+            "tests.integration.test_rfc005_mainline",
             "tests.integration.test_per_worker_artifact_qualification",
             "tests.integration.test_ray_cinderx_scalar_slot_smoke",
             "tests.integration.test_ray_object_store_data_plane",
@@ -90,7 +97,7 @@
             "test_both_workers_execute_region_driven_cinderx_scalar_load",
             "test_same_production_plan_compiles_and_executes_on_each_worker"
           ],
-          "expected_test_count": 33,
+          "expected_test_count": 36,
           "allow_skips": false
         },
         "live": {
@@ -107,9 +114,10 @@
             "test_ray_state_join_never_starts_a_query_after_budget_expires",
             "test_zero_row_counts_are_derived_from_observed_runtime_events",
             "test_rfc003_system_contract",
-            "test_rfc004_system_contract"
+            "test_rfc004_system_contract",
+            "test_rfc005_system_contract"
           ],
-          "expected_test_count": 16,
+          "expected_test_count": 17,
           "allow_skips": false
         }
       }

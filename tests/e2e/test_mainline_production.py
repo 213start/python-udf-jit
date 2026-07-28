@@ -293,5 +293,177 @@ class RFC004SystemTests(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(
+    os.environ.get("UDFJIT_LIVE_RAY") == "1",
+    "requires the blue-98 fixed three-node final candidate cluster",
+)
+class RFC005SystemTests(unittest.TestCase):
+    def test_rfc005_system_contract(self):
+        import ray
+        from ray.util.scheduling_strategies import (
+            NodeAffinitySchedulingStrategy,
+        )
+
+        @ray.remote(num_cpus=0.01)
+        def physicalize_on_worker():
+            import dataclasses as _dataclasses
+
+            import ray as _ray
+
+            from python_udf_jit.runtime.descriptors import (
+                admit_access_spec as _admit_access_spec,
+                scalar_input_spec as _input_spec,
+                scalar_output_spec as _output_spec,
+            )
+            from python_udf_jit.runtime.layout import (
+                SUPPORTED_SCALAR_TYPES as _TYPES,
+            )
+            from python_udf_jit.runtime.physicalize import (
+                ScalarPhysicalizer as _ScalarPhysicalizer,
+            )
+
+            values = {
+                "bool": True,
+                "int32": -(1 << 31),
+                "int64": (1 << 63) - 1,
+                "float32": 1.25,
+                "float64": -0.0,
+            }
+            physicalizer = _ScalarPhysicalizer(
+                epoch="rfc005-system",
+            )
+            fingerprints = {}
+            outputs = {}
+            layouts = set()
+            for scalar_type in _TYPES:
+                with physicalizer.open_call(
+                    _input_spec(
+                        scalar_type,
+                        nullable=True,
+                    ),
+                    _output_spec(
+                        scalar_type,
+                        nullable=True,
+                    ),
+                    values[scalar_type],
+                ) as frame:
+                    loaded = frame.load_input()
+                    frame.stage_output(loaded)
+                    outputs[scalar_type] = frame.publish_output()
+                    fingerprints[scalar_type] = (
+                        frame.descriptor_set.input_descriptor.layout_fingerprint
+                    )
+                    layouts.add(
+                        frame.descriptor_set.input_descriptor.layout_kind
+                    )
+            active = physicalizer.active_frame_count
+            physicalizer.close()
+            scalar = _input_spec("float64", nullable=False)
+            rejections = {
+                layout: _admit_access_spec(
+                    _dataclasses.replace(
+                        scalar,
+                        layout_kind=layout,
+                    )
+                ).reason
+                for layout in (
+                    "arrow_array",
+                    "batch_view",
+                    "unknown",
+                )
+            }
+            return {
+                "active_frames": active,
+                "fingerprints": fingerprints,
+                "layouts": sorted(layouts),
+                "node_id": (
+                    _ray.get_runtime_context().get_node_id()
+                ),
+                "outputs": outputs,
+                "rejections": rejections,
+            }
+
+        ray.init(address="auto")
+        try:
+            alive = [
+                node
+                for node in ray.nodes()
+                if node.get("Alive")
+            ]
+            head = [
+                node
+                for node in alive
+                if node.get("NodeName") == "ray-head-driver"
+            ]
+            workers = sorted(
+                (
+                    node
+                    for node in alive
+                    if node.get("NodeName")
+                    in {"ray-worker-1", "ray-worker-2"}
+                ),
+                key=lambda node: node["NodeName"],
+            )
+            self.assertEqual(len(head), 1)
+            self.assertEqual(
+                head[0].get("Resources", {}).get("CPU", 0),
+                0,
+            )
+            self.assertEqual(len(workers), 2)
+            reports = ray.get(
+                [
+                    physicalize_on_worker.options(
+                        scheduling_strategy=(
+                            NodeAffinitySchedulingStrategy(
+                                node_id=worker["NodeID"],
+                                soft=False,
+                            )
+                        )
+                    ).remote()
+                    for worker in workers
+                ]
+            )
+        finally:
+            ray.shutdown()
+
+        self.assertEqual(
+            {report["node_id"] for report in reports},
+            {worker["NodeID"] for worker in workers},
+        )
+        self.assertTrue(
+            all(
+                set(report["outputs"])
+                == {
+                    "bool",
+                    "int32",
+                    "int64",
+                    "float32",
+                    "float64",
+                }
+                and report["layouts"] == ["scalar_slot"]
+                and report["active_frames"] == 0
+                and report["rejections"]
+                == {
+                    "arrow_array": (
+                        "arrow_layout_not_implemented"
+                    ),
+                    "batch_view": (
+                        "batch_layout_not_implemented"
+                    ),
+                    "unknown": "unknown_layout_kind",
+                }
+                for report in reports
+            )
+        )
+        self.assertEqual(
+            reports[0]["fingerprints"],
+            reports[1]["fingerprints"],
+        )
+        self.assertEqual(
+            len(set(reports[0]["fingerprints"].values())),
+            5,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

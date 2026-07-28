@@ -192,7 +192,11 @@ class ArtifactLoader:
         except ArtifactCodecError as error:
             raise ArtifactLoadError(
                 ArtifactLoadRejectCode.CODEC_REJECTED,
-                error.code.value,
+                (
+                    error.code.value
+                    if not error.detail
+                    else f"{error.code.value}:{error.detail}"
+                ),
             ) from error
         except Exception as error:
             raise ArtifactLoadError(

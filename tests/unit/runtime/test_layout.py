@@ -6,6 +6,7 @@ import unittest
 from python_udf_jit.runtime.layout import (
     FLOAT64_SCALAR_TYPE,
     SCALAR_SLOT_ABI_VERSION,
+    SUPPORTED_SCALAR_TYPES,
     LocalScalarSlotBackend,
     ProcessIdentity,
     ScalarSlotDescriptor,
@@ -27,7 +28,20 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(ScalarSlotDescriptor.from_document(document), descriptor)
         self.assertEqual(pickle.loads(pickle.dumps(descriptor)), descriptor)
         self.assertEqual(
-            set(document), {"abi_version", "scalar_type", "epoch", "access_id", "process"}
+            set(document),
+            {
+                "access_mode",
+                "abi_version",
+                "access_id",
+                "capacity",
+                "descriptor_generation",
+                "epoch",
+                "layout_kind",
+                "nullable",
+                "ownership",
+                "process",
+                "scalar_type",
+            },
         )
         serialized = repr(document).lower()
         self.assertNotIn("address", serialized)
@@ -47,6 +61,46 @@ class LayoutTest(unittest.TestCase):
         backend.close()
         with self.assertRaises(RuntimeError):
             backend.load_f64()
+
+        values = {
+            "bool": True,
+            "int32": -(1 << 31),
+            "int64": (1 << 63) - 1,
+            "float32": 1.25,
+            "float64": -0.0,
+        }
+        for scalar_type in SUPPORTED_SCALAR_TYPES:
+            with self.subTest(scalar_type=scalar_type):
+                typed = LocalScalarSlotBackend(
+                    scalar_type=scalar_type,
+                    nullable=True,
+                )
+                typed.begin_borrow()
+                typed.write_scalar(
+                    values[scalar_type],
+                    scalar_type=scalar_type,
+                    nullable=True,
+                )
+                self.assertEqual(
+                    typed.load_scalar(
+                        scalar_type=scalar_type,
+                        nullable=True,
+                    ),
+                    values[scalar_type],
+                )
+                typed.write_scalar(
+                    None,
+                    scalar_type=scalar_type,
+                    nullable=True,
+                )
+                self.assertIsNone(
+                    typed.load_scalar(
+                        scalar_type=scalar_type,
+                        nullable=True,
+                    )
+                )
+                typed.end_borrow()
+                typed.close()
 
 
 if __name__ == "__main__":

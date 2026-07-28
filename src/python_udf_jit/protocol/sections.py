@@ -35,6 +35,7 @@ class ArtifactSection:
 REQUIRED_SECTIONS = (
     "manifest",
     "target",
+    "physical_layout",
     "semantic_core_ir",
     "semantic_region_graph",
     "guard",

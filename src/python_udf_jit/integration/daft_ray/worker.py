@@ -41,6 +41,7 @@ from python_udf_jit.runtime.guards import (
     guard_outer_entry,
 )
 from python_udf_jit.runtime.layout import ProcessIdentity, SCALAR_SLOT_ABI_VERSION
+from python_udf_jit.runtime.physicalize import ScalarPhysicalizer
 from python_udf_jit.runtime.variant import (
     CacheDecision,
     ProcessVariantCache,
@@ -255,6 +256,13 @@ class WorkerScalarAdapter:
         )
         self._cache: ProcessVariantCache[ScalarProviderVariant] = ProcessVariantCache(
             context.process
+        )
+        self._physicalizer = ScalarPhysicalizer(
+            epoch=context.process.cluster_epoch,
+            process=ProcessIdentity(
+                context.process.pid,
+                context.process.process_generation,
+            ),
         )
         self._artifact: PortableUdfArtifact | None = None
         self._expectation: OuterGuardExpectation | None = None
@@ -495,6 +503,21 @@ class WorkerScalarAdapter:
                 key=self._key,
                 attribution=attribution,
             )
+        except ArtifactLoadError as error:
+            return self._fallback(
+                args,
+                kwargs,
+                (
+                    f"artifact_load_rejected:{error.code.value}"
+                    + (
+                        ""
+                        if not error.detail
+                        else f":{error.detail}"
+                    )
+                ),
+                key=self._key,
+                attribution=attribution,
+            )
         except Exception as error:
             return self._fallback(
                 args,
@@ -504,8 +527,24 @@ class WorkerScalarAdapter:
                 attribution=attribution,
             )
 
+        semantics_entered = False
         try:
-            result = variant.execute(value)
+            frame = self._physicalizer.open_call(
+                artifact.input_access_specs[0],
+                artifact.output_access_spec,
+                value,
+                keepalive=args,
+            )
+            with frame:
+                physical_value = frame.load_input()
+                if type(physical_value) is not float:
+                    raise PreSemanticsExecutionError(
+                        "physicalized_input_type_mismatch"
+                    )
+                semantics_entered = True
+                result = variant.execute(physical_value)
+                frame.stage_output(result)
+                result = frame.publish_output()
         except PreSemanticsExecutionError as error:
             return self._fallback(
                 args,
@@ -515,6 +554,17 @@ class WorkerScalarAdapter:
                 attribution=attribution,
             )
         except Exception as error:
+            if not semantics_entered:
+                return self._fallback(
+                    args,
+                    kwargs,
+                    (
+                        "physicalization_failed:"
+                        f"{type(error).__name__}"
+                    ),
+                    key=key,
+                    attribution=attribution,
+                )
             self._emit(
                 "execute",
                 "post_entry_failure",
@@ -540,6 +590,7 @@ class WorkerScalarAdapter:
 
     def close(self) -> None:
         self._cache.clear(lambda variant: variant.close())
+        self._physicalizer.close()
 
 
 def build_default_worker_adapter(wrapper: Any) -> WorkerScalarAdapter:

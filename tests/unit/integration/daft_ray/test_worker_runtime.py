@@ -508,7 +508,10 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertTrue(
             any(
                 event.reason_code
-                == "pre_semantics_failure:ArtifactLoadError"
+                == (
+                    "artifact_load_rejected:dependency_missing:"
+                    "python-udf-jit-definitely-missing"
+                )
                 for event in self.report.snapshot()
             )
         )

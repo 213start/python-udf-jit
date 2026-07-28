@@ -45,6 +45,31 @@ class DescriptorGuardsTest(unittest.TestCase):
                 DescriptorRejectCode.TYPE_MISMATCH,
             ),
             (
+                dataclasses.replace(self.descriptor, nullable=True),
+                DescriptorRejectCode.NULLABILITY_MISMATCH,
+            ),
+            (
+                dataclasses.replace(
+                    self.descriptor,
+                    ownership="borrowed_input",
+                ),
+                DescriptorRejectCode.OWNERSHIP_MISMATCH,
+            ),
+            (
+                dataclasses.replace(
+                    self.descriptor,
+                    access_mode="read",
+                ),
+                DescriptorRejectCode.ACCESS_MODE_MISMATCH,
+            ),
+            (
+                dataclasses.replace(
+                    self.descriptor,
+                    descriptor_generation=2,
+                ),
+                DescriptorRejectCode.GENERATION_MISMATCH,
+            ),
+            (
                 dataclasses.replace(self.descriptor, epoch="epoch-b"),
                 DescriptorRejectCode.EPOCH_MISMATCH,
             ),

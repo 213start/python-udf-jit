@@ -15,6 +15,12 @@ from python_udf_jit.compiler.region import (
     verify_semantic_region_graph,
 )
 from python_udf_jit.compiler.verifier import verify_semantic_module
+from python_udf_jit.runtime.descriptors import (
+    AccessSpec,
+    admit_access_spec,
+    scalar_input_spec,
+    scalar_output_spec,
+)
 from python_udf_jit.protocol.manifest import (
     DEFAULT_MANIFEST,
     ArtifactManifest,
@@ -31,6 +37,8 @@ class PortableUdfArtifact:
     manifest: ArtifactManifest
     semantic_core_module: SemanticCoreModule
     semantic_region_graph: SemanticRegionGraph
+    input_access_specs: tuple[AccessSpec, ...]
+    output_access_spec: AccessSpec
     guard_template: dict[str, Any]
     fallback_identity: FallbackIdentity
     encoded_content_sha256: str | None = field(
@@ -43,6 +51,13 @@ class PortableUdfArtifact:
         return {
             "manifest": self.manifest.portable_document(),
             "target": self.manifest.target_document(),
+            "physical_layout": {
+                "inputs": [
+                    spec.to_document()
+                    for spec in self.input_access_specs
+                ],
+                "output": self.output_access_spec.to_document(),
+            },
             "semantic_core_ir": (
                 self.semantic_core_module.to_document()
             ),
@@ -127,10 +142,31 @@ def build_artifact(
         "semantic_region_hash": semantic_region_graph.semantic_hash,
         "target_python": manifest.target_python,
     }
+    input_access_specs = tuple(
+        scalar_input_spec(
+            value.value,
+            nullable=(
+                semantic_core_module.input_nullability[index].value
+                != "non_null"
+            ),
+        )
+        for index, value in enumerate(
+            semantic_core_module.input_types
+        )
+    )
+    output_access_spec = scalar_output_spec(
+        semantic_core_module.output_type.value,
+        nullable=(
+            semantic_core_module.output_nullability.value
+            != "non_null"
+        ),
+    )
     return PortableUdfArtifact(
         manifest,
         semantic_core_module,
         semantic_region_graph,
+        input_access_specs,
+        output_access_spec,
         guard,
         fallback_identity,
     )
@@ -155,6 +191,32 @@ def artifact_from_documents(
         raise ArtifactCodecError(
             ArtifactRejectCode.MANIFEST_INCOMPATIBLE
         )
+    layout_document = documents["physical_layout"]
+    if (
+        not isinstance(layout_document, dict)
+        or set(layout_document) != {"inputs", "output"}
+        or not isinstance(layout_document["inputs"], list)
+    ):
+        raise ValueError("invalid physical layout document")
+    input_access_specs = tuple(
+        AccessSpec.from_document(value)
+        for value in layout_document["inputs"]
+    )
+    output_access_spec = AccessSpec.from_document(
+        layout_document["output"]
+    )
+    for spec in (*input_access_specs, output_access_spec):
+        decision = admit_access_spec(spec)
+        if not decision.accepted:
+            from python_udf_jit.protocol.codec import (
+                ArtifactCodecError,
+                ArtifactRejectCode,
+            )
+
+            raise ArtifactCodecError(
+                ArtifactRejectCode.LAYOUT_UNSUPPORTED,
+                decision.reason,
+            )
     semantic_document = documents["semantic_core_ir"]
     if (
         not isinstance(semantic_document, dict)
@@ -204,10 +266,35 @@ def artifact_from_documents(
     verify_semantic_region_graph(semantic_module, semantic_graph)
     if semantic_module.function_id != fallback.code_sha256:
         raise ValueError("semantic Core IR fallback identity mismatch")
+    expected_inputs = tuple(
+        scalar_input_spec(
+            value.value,
+            nullable=(
+                semantic_module.input_nullability[index].value
+                != "non_null"
+            ),
+        )
+        for index, value in enumerate(semantic_module.input_types)
+    )
+    expected_output = scalar_output_spec(
+        semantic_module.output_type.value,
+        nullable=(
+            semantic_module.output_nullability.value != "non_null"
+        ),
+    )
+    if (
+        input_access_specs != expected_inputs
+        or output_access_spec != expected_output
+    ):
+        raise ValueError(
+            "physical layout does not match semantic Core IR"
+        )
     return PortableUdfArtifact(
         manifest,
         semantic_module,
         semantic_graph,
+        input_access_specs,
+        output_access_spec,
         guard,
         fallback,
     )

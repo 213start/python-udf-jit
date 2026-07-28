@@ -106,6 +106,15 @@ class CapabilityTest(unittest.TestCase):
             borrowed.write_f64(4.25)
             guarded = self.registry.guard_data_handle(self.handle)
             self.assertEqual(self.registry.data_load_f64(guarded), 4.25)
+            with self.assertRaises(CapabilityError) as raised:
+                self.registry.register(
+                    LocalScalarSlotBackend(),
+                    access_id="must-not-mutate-during-borrow",
+                )
+            self.assertEqual(
+                raised.exception.code,
+                CapabilityRejectCode.IN_USE,
+            )
 
         with self.assertRaises(CapabilityError) as raised:
             borrowed.write_f64(5.0)

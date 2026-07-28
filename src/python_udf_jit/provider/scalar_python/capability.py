@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import os
 import secrets
+import threading
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -163,6 +164,8 @@ class CapabilityRegistry:
         self._identity = ProcessIdentity(os.getpid(), secrets.token_hex(16))
         self._entries: dict[str, _Entry] = {}
         self._last_generation: dict[str, int] = {}
+        self._active_borrows = 0
+        self._lock = threading.RLock()
 
     @property
     def registry_id(self) -> str:
@@ -185,74 +188,111 @@ class CapabilityRegistry:
         *,
         access_id: str | None = None,
     ) -> CapabilityHandle:
-        self._assert_current_process()
-        if not isinstance(backend, ScalarSlotBackend):
-            raise TypeError("backend must implement ScalarSlotBackend")
-        if access_id is None:
-            access_id = secrets.token_hex(16)
-        if not isinstance(access_id, str) or not access_id:
-            raise ValueError("access id must be a non-empty string")
-        if access_id in self._entries:
-            raise ValueError("access id is already registered")
-        generation = self._last_generation.get(access_id, 0) + 1
-        token = secrets.token_hex(32)
-        descriptor = ScalarSlotDescriptor(
-            SCALAR_SLOT_ABI_VERSION,
-            FLOAT64_SCALAR_TYPE,
-            self._epoch,
-            access_id,
-            self._identity,
-        )
-        self._entries[access_id] = _Entry(descriptor, backend, generation, token)
-        self._last_generation[access_id] = generation
-        return CapabilityHandle(
-            self._registry_id,
-            self._identity.pid,
-            self._identity.generation,
-            access_id,
-            generation,
-            token,
-        )
+        with self._lock:
+            self._assert_current_process()
+            if self._active_borrows:
+                raise CapabilityError(CapabilityRejectCode.IN_USE)
+            if not isinstance(backend, ScalarSlotBackend):
+                raise TypeError(
+                    "backend must implement ScalarSlotBackend"
+                )
+            if access_id is None:
+                access_id = secrets.token_hex(16)
+            if not isinstance(access_id, str) or not access_id:
+                raise ValueError(
+                    "access id must be a non-empty string"
+                )
+            if access_id in self._entries:
+                raise ValueError("access id is already registered")
+            generation = self._last_generation.get(access_id, 0) + 1
+            token = secrets.token_hex(32)
+            descriptor = ScalarSlotDescriptor(
+                abi_version=SCALAR_SLOT_ABI_VERSION,
+                scalar_type=FLOAT64_SCALAR_TYPE,
+                epoch=self._epoch,
+                access_id=access_id,
+                process=self._identity,
+                descriptor_generation=generation,
+            )
+            self._entries[access_id] = _Entry(
+                descriptor,
+                backend,
+                generation,
+                token,
+            )
+            self._last_generation[access_id] = generation
+            return CapabilityHandle(
+                self._registry_id,
+                self._identity.pid,
+                self._identity.generation,
+                access_id,
+                generation,
+                token,
+            )
 
     def descriptor(self, handle: CapabilityHandle) -> ScalarSlotDescriptor:
-        return self._resolve(handle).descriptor
+        with self._lock:
+            return self._resolve(handle).descriptor
 
     def borrow(self, handle: CapabilityHandle) -> BorrowedCapability:
-        entry = self._resolve(handle)
-        if entry.borrow_token is not None:
-            raise CapabilityError(CapabilityRejectCode.ALREADY_BORROWED)
-        borrow_token = secrets.token_hex(32)
-        entry.borrow_token = borrow_token
-        try:
-            keepalive = entry.backend.begin_borrow()
-        except BaseException:
-            entry.borrow_token = None
-            raise
-        entry.keepalive = keepalive
-        return BorrowedCapability(self, handle, borrow_token, keepalive)
+        with self._lock:
+            entry = self._resolve(handle)
+            if entry.borrow_token is not None:
+                raise CapabilityError(
+                    CapabilityRejectCode.ALREADY_BORROWED
+                )
+            borrow_token = secrets.token_hex(32)
+            entry.borrow_token = borrow_token
+            try:
+                keepalive = entry.backend.begin_borrow()
+            except BaseException:
+                entry.borrow_token = None
+                raise
+            entry.keepalive = keepalive
+            self._active_borrows += 1
+            return BorrowedCapability(
+                self,
+                handle,
+                borrow_token,
+                keepalive,
+            )
 
     def guard_data_handle(self, handle: CapabilityHandle) -> _GuardedSlot:
-        entry = self._resolve(handle)
-        if entry.borrow_token is None:
-            raise CapabilityError(CapabilityRejectCode.NOT_BORROWED)
-        return _GuardedSlot(handle, entry.borrow_token)
+        with self._lock:
+            entry = self._resolve(handle)
+            if entry.borrow_token is None:
+                raise CapabilityError(
+                    CapabilityRejectCode.NOT_BORROWED
+                )
+            return _GuardedSlot(handle, entry.borrow_token)
 
     def data_load_f64(self, guarded: object) -> float:
-        if not isinstance(guarded, _GuardedSlot):
-            raise CapabilityError(CapabilityRejectCode.BORROW_MISMATCH)
-        entry = self._resolve(guarded.handle)
-        if entry.borrow_token is None:
-            raise CapabilityError(CapabilityRejectCode.NOT_BORROWED)
-        if not hmac.compare_digest(entry.borrow_token, guarded.borrow_token):
-            raise CapabilityError(CapabilityRejectCode.BORROW_MISMATCH)
-        return entry.backend.load_f64()
+        with self._lock:
+            if not isinstance(guarded, _GuardedSlot):
+                raise CapabilityError(
+                    CapabilityRejectCode.BORROW_MISMATCH
+                )
+            entry = self._resolve(guarded.handle)
+            if entry.borrow_token is None:
+                raise CapabilityError(
+                    CapabilityRejectCode.NOT_BORROWED
+                )
+            if not hmac.compare_digest(
+                entry.borrow_token,
+                guarded.borrow_token,
+            ):
+                raise CapabilityError(
+                    CapabilityRejectCode.BORROW_MISMATCH
+                )
+            return entry.backend.load_f64()
 
     def release(self, handle: CapabilityHandle) -> None:
-        entry = self._resolve(handle)
-        if entry.borrow_token is not None:
-            raise CapabilityError(CapabilityRejectCode.IN_USE)
-        del self._entries[handle.access_id]
-        entry.backend.close()
+        with self._lock:
+            entry = self._resolve(handle)
+            if self._active_borrows or entry.borrow_token is not None:
+                raise CapabilityError(CapabilityRejectCode.IN_USE)
+            del self._entries[handle.access_id]
+            entry.backend.close()
 
     def _assert_current_process(self) -> None:
         if os.getpid() != self._identity.pid:
@@ -284,35 +324,61 @@ class CapabilityRegistry:
                 expected_epoch=self._epoch,
                 expected_access_id=handle.access_id,
                 expected_process=self._identity,
+                expected_descriptor_generation=handle.generation,
             )
         except DescriptorGuardError as error:
             raise CapabilityError(CapabilityRejectCode.DESCRIPTOR_MISMATCH) from error
         return entry
 
     def _write_f64(self, handle: CapabilityHandle, borrow_token: str, value: float) -> None:
-        entry = self._resolve(handle)
-        if entry.borrow_token is None:
-            raise CapabilityError(CapabilityRejectCode.NOT_BORROWED)
-        if not hmac.compare_digest(entry.borrow_token, borrow_token):
-            raise CapabilityError(CapabilityRejectCode.BORROW_MISMATCH)
-        entry.backend.write_f64(value)
+        with self._lock:
+            entry = self._resolve(handle)
+            if entry.borrow_token is None:
+                raise CapabilityError(
+                    CapabilityRejectCode.NOT_BORROWED
+                )
+            if not hmac.compare_digest(
+                entry.borrow_token,
+                borrow_token,
+            ):
+                raise CapabilityError(
+                    CapabilityRejectCode.BORROW_MISMATCH
+                )
+            entry.backend.write_f64(value)
 
     def _execution_handle(self, handle: CapabilityHandle, borrow_token: str) -> object:
-        entry = self._resolve(handle)
-        if entry.borrow_token is None:
-            raise CapabilityError(CapabilityRejectCode.NOT_BORROWED)
-        if not hmac.compare_digest(entry.borrow_token, borrow_token):
-            raise CapabilityError(CapabilityRejectCode.BORROW_MISMATCH)
-        return entry.backend.execution_handle()
+        with self._lock:
+            entry = self._resolve(handle)
+            if entry.borrow_token is None:
+                raise CapabilityError(
+                    CapabilityRejectCode.NOT_BORROWED
+                )
+            if not hmac.compare_digest(
+                entry.borrow_token,
+                borrow_token,
+            ):
+                raise CapabilityError(
+                    CapabilityRejectCode.BORROW_MISMATCH
+                )
+            return entry.backend.execution_handle()
 
     def _end_borrow(self, handle: CapabilityHandle, borrow_token: str) -> None:
-        entry = self._resolve(handle)
-        if entry.borrow_token is None:
-            raise CapabilityError(CapabilityRejectCode.NOT_BORROWED)
-        if not hmac.compare_digest(entry.borrow_token, borrow_token):
-            raise CapabilityError(CapabilityRejectCode.BORROW_MISMATCH)
-        try:
-            entry.backend.end_borrow()
-        finally:
-            entry.borrow_token = None
-            entry.keepalive = None
+        with self._lock:
+            entry = self._resolve(handle)
+            if entry.borrow_token is None:
+                raise CapabilityError(
+                    CapabilityRejectCode.NOT_BORROWED
+                )
+            if not hmac.compare_digest(
+                entry.borrow_token,
+                borrow_token,
+            ):
+                raise CapabilityError(
+                    CapabilityRejectCode.BORROW_MISMATCH
+                )
+            try:
+                entry.backend.end_borrow()
+            finally:
+                entry.borrow_token = None
+                entry.keepalive = None
+                self._active_borrows -= 1
