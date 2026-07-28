@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import hashlib
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _qualification_affine(value: float) -> float:
@@ -62,6 +63,46 @@ def _qualification_runtime_report(_value: float) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+class _QualificationSwordfishTask:
+    """Driver-only task facade that exercises Daft's production Handle boundary."""
+
+    def __init__(
+        self,
+        *,
+        name,
+        plan,
+        config,
+        partition_sets,
+        context,
+    ):
+        self._name = name
+        self._plan = plan
+        self._config = config
+        self._partition_sets = {
+            key: [
+                SimpleNamespace(object_ref=reference)
+                for reference in references
+            ]
+            for key, references in partition_sets.items()
+        }
+        self._context = context
+
+    def name(self):
+        return self._name
+
+    def plan(self):
+        return self._plan
+
+    def config(self):
+        return self._config
+
+    def psets(self):
+        return self._partition_sets
+
+    def context(self):
+        return self._context
 
 
 @unittest.skipUnless(
@@ -158,12 +199,25 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
         import ray
         from daft.context import get_context
         from daft.daft import LocalPhysicalPlan
-        from daft.runners.flotilla import RaySwordfishActor
+        from daft.runners.flotilla import (
+            RaySwordfishActor,
+            RaySwordfishActorHandle,
+        )
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+        from python_udf_jit.integration.daft_ray.objectref_bridge import (
+            driver_artifact_references,
+        )
 
         self.assertEqual(os.environ.get("UDFJIT_MODE"), "auto")
         self.assertTrue(os.environ.get("UDFJIT_CLUSTER_EPOCH"))
         self.assertTrue(os.environ.get("UDFJIT_RUN_ID"))
+        self.assertTrue(
+            getattr(
+                RaySwordfishActorHandle.submit_task,
+                "__python_udf_jit_objectref_bridge__",
+                False,
+            )
+        )
         ray.init(address="auto")
         actors = []
         try:
@@ -228,6 +282,14 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
                     )
                 partition_sets[partition_set_id] = refs
             self.assertTrue(partition_sets)
+            artifact_references = driver_artifact_references()
+            self.assertTrue(artifact_references)
+            self.assertTrue(
+                all(
+                    isinstance(record.reference, ray.ObjectRef)
+                    for record in artifact_references
+                )
+            )
             reports = []
             for worker in workers:
                 actor = RaySwordfishActor.options(
@@ -240,12 +302,25 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
                     num_gpus=int(worker["Resources"].get("GPU", 0)),
                 )
                 actors.append(actor)
-                stream = actor.run_plan.remote(
-                    plan,
-                    context.daft_execution_config,
-                    partition_sets,
-                    {"query_id": f"udfjit-qualification-{worker['NodeName']}"},
+                handle = RaySwordfishActorHandle(actor)
+                task_handle = handle.submit_task(
+                    _QualificationSwordfishTask(
+                        name=(
+                            "udfjit-qualification-"
+                            f"{worker['NodeName']}"
+                        ),
+                        plan=plan,
+                        config=context.daft_execution_config,
+                        partition_sets=partition_sets,
+                        context={
+                            "query_id": (
+                                "udfjit-qualification-"
+                                f"{worker['NodeName']}"
+                            )
+                        },
+                    )
                 )
+                stream = task_handle.result_handle
                 objects = ray.get(list(stream))
                 self.assertGreaterEqual(len(objects), 2)
                 partitions = objects[:-1]
