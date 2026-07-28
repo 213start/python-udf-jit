@@ -62,6 +62,7 @@
       "arguments": ["discover", "-s", "tests/unit", "-v"],
       "required_tests": [
         "test_scalar_and_mainline_profiles_load_independently",
+        "test_every_required_suite_method_exists_in_selected_sources",
         "test_resolution_priority_is_disable_plugin_mode_compatibility_policy",
         "test_poor_performance_does_not_fail_functional_completion",
         "test_cross_code_object_state_preserves_null_alias_and_exception",
@@ -99,7 +100,7 @@
       "test_capture_cache_is_job_scoped_ttl_and_lru_bounded",
       "test_semantic_literals_round_trip_without_repr_or_address",
       "test_multitype_semantic_module_round_trips_and_matches_cpython",
-      "test_legacy_f64_capture_enters_the_semantic_pipeline",
+      "test_scalar_f64_capture_enters_the_semantic_pipeline",
       "test_non_jit_types_never_claim_a_cinderx_region",
       "test_all_required_analyses_are_value_free_and_hash_bound",
       "test_cached_analysis_is_reused_and_unpreserved_proof_recomputes",
@@ -131,7 +132,7 @@
       "test_concurrent_frames_are_isolated_and_old_process_is_rejected",
       "test_rfc005_unit_contract"
       ],
-      "expected_test_count": 251,
+      "expected_test_count": 252,
       "allow_skips": false
     },
     "integration": {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import tempfile
 import unittest
@@ -25,6 +26,44 @@ MAINLINE_SCHEMA_PATH = (
 
 
 class MainlineAcceptanceContractTests(unittest.TestCase):
+    def test_every_required_suite_method_exists_in_selected_sources(
+        self,
+    ) -> None:
+        contract = load_acceptance_contract(MAINLINE_PATH)
+        selected_sources = {
+            "unit": tuple((ROOT / "tests/unit").rglob("test_*.py")),
+            "integration": tuple(
+                (ROOT / "tests/integration").rglob("test_*.py")
+            ),
+            "live": tuple(
+                ROOT.joinpath(*argument.split(".")).with_suffix(".py")
+                for argument in contract.test_suites["live"].arguments
+                if argument.startswith("tests.")
+            ),
+        }
+
+        for suite_name, suite in contract.test_suites.items():
+            method_names: set[str] = set()
+            for path in selected_sources[suite_name]:
+                tree = ast.parse(
+                    path.read_text(encoding="utf-8"),
+                    filename=str(path),
+                )
+                method_names.update(
+                    node.name
+                    for node in ast.walk(tree)
+                    if isinstance(
+                        node,
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                    and node.name.startswith("test_")
+                )
+            with self.subTest(suite=suite_name):
+                self.assertFalse(
+                    set(suite.required_tests) - method_names,
+                    "required tests must exist in selected suite sources",
+                )
+
     def test_mainline_schema_tracks_release_tier_and_all_examples(self) -> None:
         schema = json.loads(
             MAINLINE_SCHEMA_PATH.read_text(encoding="utf-8")
