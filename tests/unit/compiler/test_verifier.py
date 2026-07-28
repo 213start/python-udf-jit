@@ -4,9 +4,24 @@ import dataclasses
 import unittest
 
 from python_udf_jit.compiler.capture import CaptureRequest, capture
-from python_udf_jit.compiler.core_ir import CoreNode, lower_capture
+from python_udf_jit.compiler.core_ir import (
+    CoreNode,
+    LiteralKind,
+    SemanticLiteral,
+    lower_capture,
+    rehash_semantic_module,
+)
 from python_udf_jit.compiler.region import form_verified_region
-from python_udf_jit.compiler.verifier import VerificationError, VerificationRejectCode, verify_core_module
+from python_udf_jit.compiler.verifier import (
+    VerificationError,
+    VerificationRejectCode,
+    verify_core_module,
+    verify_semantic_module,
+)
+from tests.semantic_cases import (
+    branch_semantic_module,
+    python_continuation_module,
+)
 
 
 def affine(x):
@@ -62,6 +77,78 @@ class VerifierTest(unittest.TestCase):
 
         self.assertNotEqual(changed_constant.recompute_semantic_hash(), self.module.semantic_hash)
         self.assertNotEqual(changed_operator.recompute_semantic_hash(), self.module.semantic_hash)
+
+    def test_semantic_verifier_rejects_exception_cfg_and_python_region_drift(self):
+        continuation = python_continuation_module()
+        operations = list(continuation.operations)
+        operations[1] = dataclasses.replace(
+            operations[1],
+            exception_order=2,
+        )
+        invalid_exception = rehash_semantic_module(
+            dataclasses.replace(
+                continuation,
+                operations=tuple(operations),
+            )
+        )
+        with self.assertRaises(VerificationError) as raised:
+            verify_semantic_module(invalid_exception)
+        self.assertEqual(
+            raised.exception.code,
+            VerificationRejectCode.INVALID_EXCEPTION_ORDER,
+        )
+
+        branch = branch_semantic_module()
+        invalid_cfg = rehash_semantic_module(
+            dataclasses.replace(
+                branch,
+                control_edges=branch.control_edges[:-1],
+            )
+        )
+        with self.assertRaises(VerificationError) as raised:
+            verify_semantic_module(invalid_cfg)
+        self.assertEqual(
+            raised.exception.code,
+            VerificationRejectCode.INVALID_CONTROL_FLOW,
+        )
+
+        region = continuation.python_regions[0]
+        invalid_region = rehash_semantic_module(
+            dataclasses.replace(
+                continuation,
+                python_regions=(
+                    dataclasses.replace(region, resume_id="unsafe resume"),
+                ),
+            )
+        )
+        with self.assertRaises(VerificationError) as raised:
+            verify_semantic_module(invalid_region)
+        self.assertEqual(
+            raised.exception.code,
+            VerificationRejectCode.INVALID_PYTHON_REGION,
+        )
+
+        literal_module = branch_semantic_module()
+        literal_operations = list(literal_module.operations)
+        literal_operations[5] = dataclasses.replace(
+            literal_operations[5],
+            literal=SemanticLiteral(
+                LiteralKind.STRING,
+                "x" * 4097,
+            ),
+        )
+        invalid_literal = rehash_semantic_module(
+            dataclasses.replace(
+                literal_module,
+                operations=tuple(literal_operations),
+            )
+        )
+        with self.assertRaises(VerificationError) as raised:
+            verify_semantic_module(invalid_literal)
+        self.assertEqual(
+            raised.exception.code,
+            VerificationRejectCode.INVALID_LITERAL,
+        )
 
 
 if __name__ == "__main__":

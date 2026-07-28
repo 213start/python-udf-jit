@@ -319,6 +319,11 @@ class ControlHookTest(unittest.TestCase):
 
             self.assertTrue(wrapper.carrier.finalized)
             self.assertGreater(len(wrapper.carrier.artifact_bytes), 0)
+            record = registry.records()[0]
+            self.assertIsNotNone(record.semantic_core_hash)
+            self.assertIsNotNone(record.semantic_region_hash)
+            self.assertEqual(len(record.semantic_core_hash), 64)
+            self.assertEqual(len(record.semantic_region_hash), 64)
         finally:
             uninstall_daft_control_hooks(FakeFunc, FakeFloatDataFrame)
 

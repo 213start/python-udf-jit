@@ -96,9 +96,24 @@
         "test_global_and_default_changes_only_dependency_fingerprint",
         "test_opaque_dependency_rejects_without_repr_or_address",
         "test_identity_is_cross_process_stable",
-        "test_capture_cache_is_job_scoped_ttl_and_lru_bounded"
+      "test_capture_cache_is_job_scoped_ttl_and_lru_bounded",
+      "test_semantic_literals_round_trip_without_repr_or_address",
+      "test_multitype_semantic_module_round_trips_and_matches_cpython",
+      "test_legacy_f64_capture_enters_the_semantic_pipeline",
+      "test_non_jit_types_never_claim_a_cinderx_region",
+      "test_all_required_analyses_are_value_free_and_hash_bound",
+      "test_cached_analysis_is_reused_and_unpreserved_proof_recomputes",
+      "test_incorrect_preserved_analysis_is_rejected_as_stale",
+      "test_node_iteration_and_time_budgets_return_no_partial_regions",
+      "test_pure_f64_chain_forms_one_verified_cinderx_candidate",
+      "test_may_raise_operations_preserve_exception_order_edges",
+      "test_python_region_is_an_exact_once_continuation_barrier",
+      "test_control_flow_and_effect_boundaries_never_merge",
+      "test_multiple_effects_receive_explicit_order_edges",
+      "test_semantic_verifier_rejects_exception_cfg_and_python_region_drift",
+      "test_rfc003_unit_contract"
       ],
-      "expected_test_count": 210,
+      "expected_test_count": 225,
       "allow_skips": false
     },
     "integration": {
@@ -116,25 +131,28 @@
         "test_off_and_observe_preserve_real_daft_exception_semantics",
         "test_explicit_pth_bootstrap_hooks_fresh_driver_and_worker_interpreters",
         "test_scalar_call_view_is_address_free_and_stable_across_worker_pickle",
-        "test_driver_frontend_round_trips_in_fresh_worker_process"
+      "test_driver_frontend_round_trips_in_fresh_worker_process",
+      "test_rfc003_integration_contract"
       ],
-      "expected_test_count": 45,
+      "expected_test_count": 46,
       "allow_skips": false
     },
     "live": {
       "gate_id": "python.live",
       "tier": "system",
       "arguments": [
-        "tests.e2e.test_scalar_mainline_piercing",
-        "tests.integration.test_per_worker_artifact_qualification",
-        "-v"
+      "tests.e2e.test_scalar_mainline_piercing",
+      "tests.integration.test_per_worker_artifact_qualification",
+      "tests.e2e.test_mainline_production",
+      "-v"
       ],
       "required_tests": [
         "test_live_evidence_is_supplied_by_the_external_harness",
         "test_same_production_plan_compiles_and_executes_on_each_worker",
-        "test_rfc002_frontend_verifies_on_each_worker"
+      "test_rfc002_frontend_verifies_on_each_worker",
+      "test_rfc003_system_contract"
       ],
-      "expected_test_count": 16,
+      "expected_test_count": 17,
       "allow_skips": false
     }
   },

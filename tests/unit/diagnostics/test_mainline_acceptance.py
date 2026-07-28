@@ -249,24 +249,19 @@ class MainlineAcceptanceContractTests(unittest.TestCase):
         self.assertNotIn("incomplete", report["gates"].values())
         self.assertEqual(
             set(report["missing_rfcs"]),
-            {f"RFC-{index:03d}" for index in range(3, 9)},
+            {f"RFC-{index:03d}" for index in range(4, 9)},
         )
         self.assertEqual(report["rfcs"]["RFC-001"], "pass")
         self.assertEqual(report["rfcs"]["RFC-002"], "pass")
-        self.assertEqual(
-            {
-                report["gates"][gate]
-                for gate in contract.rfc_gates["RFC-001"]
-            },
-            {"pass"},
-        )
-        self.assertEqual(
-            {
-                report["gates"][gate]
-                for gate in contract.rfc_gates["RFC-002"]
-            },
-            {"pass"},
-        )
+        self.assertEqual(report["rfcs"]["RFC-003"], "pass")
+        for rfc in ("RFC-001", "RFC-002", "RFC-003"):
+            self.assertEqual(
+                {
+                    report["gates"][gate]
+                    for gate in contract.rfc_gates[rfc]
+                },
+                {"pass"},
+            )
         self.assertTrue(
             all(
                 gate.startswith(("rfc", "prerequisite."))
