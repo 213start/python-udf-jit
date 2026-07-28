@@ -360,6 +360,17 @@ class _WorkerScalarSlotProbe:
             raise AssertionError(
                 "continuation did not resume the suffix exactly once"
             )
+        with open("/proc/self/maps", encoding="ascii") as mappings:
+            rwx_mapping_count = sum(
+                1
+                for line in mappings
+                if len(fields := line.split(maxsplit=2)) >= 2
+                and fields[1].startswith("rwx")
+            )
+        if rwx_mapping_count:
+            raise AssertionError(
+                f"worker process contains {rwx_mapping_count} RWX mappings"
+            )
 
         return {
             "node_id": node_id,
@@ -373,6 +384,7 @@ class _WorkerScalarSlotProbe:
             "continuation_result": continuation_result,
             "continuation_effects": effects,
             "continuation_jit_compiled": True,
+            "rwx_mapping_count": rwx_mapping_count,
         }
 
 
@@ -476,6 +488,7 @@ class RayCinderXScalarSlotSmokeTests(unittest.TestCase):
                     report["continuation_jit_compiled"],
                     True,
                 )
+                self.assertEqual(report["rwx_mapping_count"], 0)
             output_path = os.environ.get("UDFJIT_READINESS_REPORT_PATH", "")
             if output_path:
                 manifest_path = Path(os.environ["UDFJIT_MANIFEST_PATH"])
