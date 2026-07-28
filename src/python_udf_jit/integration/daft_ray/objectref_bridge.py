@@ -20,12 +20,19 @@ from python_udf_jit.protocol.manifest import DEFAULT_MANIFEST
 
 
 _BRIDGE_CONTEXT_KEY = "__python_udf_jit_artifacts__"
+_BRIDGE_PARTITION_SET_KEY = "__python_udf_jit_artifact_references__"
 _BRIDGE_MARKER = "__python_udf_jit_objectref_bridge__"
 _ORIGINAL_METHOD = "__python_udf_jit_objectref_original__"
 _INSTALL_LOCK = threading.RLock()
 _DRIVER_LOCK = threading.RLock()
+_SCHEDULER_LOCK = threading.RLock()
 _DRIVER_ARTIFACTS: dict[str, "DriverArtifactReference"] = {}
+_SCHEDULER_PLAN_ARTIFACTS: dict[
+    str,
+    tuple["DriverArtifactReference", ...],
+] = {}
 _MAX_DRIVER_ARTIFACTS = 1024
+_MAX_SCHEDULER_PLANS = 1024
 
 
 @dataclass(frozen=True)
@@ -54,8 +61,14 @@ class DriverArtifactReference:
 class ObjectRefBridgeTarget:
     run_plan_signature: tuple[tuple[str, str], ...]
     submit_task_signature: tuple[tuple[str, str], ...]
+    stream_plan_signature: tuple[tuple[str, str], ...]
+    scheduler_run_plan_signature: tuple[tuple[str, str], ...]
+    scheduler_get_next_signature: tuple[tuple[str, str], ...]
     run_plan_fingerprint: str
     submit_task_fingerprint: str
+    stream_plan_fingerprint: str
+    scheduler_run_plan_fingerprint: str
+    scheduler_get_next_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -76,6 +89,22 @@ DAFT_V0_7_2_OBJECTREF_TARGET = ObjectRefBridgeTarget(
         ("self", "POSITIONAL_OR_KEYWORD"),
         ("task", "POSITIONAL_OR_KEYWORD"),
     ),
+    stream_plan_signature=(
+        ("self", "POSITIONAL_OR_KEYWORD"),
+        ("plan", "POSITIONAL_OR_KEYWORD"),
+        ("partition_sets", "POSITIONAL_OR_KEYWORD"),
+    ),
+    scheduler_run_plan_signature=(
+        ("self", "POSITIONAL_OR_KEYWORD"),
+        ("plan", "POSITIONAL_OR_KEYWORD"),
+        ("partition_sets", "POSITIONAL_OR_KEYWORD"),
+        ("_ray_trace_ctx", "KEYWORD_ONLY"),
+    ),
+    scheduler_get_next_signature=(
+        ("self", "POSITIONAL_OR_KEYWORD"),
+        ("plan_id", "POSITIONAL_OR_KEYWORD"),
+        ("_ray_trace_ctx", "KEYWORD_ONLY"),
+    ),
     run_plan_fingerprint=(
         "5edd09dfa1c01d6d674f972f96f1c303a"
         "0958967a0d5c3f2d2641aa8d6116d67"
@@ -83,6 +112,18 @@ DAFT_V0_7_2_OBJECTREF_TARGET = ObjectRefBridgeTarget(
     submit_task_fingerprint=(
         "9ead1d6619a29b6e277d8803ac000fb7"
         "1089447579a75af5e53a2ea37835ac30"
+    ),
+    stream_plan_fingerprint=(
+        "a9b89345a94266236fa746626621f53c5"
+        "bc60ea17a9fcd4c885f908e48741b13"
+    ),
+    scheduler_run_plan_fingerprint=(
+        "d25e04c37eb5ad1c65f1ea5e2b55209"
+        "fa5a185508c5d4f1b77318eb284de9f6a"
+    ),
+    scheduler_get_next_fingerprint=(
+        "594803324d56ca75a03603af3306a393e"
+        "85d02d119f855d1bcbfd31ede26b1ab"
     ),
 )
 
@@ -101,12 +142,21 @@ def _signature_shape(
 def target_for_objectref_bridge(
     run_plan: Any,
     submit_task: Any,
+    stream_plan: Any,
+    scheduler_run_plan: Any,
+    scheduler_get_next: Any,
 ) -> ObjectRefBridgeTarget:
     return ObjectRefBridgeTarget(
         _signature_shape(run_plan),
         _signature_shape(submit_task),
+        _signature_shape(stream_plan),
+        _signature_shape(scheduler_run_plan),
+        _signature_shape(scheduler_get_next),
         callable_fingerprint(run_plan),
         callable_fingerprint(submit_task),
+        callable_fingerprint(stream_plan),
+        callable_fingerprint(scheduler_run_plan),
+        callable_fingerprint(scheduler_get_next),
     )
 
 
@@ -142,13 +192,69 @@ def register_driver_artifact_reference(
 
 
 def driver_artifact_references() -> tuple[DriverArtifactReference, ...]:
-    with _DRIVER_LOCK:
-        return tuple(_DRIVER_ARTIFACTS.values())
+    with _DRIVER_LOCK, _SCHEDULER_LOCK:
+        records: dict[str, DriverArtifactReference] = dict(
+            _DRIVER_ARTIFACTS
+        )
+        for active in _SCHEDULER_PLAN_ARTIFACTS.values():
+            for record in active:
+                records.setdefault(
+                    record.content_sha256,
+                    record,
+                )
+        return tuple(records.values())
 
 
 def clear_driver_artifact_references() -> None:
-    with _DRIVER_LOCK:
+    with _DRIVER_LOCK, _SCHEDULER_LOCK:
         _DRIVER_ARTIFACTS.clear()
+        _SCHEDULER_PLAN_ARTIFACTS.clear()
+
+
+def scheduler_artifact_references() -> tuple[
+    DriverArtifactReference,
+    ...,
+]:
+    with _SCHEDULER_LOCK:
+        records: dict[str, DriverArtifactReference] = {}
+        for active in _SCHEDULER_PLAN_ARTIFACTS.values():
+            for record in active:
+                records.setdefault(
+                    record.content_sha256,
+                    record,
+                )
+        return tuple(records.values())
+
+
+def _register_scheduler_plan_artifacts(
+    plan_id: str,
+    records: tuple[DriverArtifactReference, ...],
+) -> None:
+    if (
+        type(plan_id) is not str
+        or not plan_id
+        or len(plan_id.encode("utf-8")) > 4096
+        or not records
+        or len(records) > _MAX_DRIVER_ARTIFACTS
+        or not all(
+            isinstance(record, DriverArtifactReference)
+            for record in records
+        )
+    ):
+        raise ValueError("invalid Scheduler artifact references")
+    with _SCHEDULER_LOCK:
+        if (
+            plan_id not in _SCHEDULER_PLAN_ARTIFACTS
+            and len(_SCHEDULER_PLAN_ARTIFACTS)
+            >= _MAX_SCHEDULER_PLANS
+        ):
+            raise ValueError("Scheduler artifact plan capacity exceeded")
+        _SCHEDULER_PLAN_ARTIFACTS[plan_id] = records
+
+
+def _clear_scheduler_plan_artifacts(plan_id: str) -> None:
+    with _SCHEDULER_LOCK:
+        _SCHEDULER_PLAN_ARTIFACTS.pop(plan_id, None)
 
 
 def install_daft_objectref_bridge(
@@ -167,24 +273,38 @@ def install_daft_objectref_bridge(
             run_plan = modified_class.run_plan
             handle_class = flotilla_module.RaySwordfishActorHandle
             submit_task = handle_class.submit_task
+            runner_class = flotilla_module.FlotillaRunner
+            stream_plan = runner_class.stream_plan
+            scheduler_class = (
+                flotilla_module.RemoteFlotillaRunner
+                .__ray_metadata__.modified_class
+            )
+            scheduler_run_plan = scheduler_class.run_plan
+            scheduler_get_next = (
+                scheduler_class.get_next_partition
+            )
         except Exception as error:
             return ObjectRefBridgeResult(
                 False,
                 f"objectref_bridge_surface_missing:{type(error).__name__}",
             )
 
-        run_installed = bool(
-            getattr(run_plan, _BRIDGE_MARKER, False)
+        installed_states = tuple(
+            bool(getattr(method, _BRIDGE_MARKER, False))
+            for method in (
+                run_plan,
+                submit_task,
+                stream_plan,
+                scheduler_run_plan,
+                scheduler_get_next,
+            )
         )
-        submit_installed = bool(
-            getattr(submit_task, _BRIDGE_MARKER, False)
-        )
-        if run_installed and submit_installed:
+        if all(installed_states):
             return ObjectRefBridgeResult(
                 True,
                 "objectref_bridge_already_installed",
             )
-        if run_installed or submit_installed:
+        if any(installed_states):
             return ObjectRefBridgeResult(
                 False,
                 "objectref_bridge_partial_state",
@@ -193,6 +313,9 @@ def install_daft_objectref_bridge(
             actual = target_for_objectref_bridge(
                 run_plan,
                 submit_task,
+                stream_plan,
+                scheduler_run_plan,
+                scheduler_get_next,
             )
         except Exception as error:
             return ObjectRefBridgeResult(
@@ -303,6 +426,128 @@ def install_daft_objectref_bridge(
                     content_sha256s=tuple(prefetched),
                 )
 
+        @functools.wraps(stream_plan)
+        def wrapped_stream_plan(
+            self,
+            plan,
+            partition_sets,
+        ):
+            references = driver_artifact_references()
+            if (
+                not references
+                or not isinstance(partition_sets, dict)
+                or _BRIDGE_PARTITION_SET_KEY in partition_sets
+            ):
+                yield from stream_plan(
+                    self,
+                    plan,
+                    partition_sets,
+                )
+                return
+            try:
+                plan_id = plan.idx()
+                if type(plan_id) is not str or not plan_id:
+                    raise ValueError("invalid distributed plan id")
+            except Exception:
+                yield from stream_plan(
+                    self,
+                    plan,
+                    partition_sets,
+                )
+                return
+            bridged_partition_sets = dict(partition_sets)
+            bridged_partition_sets[_BRIDGE_PARTITION_SET_KEY] = (
+                plan_id,
+                references,
+            )
+            yield from stream_plan(
+                self,
+                plan,
+                bridged_partition_sets,
+            )
+
+        @functools.wraps(scheduler_run_plan)
+        def wrapped_scheduler_run_plan(
+            self,
+            plan,
+            partition_sets,
+            *,
+            _ray_trace_ctx=None,
+        ):
+            registered_plan_id = ""
+            execution_partition_sets = partition_sets
+            if (
+                isinstance(partition_sets, dict)
+                and _BRIDGE_PARTITION_SET_KEY
+                in partition_sets
+            ):
+                bridge_value = partition_sets[
+                    _BRIDGE_PARTITION_SET_KEY
+                ]
+                try:
+                    plan_id = plan.idx()
+                except Exception:
+                    plan_id = None
+                if (
+                    isinstance(bridge_value, tuple)
+                    and len(bridge_value) == 2
+                    and type(bridge_value[0]) is str
+                    and bridge_value[0] == plan_id
+                    and isinstance(bridge_value[1], tuple)
+                    and bridge_value[1]
+                    and all(
+                        isinstance(
+                            item,
+                            DriverArtifactReference,
+                        )
+                        for item in bridge_value[1]
+                    )
+                ):
+                    execution_partition_sets = dict(
+                        partition_sets
+                    )
+                    execution_partition_sets.pop(
+                        _BRIDGE_PARTITION_SET_KEY
+                    )
+                    _register_scheduler_plan_artifacts(
+                        bridge_value[0],
+                        bridge_value[1],
+                    )
+                    registered_plan_id = bridge_value[0]
+            try:
+                return scheduler_run_plan(
+                    self,
+                    plan,
+                    execution_partition_sets,
+                    _ray_trace_ctx=_ray_trace_ctx,
+                )
+            except BaseException:
+                if registered_plan_id:
+                    _clear_scheduler_plan_artifacts(
+                        registered_plan_id
+                    )
+                raise
+
+        @functools.wraps(scheduler_get_next)
+        async def wrapped_scheduler_get_next(
+            self,
+            plan_id,
+            *,
+            _ray_trace_ctx=None,
+        ):
+            try:
+                result = await scheduler_get_next(
+                    self,
+                    plan_id,
+                    _ray_trace_ctx=_ray_trace_ctx,
+                )
+            except BaseException:
+                _clear_scheduler_plan_artifacts(plan_id)
+                raise
+            if result is None:
+                _clear_scheduler_plan_artifacts(plan_id)
+            return result
+
         @functools.wraps(submit_task)
         def wrapped_submit_task(self, task):
             psets = {
@@ -343,12 +588,46 @@ def install_daft_objectref_bridge(
         setattr(wrapped_run_plan, _ORIGINAL_METHOD, run_plan)
         setattr(wrapped_submit_task, _BRIDGE_MARKER, True)
         setattr(wrapped_submit_task, _ORIGINAL_METHOD, submit_task)
+        setattr(wrapped_stream_plan, _BRIDGE_MARKER, True)
+        setattr(wrapped_stream_plan, _ORIGINAL_METHOD, stream_plan)
+        setattr(
+            wrapped_scheduler_run_plan,
+            _BRIDGE_MARKER,
+            True,
+        )
+        setattr(
+            wrapped_scheduler_run_plan,
+            _ORIGINAL_METHOD,
+            scheduler_run_plan,
+        )
+        setattr(
+            wrapped_scheduler_get_next,
+            _BRIDGE_MARKER,
+            True,
+        )
+        setattr(
+            wrapped_scheduler_get_next,
+            _ORIGINAL_METHOD,
+            scheduler_get_next,
+        )
         try:
             modified_class.run_plan = wrapped_run_plan
             handle_class.submit_task = wrapped_submit_task
+            runner_class.stream_plan = wrapped_stream_plan
+            scheduler_class.run_plan = (
+                wrapped_scheduler_run_plan
+            )
+            scheduler_class.get_next_partition = (
+                wrapped_scheduler_get_next
+            )
         except Exception:
             modified_class.run_plan = run_plan
             handle_class.submit_task = submit_task
+            runner_class.stream_plan = stream_plan
+            scheduler_class.run_plan = scheduler_run_plan
+            scheduler_class.get_next_partition = (
+                scheduler_get_next
+            )
             return ObjectRefBridgeResult(
                 False,
                 "objectref_bridge_install_failed",

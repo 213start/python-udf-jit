@@ -90,13 +90,28 @@ def _ray_get(reference: object) -> bytes:
     if isinstance(reference, bytes):
         return reference
 
+    import ray
+
+    try:
+        actor_id = ray.get_runtime_context().get_actor_id()
+        is_nil = getattr(actor_id, "is_nil", None)
+        inside_actor = (
+            not is_nil()
+            if callable(is_nil)
+            else isinstance(actor_id, str) and bool(actor_id)
+        )
+    except Exception:
+        inside_actor = False
+    if inside_actor:
+        raise RuntimeError(
+            "async_actor_object_ref_was_not_prefetched"
+        )
+
     try:
         import asyncio
 
         asyncio.get_running_loop()
     except RuntimeError:
-        import ray
-
         value = ray.get(
             reference,
             timeout=_RAY_GET_TIMEOUT_SECONDS,

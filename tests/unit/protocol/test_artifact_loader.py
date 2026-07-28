@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from python_udf_jit.compiler.capture import CaptureRequest, capture
 from python_udf_jit.compiler.pipeline import compile_semantic
@@ -93,6 +96,49 @@ class _ObjectStore:
 
 
 class ArtifactLoaderTest(unittest.TestCase):
+    def test_sync_actor_thread_rejects_unprefetched_ref_without_ray_get(
+        self,
+    ):
+        encoded = _encoded()
+        carrier = ProductionCarrierState.placeholder(
+            "candidate",
+            "a" * 64,
+        ).finalize(
+            encoded,
+            inline_threshold=0,
+            publisher=lambda _payload: "object-ref",
+        )
+        ray_get = mock.Mock()
+        fake_ray = SimpleNamespace(
+            get=ray_get,
+            get_runtime_context=lambda: SimpleNamespace(
+                get_actor_id=lambda: SimpleNamespace(
+                    is_nil=lambda: False
+                )
+            ),
+        )
+
+        with mock.patch.dict(sys.modules, {"ray": fake_ray}):
+            with self.assertRaises(ArtifactLoadError) as rejected:
+                ArtifactLoader().load(
+                    carrier.handle,
+                    LoaderNamespace(
+                        "actor-job",
+                        "tenant",
+                        "process",
+                    ),
+                )
+
+        self.assertEqual(
+            rejected.exception.code,
+            ArtifactLoadRejectCode.OBJECT_MISSING,
+        )
+        self.assertEqual(
+            rejected.exception.detail,
+            "RuntimeError",
+        )
+        ray_get.assert_not_called()
+
     def test_1_10_100_1000_artifacts_parse_once_per_content(self):
         base = _artifact()
         for count in (1, 10, 100, 1000):

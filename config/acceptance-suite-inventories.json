@@ -55,7 +55,9 @@
             "test_each_invoke_freezes_one_ray_task_identity_for_all_events",
             "test_default_install_requires_exact_objectref_bridge",
             "test_bridge_awaits_on_actor_loop_and_prefetches_for_sync_udf",
+            "test_driver_references_relay_through_scheduler_and_clear_on_completion",
             "test_bridge_rejects_contract_mismatch_and_partial_state",
+            "test_sync_actor_thread_rejects_unprefetched_ref_without_ray_get",
             "test_existing_parent_permissions_are_not_changed",
             "test_exact_static_runtime_and_python_gates_produce_proof",
             "test_failure_scrub_removes_all_payloads_but_preserves_run_root",
@@ -70,7 +72,7 @@
             "test_runtime_binding_is_exact_and_reversible",
             "test_successful_compose_down_still_verifies_no_resources_remain"
           ],
-          "expected_test_count": 177,
+          "expected_test_count": 179,
           "allow_skips": false
         },
         "integration": {

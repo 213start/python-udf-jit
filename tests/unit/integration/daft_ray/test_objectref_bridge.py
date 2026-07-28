@@ -16,6 +16,7 @@ from python_udf_jit.integration.daft_ray.objectref_bridge import (
     clear_driver_artifact_references,
     install_daft_objectref_bridge,
     register_driver_artifact_reference,
+    scheduler_artifact_references,
     target_for_objectref_bridge,
 )
 from python_udf_jit.protocol.artifact import build_artifact
@@ -67,6 +68,51 @@ class _FakeActorImplementation:
 class _FakeActorClass:
     __ray_metadata__ = SimpleNamespace(
         modified_class=_FakeActorImplementation
+    )
+
+
+class _FakeDistributedPlan:
+    def __init__(self, plan_id="distributed-plan"):
+        self._plan_id = plan_id
+
+    def idx(self):
+        return self._plan_id
+
+
+class _FakeFlotillaRunner:
+    def __init__(self):
+        self.submitted = None
+
+    def stream_plan(self, plan, partition_sets):
+        self.submitted = (plan, partition_sets)
+        yield ("stream", plan.idx())
+
+
+class _FakeRemoteRunnerImplementation:
+    def __init__(self):
+        self.partition_sets = None
+
+    def run_plan(
+        self,
+        _plan,
+        partition_sets,
+        *,
+        _ray_trace_ctx=None,
+    ):
+        self.partition_sets = partition_sets
+
+    async def get_next_partition(
+        self,
+        _plan_id,
+        *,
+        _ray_trace_ctx=None,
+    ):
+        return None
+
+
+class _FakeRemoteRunnerClass:
+    __ray_metadata__ = SimpleNamespace(
+        modified_class=_FakeRemoteRunnerImplementation
     )
 
 
@@ -137,6 +183,8 @@ def _flotilla_module():
         RaySwordfishActor=_FakeActorClass,
         RaySwordfishActorHandle=_FakeRaySwordfishActorHandle,
         RaySwordfishTaskHandle=_FakeRaySwordfishTaskHandle,
+        FlotillaRunner=_FakeFlotillaRunner,
+        RemoteFlotillaRunner=_FakeRemoteRunnerClass,
     )
 
 
@@ -146,6 +194,15 @@ class ObjectRefBridgeTest(unittest.TestCase):
         self.original_submit_task = (
             _FakeRaySwordfishActorHandle.submit_task
         )
+        self.original_stream_plan = (
+            _FakeFlotillaRunner.stream_plan
+        )
+        self.original_scheduler_run_plan = (
+            _FakeRemoteRunnerImplementation.run_plan
+        )
+        self.original_scheduler_get_next = (
+            _FakeRemoteRunnerImplementation.get_next_partition
+        )
         clear_driver_artifact_references()
 
     def tearDown(self):
@@ -153,17 +210,32 @@ class ObjectRefBridgeTest(unittest.TestCase):
         _FakeRaySwordfishActorHandle.submit_task = (
             self.original_submit_task
         )
+        _FakeFlotillaRunner.stream_plan = (
+            self.original_stream_plan
+        )
+        _FakeRemoteRunnerImplementation.run_plan = (
+            self.original_scheduler_run_plan
+        )
+        _FakeRemoteRunnerImplementation.get_next_partition = (
+            self.original_scheduler_get_next
+        )
         clear_driver_artifact_references()
+
+    def target(self):
+        return target_for_objectref_bridge(
+            self.original_run_plan,
+            self.original_submit_task,
+            self.original_stream_plan,
+            self.original_scheduler_run_plan,
+            self.original_scheduler_get_next,
+        )
 
     def test_bridge_awaits_on_actor_loop_and_prefetches_for_sync_udf(self):
         payload = _encoded_artifact()
         reference = _ResolvedReference(payload)
         register_driver_artifact_reference(payload, reference)
         module = _flotilla_module()
-        target = target_for_objectref_bridge(
-            self.original_run_plan,
-            self.original_submit_task,
-        )
+        target = self.target()
 
         installed = install_daft_objectref_bridge(
             module,
@@ -270,12 +342,79 @@ class ObjectRefBridgeTest(unittest.TestCase):
             ("original-submit", collision_task),
         )
 
+    def test_driver_references_relay_through_scheduler_and_clear_on_completion(
+        self,
+    ):
+        payload = _encoded_artifact()
+        reference = _ResolvedReference(payload)
+        register_driver_artifact_reference(payload, reference)
+        module = _flotilla_module()
+
+        installed = install_daft_objectref_bridge(
+            module,
+            target=self.target(),
+        )
+        self.assertTrue(installed.installed)
+
+        distributed_plan = _FakeDistributedPlan()
+        driver_runner = _FakeFlotillaRunner()
+        self.assertEqual(
+            list(
+                driver_runner.stream_plan(
+                    distributed_plan,
+                    {"input": "partition-set"},
+                )
+            ),
+            [("stream", distributed_plan.idx())],
+        )
+        scheduler_arguments = driver_runner.submitted
+        self.assertIsNotNone(scheduler_arguments)
+
+        clear_driver_artifact_references()
+        self.assertEqual(scheduler_artifact_references(), ())
+        scheduler = _FakeRemoteRunnerImplementation()
+        scheduler.run_plan(
+            *scheduler_arguments,
+            _ray_trace_ctx="trace",
+        )
+        self.assertEqual(
+            [
+                record.content_sha256
+                for record in scheduler_artifact_references()
+            ],
+            [hashlib.sha256(payload).hexdigest()],
+        )
+        self.assertEqual(
+            scheduler.partition_sets,
+            {"input": "partition-set"},
+        )
+
+        actor_handle = _FakeRaySwordfishActorHandle()
+        actor_handle.submit_task(
+            _FakeTask(lambda *_arguments: "executed")
+        )
+        actor_arguments = (
+            actor_handle.actor_handle.run_plan.arguments
+        )
+        self.assertIsNotNone(actor_arguments)
+        self.assertIn(
+            "__python_udf_jit_artifacts__",
+            actor_arguments[-1],
+        )
+
+        self.assertIsNone(
+            asyncio.run(
+                scheduler.get_next_partition(
+                    distributed_plan.idx(),
+                    _ray_trace_ctx="trace",
+                )
+            )
+        )
+        self.assertEqual(scheduler_artifact_references(), ())
+
     def test_bridge_rejects_contract_mismatch_and_partial_state(self):
         module = _flotilla_module()
-        target = target_for_objectref_bridge(
-            self.original_run_plan,
-            self.original_submit_task,
-        )
+        target = self.target()
         mismatch = dataclasses.replace(
             target,
             run_plan_fingerprint="0" * 64,
