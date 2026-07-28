@@ -21,6 +21,7 @@ from python_udf_jit.integration.daft_ray.compatibility import (
 from python_udf_jit.integration.daft_ray.control import (
     HookStatus,
     install_daft_control_hooks,
+    install_default_daft_hooks,
     uninstall_daft_control_hooks,
 )
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
@@ -183,6 +184,41 @@ class ControlHookTest(unittest.TestCase):
         self.assertEqual(result.status, HookStatus.DISABLED)
         self.assertIs(FakeFunc.__call__, original_call)
         self.assertIs(FakeDataFrame.with_columns, original_with_columns)
+
+    def test_default_install_requires_exact_objectref_bridge(self):
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "UDFJIT_MODE": "auto",
+                    "UDFJIT_MANIFEST_SHA256": MANIFEST_SHA256,
+                },
+                clear=False,
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control.install_daft_objectref_bridge",
+                return_value=SimpleNamespace(
+                    installed=False,
+                    reason="objectref_bridge_contract_mismatch",
+                ),
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control.importlib.import_module",
+                return_value=SimpleNamespace(),
+            ) as import_module,
+        ):
+            result = install_default_daft_hooks(
+                SimpleNamespace(__version__="0.7.2")
+            )
+
+        self.assertEqual(result.status, HookStatus.ERROR)
+        self.assertEqual(
+            result.reason,
+            "objectref_bridge_contract_mismatch",
+        )
+        import_module.assert_called_once_with(
+            "daft.runners.flotilla"
+        )
 
     def test_fingerprint_mismatch_fails_open_without_patching(self):
         original_call = FakeFunc.__call__

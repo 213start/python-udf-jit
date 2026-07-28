@@ -18,6 +18,9 @@ from python_udf_jit.integration.daft_ray.compatibility import (
     validate_daft_compatibility,
     validate_func_instance,
 )
+from python_udf_jit.integration.daft_ray.objectref_bridge import (
+    install_daft_objectref_bridge,
+)
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
 
 
@@ -234,6 +237,18 @@ def install_default_daft_hooks(daft_module: Any) -> HookResult:
         _emit_fail_open("manifest_missing")
         return HookResult(HookStatus.ERROR, "manifest_missing")
     try:
+        flotilla_module = importlib.import_module(
+            "daft.runners.flotilla"
+        )
+        bridge = install_daft_objectref_bridge(
+            flotilla_module
+        )
+        if not bridge.installed:
+            _emit_fail_open(bridge.reason)
+            return HookResult(
+                HookStatus.ERROR,
+                bridge.reason,
+            )
         udf_module = importlib.import_module("daft.udf.udf_v2")
         dataframe_module = importlib.import_module("daft.dataframe.dataframe")
         expressions_module = importlib.import_module("daft.expressions.expressions")

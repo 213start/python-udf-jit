@@ -4,7 +4,6 @@ import hashlib
 import importlib.metadata
 import secrets
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Callable
@@ -21,6 +20,11 @@ from python_udf_jit.protocol.manifest import (
 
 
 _RAY_GET_TIMEOUT_SECONDS = 30.0
+_PREFETCH_LOCK = threading.RLock()
+_PREFETCHED_PAYLOADS: dict[
+    tuple[str, str, str],
+    bytes,
+] = {}
 
 
 class ArtifactLoadRejectCode(StrEnum):
@@ -86,44 +90,92 @@ def _ray_get(reference: object) -> bytes:
     if isinstance(reference, bytes):
         return reference
 
-    def resolve() -> object:
-        import ray
-
-        return ray.get(
-            reference,
-            timeout=_RAY_GET_TIMEOUT_SECONDS,
-        )
-
     try:
         import asyncio
 
         asyncio.get_running_loop()
     except RuntimeError:
-        value = resolve()
-    else:
-        # Daft's RaySwordfishActor is asynchronous while the scalar UDF call
-        # is synchronous. Calling ray.get on that event-loop thread can
-        # deadlock the Actor. The process-local loader remains synchronous to
-        # its caller, but object-store progress runs on this bounded resolver.
-        with ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="udfjit-object-ref",
-        ) as executor:
-            async def await_reference() -> object:
-                return await asyncio.wait_for(
-                    reference,  # type: ignore[arg-type]
-                    timeout=_RAY_GET_TIMEOUT_SECONDS,
-                )
+        import ray
 
-            value = executor.submit(
-                asyncio.run,
-                await_reference(),
-            ).result(
-                timeout=_RAY_GET_TIMEOUT_SECONDS + 1.0
-            )
+        value = ray.get(
+            reference,
+            timeout=_RAY_GET_TIMEOUT_SECONDS,
+        )
+    else:
+        raise RuntimeError(
+            "async_actor_object_ref_was_not_prefetched"
+        )
     if not isinstance(value, bytes):
         raise TypeError("Ray object does not contain artifact bytes")
     return value
+
+
+def prefetch_artifact_payload(
+    *,
+    job_namespace: str,
+    tenant_namespace: str,
+    content_sha256: str,
+    payload: bytes,
+) -> None:
+    namespace = LoaderNamespace(
+        job_namespace,
+        tenant_namespace,
+        "prefetch",
+    )
+    if (
+        not isinstance(content_sha256, str)
+        or len(content_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in content_sha256
+        )
+        or not isinstance(payload, bytes)
+        or not payload
+        or len(payload) > DEFAULT_MANIFEST.max_total_bytes
+    ):
+        raise ValueError("invalid prefetched artifact payload")
+    key = (
+        namespace.job_namespace,
+        namespace.tenant_namespace,
+        content_sha256,
+    )
+    with _PREFETCH_LOCK:
+        existing = _PREFETCHED_PAYLOADS.get(key)
+        if existing is not None and existing != payload:
+            raise ValueError("prefetched artifact content collision")
+        _PREFETCHED_PAYLOADS[key] = payload
+
+
+def clear_prefetched_artifact_payloads(
+    *,
+    job_namespace: str,
+    tenant_namespace: str,
+    content_sha256s: tuple[str, ...],
+) -> None:
+    with _PREFETCH_LOCK:
+        for content_sha256 in content_sha256s:
+            _PREFETCHED_PAYLOADS.pop(
+                (
+                    job_namespace,
+                    tenant_namespace,
+                    content_sha256,
+                ),
+                None,
+            )
+
+
+def _prefetched_payload(
+    namespace: LoaderNamespace,
+    content_sha256: str,
+) -> bytes | None:
+    with _PREFETCH_LOCK:
+        return _PREFETCHED_PAYLOADS.get(
+            (
+                namespace.job_namespace,
+                namespace.tenant_namespace,
+                content_sha256,
+            )
+        )
 
 
 class ArtifactLoader:
@@ -177,14 +229,21 @@ class ArtifactLoader:
             if rejected is not None:
                 raise rejected
             try:
-                artifact = self._load_uncached(handle)
+                artifact = self._load_uncached(
+                    handle,
+                    namespace,
+                )
             except ArtifactLoadError as error:
                 self._negative[key] = error
                 raise
             self._positive[key] = artifact
             return artifact
 
-    def _load_uncached(self, handle: Any) -> PortableUdfArtifact:
+    def _load_uncached(
+        self,
+        handle: Any,
+        namespace: LoaderNamespace,
+    ) -> PortableUdfArtifact:
         kind = getattr(handle, "kind", None)
         declared_size = getattr(handle, "size_bytes", None)
         if (
@@ -200,19 +259,24 @@ class ArtifactLoader:
         if kind == "inline-artifact":
             payload = getattr(handle, "payload", None)
         else:
-            reference = getattr(handle, "reference", None)
-            if reference is None:
-                raise ArtifactLoadError(
-                    ArtifactLoadRejectCode.HANDLE_INVALID,
-                    "object_reference",
-                )
-            try:
-                payload = self._resolver(reference)
-            except Exception as error:
-                raise ArtifactLoadError(
-                    ArtifactLoadRejectCode.OBJECT_MISSING,
-                    type(error).__name__,
-                ) from error
+            payload = _prefetched_payload(
+                namespace,
+                getattr(handle, "content_sha256", ""),
+            )
+            if payload is None:
+                reference = getattr(handle, "reference", None)
+                if reference is None:
+                    raise ArtifactLoadError(
+                        ArtifactLoadRejectCode.HANDLE_INVALID,
+                        "object_reference",
+                    )
+                try:
+                    payload = self._resolver(reference)
+                except Exception as error:
+                    raise ArtifactLoadError(
+                        ArtifactLoadRejectCode.OBJECT_MISSING,
+                        type(error).__name__,
+                    ) from error
         if (
             not isinstance(payload, bytes)
             or len(payload) != declared_size

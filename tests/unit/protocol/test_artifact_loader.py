@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import threading
 import unittest
 
 from python_udf_jit.compiler.capture import CaptureRequest, capture
@@ -18,6 +17,8 @@ from python_udf_jit.protocol.loader import (
     ArtifactLoader,
     ArtifactLoadRejectCode,
     LoaderNamespace,
+    clear_prefetched_artifact_payloads,
+    prefetch_artifact_payload,
 )
 from python_udf_jit.protocol.manifest import (
     DEFAULT_MANIFEST,
@@ -166,44 +167,65 @@ class ArtifactLoaderTest(unittest.TestCase):
         self.assertEqual(decode_count, 4)
         self.assertEqual(store.get_count, 4)
 
-        resolver_threads = []
-
-        class AwaitableReference:
-            def __await__(self):
-                async def resolve():
-                    resolver_threads.append(
-                        threading.get_ident()
-                    )
-                    return encoded
-
-                return resolve().__await__()
-
         async def load_from_actor_event_loop():
-            actor_thread = threading.get_ident()
-            loader = ArtifactLoader()
-            handle = dataclasses.replace(
-                carrier.handle,
-                reference=AwaitableReference(),
-            )
-            loaded = loader.load(
-                handle,
-                LoaderNamespace(
-                    "async-actor-job",
-                    "tenant-a",
-                    "process-1",
-                ),
-            )
-            return actor_thread, loaded
+            resolver_calls = 0
 
-        actor_thread, loaded = asyncio.run(
+            def unexpected_resolver(_reference):
+                nonlocal resolver_calls
+                resolver_calls += 1
+                raise AssertionError(
+                    "prefetched ObjectRef must not be resolved in the UDF"
+                )
+
+            namespace = LoaderNamespace(
+                "async-actor-job",
+                "tenant-a",
+                "process-1",
+            )
+            prefetch_artifact_payload(
+                job_namespace=namespace.job_namespace,
+                tenant_namespace=namespace.tenant_namespace,
+                content_sha256=carrier.handle.content_sha256,
+                payload=encoded,
+            )
+            try:
+                loaded = ArtifactLoader(
+                    resolver=unexpected_resolver
+                ).load(carrier.handle, namespace)
+            finally:
+                clear_prefetched_artifact_payloads(
+                    job_namespace=namespace.job_namespace,
+                    tenant_namespace=namespace.tenant_namespace,
+                    content_sha256s=(
+                        carrier.handle.content_sha256,
+                    ),
+                )
+            missing_loader = ArtifactLoader()
+            with self.assertRaises(
+                ArtifactLoadError
+            ) as missing:
+                missing_loader.load(
+                    carrier.handle,
+                    LoaderNamespace(
+                        "missing-actor-job",
+                        "tenant-a",
+                        "process-1",
+                    ),
+                )
+            self.assertEqual(
+                missing.exception.code,
+                ArtifactLoadRejectCode.OBJECT_MISSING,
+            )
+            return resolver_calls, loaded
+
+        resolver_calls, loaded = asyncio.run(
             load_from_actor_event_loop()
         )
         self.assertEqual(
             loaded.content_sha256,
             carrier.handle.content_sha256,
         )
-        self.assertEqual(len(resolver_threads), 1)
-        self.assertNotEqual(resolver_threads[0], actor_thread)
+        self.assertEqual(resolver_calls, 0)
 
     def test_missing_or_corrupt_object_is_negative_cached_in_its_namespace(self):
         encoded = _encoded()

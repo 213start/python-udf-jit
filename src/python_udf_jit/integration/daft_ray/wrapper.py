@@ -53,7 +53,17 @@ class FallbackOnlyWrapper:
                     import ray
 
                     if ray.is_initialized():
-                        publisher = ray.put
+                        from python_udf_jit.integration.daft_ray.objectref_bridge import (
+                            register_driver_artifact_reference,
+                        )
+
+                        def publish(payload: bytes) -> object:
+                            return register_driver_artifact_reference(
+                                payload,
+                                ray.put(payload),
+                            )
+
+                        publisher = publish
                 except Exception:
                     publisher = None
                 if publisher is None:

@@ -13,6 +13,10 @@ from python_udf_jit.integration.daft_ray.carrier import (
     ObjectRefArtifactHandle,
     ProductionCarrierState,
 )
+from python_udf_jit.integration.daft_ray.objectref_bridge import (
+    clear_driver_artifact_references,
+    driver_artifact_references,
+)
 from python_udf_jit.integration.daft_ray.wrapper import (
     WRAPPER_SERIALIZATION_VERSION,
     FallbackOnlyWrapper,
@@ -60,6 +64,12 @@ def make_wrapper(original=operator.add):
 
 
 class WrapperSerializationTest(unittest.TestCase):
+    def setUp(self):
+        clear_driver_artifact_references()
+
+    def tearDown(self):
+        clear_driver_artifact_references()
+
     def test_pickle_roundtrip_preserves_candidate_carrier_and_fallback(self):
         wrapper = make_wrapper()
         restored = pickle.loads(pickle.dumps(wrapper))
@@ -160,6 +170,13 @@ class WrapperSerializationTest(unittest.TestCase):
         )
         self.assertEqual(wrapper.carrier.handle.reference, reference)
         fake_ray.put.assert_called_once()
+        references = driver_artifact_references()
+        self.assertEqual(len(references), 1)
+        self.assertEqual(
+            references[0].content_sha256,
+            wrapper.carrier.handle.content_sha256,
+        )
+        self.assertIs(references[0].reference, reference)
         restored = pickle.loads(pickle.dumps(wrapper))
         self.assertEqual(restored.carrier.handle.reference, reference)
 
