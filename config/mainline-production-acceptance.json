@@ -109,6 +109,14 @@
       "test_pure_f64_chain_forms_one_verified_cinderx_candidate",
       "test_may_raise_operations_preserve_exception_order_edges",
       "test_python_region_is_an_exact_once_continuation_barrier",
+      "test_verified_resume_executes_only_the_unfinished_suffix",
+      "test_resume_rejects_control_flow_that_can_reenter_prefix",
+      "test_keepalive_dominates_resume_and_suffix_is_claimed_exactly_once",
+      "test_cinderx_deopt_can_only_recover_the_region",
+      "test_incomplete_proof_selects_whole_function_before_region_execution",
+      "test_live_value_shape_kind_and_materialization_are_fail_closed",
+      "test_stale_continuation_abi_is_rejected_before_resume",
+      "test_cinderx_payload_is_bound_to_contract_and_commit_boundary",
       "test_control_flow_and_effect_boundaries_never_merge",
       "test_multiple_effects_receive_explicit_order_edges",
       "test_semantic_verifier_rejects_exception_cfg_and_python_region_drift",
@@ -140,7 +148,7 @@
       "test_layout_and_semantic_type_mismatch_is_rejected_before_compile",
       "test_rfc006_unit_contract"
       ],
-      "expected_test_count": 260,
+      "expected_test_count": 268,
       "allow_skips": false
     },
     "integration": {
@@ -153,6 +161,7 @@
         "test_trusted_job_contract_uses_hash_and_worker_revalidation",
         "test_only_physical_multinode_is_an_external_release_prerequisite",
         "test_counterexample_matrix_resumes_suffix_exactly_once",
+      "test_native_payload_crosses_exactly_once_into_python_suffix",
         "test_real_where_select_with_columns_preserve_options_and_scalar_semantics",
         "test_off_and_observe_match_without_repeating_side_effects",
         "test_off_and_observe_preserve_real_daft_exception_semantics",
@@ -169,7 +178,7 @@
       "test_both_workers_execute_full_cinderx_scalar_matrix",
       "test_rfc006_integration_contract"
       ],
-      "expected_test_count": 53,
+      "expected_test_count": 54,
       "allow_skips": false
     },
     "live": {

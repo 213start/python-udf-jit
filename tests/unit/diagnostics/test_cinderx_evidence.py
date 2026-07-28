@@ -27,8 +27,8 @@ def _runtime_log() -> str:
     )
     return (
         f"{cases}\n"
-        "100% tests passed, 0 tests failed out of 1177\n"
-        "100% tests passed, 0 tests failed out of 66\n"
+        "100% tests passed, 0 tests failed out of 1180\n"
+        "100% tests passed, 0 tests failed out of 67\n"
         "100% tests passed, 0 tests failed out of 130\n"
     )
 
@@ -72,8 +72,8 @@ class CinderXEvidenceTests(unittest.TestCase):
             "official_summary": _libtest(26),
             "official_log": "All 26 tests OK.\n",
             "targeted_log": (
-                "...... [100%]\n"
-                "6 passed, 22 subtests passed in 0.06s\n"
+                "....... [100%]\n"
+                "7 passed, 22 subtests passed in 0.06s\n"
             ),
         }
         self.paths = {
@@ -123,8 +123,8 @@ class CinderXEvidenceTests(unittest.TestCase):
             proof["identity"]["cinderx_wheel_sha256"],
             "e" * 64,
         )
-        self.assertEqual(proof["runtime_tests"]["normal"]["passed"], 1177)
-        self.assertEqual(len(proof["runtime_tests"]["udf_cases"]), 7)
+        self.assertEqual(proof["runtime_tests"]["normal"]["passed"], 1180)
+        self.assertEqual(len(proof["runtime_tests"]["udf_cases"]), 10)
         self.assertEqual(
             proof["python_tests"]["release_pytest"]["passed"],
             1332,
@@ -138,8 +138,8 @@ class CinderXEvidenceTests(unittest.TestCase):
             26,
         )
         self.assertEqual(
-            proof["python_tests"]["udf_data_intrinsic"]["passed"],
-            6,
+            proof["python_tests"]["udf_targeted"]["passed"],
+            7,
         )
         self.assertRegex(proof["proof_sha256"], r"^[0-9a-f]{64}$")
         self.assertTrue(
@@ -193,7 +193,7 @@ class CinderXEvidenceTests(unittest.TestCase):
 
     def test_retained_proof_tampering_is_rejected(self) -> None:
         proof = self._build()
-        proof["runtime_tests"]["normal"]["passed"] = 1175
+        proof["runtime_tests"]["normal"]["passed"] = 1178
 
         self.assertEqual(validate_cinderx_evidence(proof), "fail")
 

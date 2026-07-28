@@ -7,21 +7,39 @@ import unittest
 from pathlib import Path
 
 
+def _continuation_source(value):
+    return value
+
+
+def _continuation_suffix(state):
+    state.values["effects"].append(
+        ("suffix", state.values["value"])
+    )
+    return state.values["value"] + 1
+
+
 class _WorkerScalarSlotProbe:
     def run(self, cluster_epoch: str) -> dict[str, object]:
+        from dataclasses import astuple
         import hashlib
         import sysconfig
 
         import cinderx.jit
         import ray
+        from cinderjit import _udf_build_continuation_payload
 
         from python_udf_jit.compiler.capture import FallbackIdentity
+        from python_udf_jit.compiler.identity import capture_identities
         from python_udf_jit.compiler.region import (
             form_semantic_region_graph,
         )
         from python_udf_jit.protocol.artifact import build_artifact
+        from python_udf_jit.provider.scalar_python.capability import (
+            CapabilityRegistry,
+        )
         from python_udf_jit.provider.scalar_python.executor import (
             CinderXScalarProviderFactory,
+            ScalarExecutor,
         )
         from python_udf_jit.runtime.descriptors import (
             scalar_input_spec,
@@ -29,9 +47,18 @@ class _WorkerScalarSlotProbe:
         )
         from python_udf_jit.runtime.layout import (
             SCALAR_SLOT_ABI_VERSION,
+            LocalScalarSlotBackend,
             normalize_scalar_value,
         )
-        from python_udf_jit.runtime.continuation import CommitBoundary
+        from python_udf_jit.runtime.continuation import (
+            CONTINUATION_ABI_VERSION,
+            CommitBoundary,
+            ContinuationContract,
+            InterpreterContinuation,
+            LiveValueKind,
+            LiveValueSpec,
+            ResumeSourceMap,
+        )
         from python_udf_jit.runtime.variant import (
             VariantKey,
             WorkerProcessKey,
@@ -246,6 +273,94 @@ class _WorkerScalarSlotProbe:
         if len({report["code_hash"] for report in reports}) != 5:
             raise AssertionError("physical scalar types reused one code hash")
 
+        identity = capture_identities(_continuation_source).source
+        resume_id = "v1:" + "c" * 64
+        source_map = ResumeSourceMap(
+            schema_version=CONTINUATION_ABI_VERSION,
+            bytecode_offset=18,
+            line=identity.first_line,
+            column=4,
+            end_line=identity.first_line,
+            end_column=18,
+        )
+        contract = ContinuationContract(
+            abi_version=CONTINUATION_ABI_VERSION,
+            resume_id=resume_id,
+            source_identity=identity,
+            source_code=_continuation_source.__code__,
+            resume_code=_continuation_suffix.__code__,
+            source_map=source_map,
+            live_values=(
+                LiveValueSpec(
+                    "effects",
+                    LiveValueKind.PYTHON_OBJECT,
+                    borrowed=True,
+                ),
+                LiveValueSpec("value", LiveValueKind.INT64),
+            ),
+            proof_complete=True,
+        )
+        effects = [("compiled_prefix", 7)]
+
+        def compiled_continuation(_input, _output):
+            return _udf_build_continuation_payload(
+                CONTINUATION_ABI_VERSION,
+                "cinderx_deopt",
+                resume_id,
+                identity.namespace_sha256,
+                identity.code_sha256,
+                identity.first_line,
+                astuple(source_map),
+                (effects, 7),
+                ("python_object", "int64"),
+                (False, False),
+                (True, False),
+                (True, True),
+                None,
+                True,
+            )
+
+        if not cinderx.jit.force_compile(compiled_continuation):
+            raise AssertionError("continuation probe did not JIT compile")
+        if not cinderx.jit.is_jit_compiled(compiled_continuation):
+            raise AssertionError("continuation probe lacks JIT evidence")
+
+        continuation_registry = CapabilityRegistry(
+            epoch=f"{cluster_epoch}:continuation",
+        )
+        continuation_input = continuation_registry.register(
+            LocalScalarSlotBackend()
+        )
+        continuation_output = continuation_registry.register(
+            LocalScalarSlotBackend()
+        )
+        continuation_boundary = CommitBoundary()
+        try:
+            continuation_result = ScalarExecutor(
+                continuation_registry
+            ).execute_guarded(
+                compiled_continuation,
+                continuation_input,
+                continuation_output,
+                1.0,
+                boundary=continuation_boundary,
+                continuation=InterpreterContinuation(
+                    contract,
+                    _continuation_suffix,
+                ),
+            )
+        finally:
+            continuation_registry.release(continuation_output)
+            continuation_registry.release(continuation_input)
+        expected_effects = [
+            ("compiled_prefix", 7),
+            ("suffix", 7),
+        ]
+        if continuation_result != 8 or effects != expected_effects:
+            raise AssertionError(
+                "continuation did not resume the suffix exactly once"
+            )
+
         return {
             "node_id": node_id,
             "actor_id": actor_id,
@@ -255,6 +370,9 @@ class _WorkerScalarSlotProbe:
             "scalar_types": reports,
             "branch_results": branch_results,
             "branch_counts": branch_counts,
+            "continuation_result": continuation_result,
+            "continuation_effects": effects,
+            "continuation_jit_compiled": True,
         }
 
 
@@ -345,6 +463,18 @@ class RayCinderXScalarSlotSmokeTests(unittest.TestCase):
                 self.assertGreaterEqual(
                     report["branch_counts"].get("CondBranch", 0),
                     1,
+                )
+                self.assertEqual(report["continuation_result"], 8)
+                self.assertEqual(
+                    report["continuation_effects"],
+                    [
+                        ("compiled_prefix", 7),
+                        ("suffix", 7),
+                    ],
+                )
+                self.assertIs(
+                    report["continuation_jit_compiled"],
+                    True,
                 )
             output_path = os.environ.get("UDFJIT_READINESS_REPORT_PATH", "")
             if output_path:

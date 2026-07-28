@@ -11,7 +11,7 @@ from typing import Any, Mapping
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
-EXPECTED_RUNTIME_TOTALS = (1177, 66, 130)
+EXPECTED_RUNTIME_TOTALS = (1180, 67, 130)
 EXPECTED_UDF_RUNTIME_CASES = (
     "UdfDataIntrinsicTest.RuntimeHelpersCoverTypedNullableLifecycle",
     "UdfDataIntrinsicTest.RuntimeHelpersRejectCrossProcessCapsule",
@@ -20,6 +20,9 @@ EXPECTED_UDF_RUNTIME_CASES = (
     "UdfDataIntrinsicTest.LIRCallsTypedLoadAndStoreHelpers",
     "UdfDataIntrinsicHIRTest.ParserPrinterAndOutputTypesPreserveTypedReadsAndWrites",
     "UdfDescriptorFuzzTest.DeterministicLifecycleAndTypeMatrix",
+    "UdfContinuationTest.NativeDeoptScopeRejectsCrossCodeRecovery",
+    "UdfContinuationTest.RuntimePayloadPreservesTypedValuesAndAliases",
+    "UdfContinuationTest.RuntimePayloadRejectsUnsafeResumeMatrix",
 )
 
 
@@ -201,7 +204,7 @@ def _python_tests(
         raise CinderXEvidenceError("official_skip_libtest_log_invalid")
 
     targeted = re.search(
-        r"(^|\n)6 passed, 22 subtests passed in [0-9.]+s(?:\n|$)",
+        r"(^|\n)7 passed, 22 subtests passed in [0-9.]+s(?:\n|$)",
         targeted_log,
     )
     if targeted is None:
@@ -217,8 +220,8 @@ def _python_tests(
         },
         "adaptive_libtest": adaptive,
         "official_skip_libtest": official,
-        "udf_data_intrinsic": {
-            "passed": 6,
+        "udf_targeted": {
+            "passed": 7,
             "subtests_passed": 22,
             "failed": 0,
         },
@@ -342,8 +345,8 @@ def validate_cinderx_evidence(proof: object) -> str:
         return "fail"
 
     runtime_totals = {
-        "normal": 1177,
-        "lightweight_frames_deopt": 66,
+        "normal": 1180,
+        "lightweight_frames_deopt": 67,
         "osr": 130,
     }
     runtime_valid = all(
@@ -355,7 +358,7 @@ def validate_cinderx_evidence(proof: object) -> str:
     release = python_tests.get("release_pytest")
     adaptive = python_tests.get("adaptive_libtest")
     official = python_tests.get("official_skip_libtest")
-    targeted = python_tests.get("udf_data_intrinsic")
+    targeted = python_tests.get("udf_targeted")
     python_valid = (
         isinstance(release, Mapping)
         and release.get("passed") == 1332
@@ -376,7 +379,7 @@ def validate_cinderx_evidence(proof: object) -> str:
         and official.get("adaptive_compile_after") == 24
         and official.get("returncode") == 0
         and isinstance(targeted, Mapping)
-        and targeted.get("passed") == 6
+        and targeted.get("passed") == 7
         and targeted.get("subtests_passed") == 22
         and targeted.get("failed") == 0
     )

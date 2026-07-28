@@ -298,8 +298,8 @@ def _evidence() -> dict[str, object]:
             "python_library": "/opt/python314/lib/libpython3.14.a",
         },
         "runtime_tests": {
-            "normal": {"passed": 1177, "failed": 0},
-            "lightweight_frames_deopt": {"passed": 66, "failed": 0},
+            "normal": {"passed": 1180, "failed": 0},
+            "lightweight_frames_deopt": {"passed": 67, "failed": 0},
             "osr": {"passed": 130, "failed": 0},
             "udf_cases": list(EXPECTED_UDF_RUNTIME_CASES),
         },
@@ -325,8 +325,8 @@ def _evidence() -> dict[str, object]:
                 "adaptive_compile_after": 24,
                 "returncode": 0,
             },
-            "udf_data_intrinsic": {
-                "passed": 6,
+            "udf_targeted": {
+                "passed": 7,
                 "subtests_passed": 22,
                 "failed": 0,
             },
