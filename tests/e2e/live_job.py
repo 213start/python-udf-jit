@@ -17,7 +17,7 @@ from tests.system.private_output import write_private_json
 
 
 _FIXTURE_PARTITION_COUNT = 32
-_SOURCES_PER_SCAN_TASK = 16
+_EXECUTION_PARTITION_COUNT = 2
 
 
 def _supported(value: float) -> float:
@@ -334,7 +334,10 @@ def _input_frame(path: str, *, empty: bool = False):
     import daft
 
     pattern = f"{path}/empty.parquet" if empty else f"{path}/part-*.parquet"
-    return daft.read_parquet(pattern)
+    frame = daft.read_parquet(pattern)
+    if empty:
+        return frame
+    return frame.repartition(_EXECUTION_PARTITION_COUNT)
 
 
 def _original_job(
@@ -829,9 +832,6 @@ def run_live_job() -> dict[str, object]:
 
     ray.init(address="auto")
     daft.set_runner_ray(address="auto", noop_if_initialized=True)
-    daft.set_execution_config(
-        max_sources_per_scan_task=_SOURCES_PER_SCAN_TASK,
-    )
     alive = [node for node in ray.nodes() if node.get("Alive")]
     heads = [node for node in alive if node.get("NodeName") == "ray-head-driver"]
     workers = sorted(

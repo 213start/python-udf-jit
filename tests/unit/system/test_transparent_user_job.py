@@ -150,22 +150,18 @@ class TransparentUserJobContractTests(unittest.TestCase):
             and isinstance(node.value.value, int)
         }
         self.assertEqual(constants["_FIXTURE_PARTITION_COUNT"], 32)
-        self.assertEqual(constants["_SOURCES_PER_SCAN_TASK"], 16)
-        execution_config_calls = [
+        self.assertEqual(constants["_EXECUTION_PARTITION_COUNT"], 2)
+        repartition_calls = [
             node
-            for node in ast.walk(functions["run_live_job"])
+            for node in ast.walk(functions["_input_frame"])
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "set_execution_config"
+            and node.func.attr == "repartition"
         ]
-        self.assertEqual(len(execution_config_calls), 1)
-        source_limit = next(
-            keyword.value
-            for keyword in execution_config_calls[0].keywords
-            if keyword.arg == "max_sources_per_scan_task"
-        )
-        self.assertIsInstance(source_limit, ast.Name)
-        self.assertEqual(source_limit.id, "_SOURCES_PER_SCAN_TASK")
+        self.assertEqual(len(repartition_calls), 1)
+        partition_count = repartition_calls[0].args[0]
+        self.assertIsInstance(partition_count, ast.Name)
+        self.assertEqual(partition_count.id, "_EXECUTION_PARTITION_COUNT")
 
     def test_exception_observation_is_value_free_and_stable(self) -> None:
         error = RuntimeError(
