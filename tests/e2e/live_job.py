@@ -17,8 +17,8 @@ from tests.system.private_output import write_private_json
 
 
 _FIXTURE_PARTITION_COUNT = 32
-_EXECUTION_PARTITION_COUNT = 2
-_UDF_MAX_CONCURRENCY = 2
+_SOURCES_PER_SCAN_TASK = 8
+_MIN_CPU_PER_TASK = 2.0
 
 
 def _supported(value: float) -> float:
@@ -335,19 +335,7 @@ def _input_frame(path: str, *, empty: bool = False):
     import daft
 
     pattern = f"{path}/empty.parquet" if empty else f"{path}/part-*.parquet"
-    frame = daft.read_parquet(pattern)
-    if empty:
-        return frame
-    return frame.repartition(_EXECUTION_PARTITION_COUNT)
-
-
-def _fixed_udf(function: Callable[..., Any]):
-    import daft
-
-    return replace(
-        daft.func(function),
-        max_concurrency=_UDF_MAX_CONCURRENCY,
-    )
+    return daft.read_parquet(pattern)
 
 
 def _original_job(
@@ -362,7 +350,7 @@ def _original_job(
     _uninstall_hooks()
     try:
         frame = _input_frame(path, empty=empty)
-        udf = _fixed_udf(function)
+        udf = daft.func(function)
         original_method = udf._method
         if method_override is not None:
             udf._method = method_override
@@ -384,7 +372,7 @@ def _normal_auto_job(path: str, function: Callable[[float], float], *, empty: bo
 
     _install_hooks()
     frame = _input_frame(path, empty=empty)
-    udf = _fixed_udf(function)
+    udf = daft.func(function)
     return (
         frame.with_column("result", udf(daft.col("measurement")))
         .select("measurement", "result")
@@ -404,7 +392,7 @@ def _plain_job(
     import daft
 
     frame = _input_frame(path, empty=empty)
-    udf = _fixed_udf(function)
+    udf = daft.func(function)
     original_method = udf._method
     if method_override is not None:
         udf._method = method_override
@@ -425,7 +413,7 @@ def _diagnostic_job(path: str, function: Callable[[float], float]):
     started_ns = time.time_ns()
     _assert_hooks_installed()
     warm_frame = _input_frame(path)
-    warm_udf = _fixed_udf(function)
+    warm_udf = daft.func(function)
     (
         warm_frame
         .with_column(
@@ -436,7 +424,7 @@ def _diagnostic_job(path: str, function: Callable[[float], float]):
         .to_pydict()
     )
     frame = _input_frame(path)
-    udf = _fixed_udf(function)
+    udf = daft.func(function)
     document = (
         frame.with_column(
             "result",
@@ -462,7 +450,7 @@ def _runtime_events_since(
 
     _uninstall_hooks()
     try:
-        probe = _fixed_udf(_diagnostic_probe_factory(started_ns))
+        probe = daft.func(_diagnostic_probe_factory(started_ns))
         document = (
             _input_frame(path)
             .with_column("evidence", probe(daft.col("measurement")))
@@ -499,7 +487,7 @@ def _custom_wrapper_job(path: str, wrapper: Any):
     _uninstall_hooks()
     try:
         frame = _input_frame(path)
-        udf = _fixed_udf(_supported)
+        udf = daft.func(_supported)
         original_method = udf._method
         udf._method = wrapper
         try:
@@ -507,7 +495,7 @@ def _custom_wrapper_job(path: str, wrapper: Any):
         finally:
             udf._method = original_method
         frame = frame.with_column("result", expression)
-        probe = _fixed_udf(_diagnostic_probe_factory(started_ns))
+        probe = daft.func(_diagnostic_probe_factory(started_ns))
         frame = frame.with_column("evidence", probe(daft.col("result")))
         document = frame.select("measurement", "result", "evidence").to_pydict()
     finally:
@@ -576,7 +564,7 @@ def _fingerprint_mismatch_job(path: str) -> tuple[dict[str, list[Any]], str]:
         if result.status.value != "incompatible":
             raise AssertionError(result)
         frame = _input_frame(path)
-        udf = _fixed_udf(_supported)
+        udf = daft.func(_supported)
         document = (
             frame.with_column("result", udf(daft.col("measurement")))
             .select("measurement", "result")
@@ -842,6 +830,10 @@ def run_live_job() -> dict[str, object]:
 
     ray.init(address="auto")
     daft.set_runner_ray(address="auto", noop_if_initialized=True)
+    daft.set_execution_config(
+        max_sources_per_scan_task=_SOURCES_PER_SCAN_TASK,
+        min_cpu_per_task=_MIN_CPU_PER_TASK,
+    )
     alive = [node for node in ray.nodes() if node.get("Alive")]
     heads = [node for node in alive if node.get("NodeName") == "ray-head-driver"]
     workers = sorted(

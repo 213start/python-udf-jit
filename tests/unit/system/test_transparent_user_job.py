@@ -147,37 +147,29 @@ class TransparentUserJobContractTests(unittest.TestCase):
             and len(node.targets) == 1
             and isinstance((target := node.targets[0]), ast.Name)
             and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, int)
+            and isinstance(node.value.value, (int, float))
         }
         self.assertEqual(constants["_FIXTURE_PARTITION_COUNT"], 32)
-        self.assertEqual(constants["_EXECUTION_PARTITION_COUNT"], 2)
-        self.assertEqual(constants["_UDF_MAX_CONCURRENCY"], 2)
-        repartition_calls = [
+        self.assertEqual(constants["_SOURCES_PER_SCAN_TASK"], 8)
+        self.assertEqual(constants["_MIN_CPU_PER_TASK"], 2.0)
+        execution_config_calls = [
             node
-            for node in ast.walk(functions["_input_frame"])
+            for node in ast.walk(functions["run_live_job"])
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "repartition"
+            and node.func.attr == "set_execution_config"
         ]
-        self.assertEqual(len(repartition_calls), 1)
-        partition_count = repartition_calls[0].args[0]
-        self.assertIsInstance(partition_count, ast.Name)
-        self.assertEqual(partition_count.id, "_EXECUTION_PARTITION_COUNT")
-        fixed_udf_calls = [
-            node
-            for node in ast.walk(functions["_fixed_udf"])
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "replace"
-        ]
-        self.assertEqual(len(fixed_udf_calls), 1)
-        concurrency = next(
-            keyword.value
-            for keyword in fixed_udf_calls[0].keywords
-            if keyword.arg == "max_concurrency"
-        )
-        self.assertIsInstance(concurrency, ast.Name)
-        self.assertEqual(concurrency.id, "_UDF_MAX_CONCURRENCY")
+        self.assertEqual(len(execution_config_calls), 1)
+        config_values = {
+            keyword.arg: keyword.value
+            for keyword in execution_config_calls[0].keywords
+        }
+        source_limit = config_values["max_sources_per_scan_task"]
+        self.assertIsInstance(source_limit, ast.Name)
+        self.assertEqual(source_limit.id, "_SOURCES_PER_SCAN_TASK")
+        cpu_limit = config_values["min_cpu_per_task"]
+        self.assertIsInstance(cpu_limit, ast.Name)
+        self.assertEqual(cpu_limit.id, "_MIN_CPU_PER_TASK")
 
     def test_exception_observation_is_value_free_and_stable(self) -> None:
         error = RuntimeError(
