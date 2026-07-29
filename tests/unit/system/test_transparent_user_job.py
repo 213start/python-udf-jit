@@ -140,6 +140,33 @@ class TransparentUserJobContractTests(unittest.TestCase):
                 any(node.func.id == "_install_hooks" for node in helper_calls)
             )
 
+        constants = {
+            target.id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance((target := node.targets[0]), ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, int)
+        }
+        self.assertEqual(constants["_FIXTURE_PARTITION_COUNT"], 32)
+        self.assertEqual(constants["_SOURCES_PER_SCAN_TASK"], 16)
+        execution_config_calls = [
+            node
+            for node in ast.walk(functions["run_live_job"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set_execution_config"
+        ]
+        self.assertEqual(len(execution_config_calls), 1)
+        source_limit = next(
+            keyword.value
+            for keyword in execution_config_calls[0].keywords
+            if keyword.arg == "max_sources_per_scan_task"
+        )
+        self.assertIsInstance(source_limit, ast.Name)
+        self.assertEqual(source_limit.id, "_SOURCES_PER_SCAN_TASK")
+
     def test_exception_observation_is_value_free_and_stable(self) -> None:
         error = RuntimeError(
             f"framework wrapper: {transparent_user_job.EXCEPTION_SENTINEL} "

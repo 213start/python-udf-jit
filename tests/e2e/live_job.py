@@ -16,6 +16,10 @@ from typing import Any, Callable
 from tests.system.private_output import write_private_json
 
 
+_FIXTURE_PARTITION_COUNT = 32
+_SOURCES_PER_SCAN_TASK = 16
+
+
 def _supported(value: float) -> float:
     return value * 2.0 + 3.0
 
@@ -232,7 +236,7 @@ def _write_parquet_fixture(directory: str) -> dict[str, object]:
             float(index) - 8.0,
             float(index) + 0.25,
         )
-        for index in range(32)
+        for index in range(_FIXTURE_PARTITION_COUNT)
     )
     for index, values in enumerate(partitions):
         pq.write_table(
@@ -825,6 +829,9 @@ def run_live_job() -> dict[str, object]:
 
     ray.init(address="auto")
     daft.set_runner_ray(address="auto", noop_if_initialized=True)
+    daft.set_execution_config(
+        max_sources_per_scan_task=_SOURCES_PER_SCAN_TASK,
+    )
     alive = [node for node in ray.nodes() if node.get("Alive")]
     heads = [node for node in alive if node.get("NodeName") == "ray-head-driver"]
     workers = sorted(
