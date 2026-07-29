@@ -151,6 +151,7 @@ class TransparentUserJobContractTests(unittest.TestCase):
         }
         self.assertEqual(constants["_FIXTURE_PARTITION_COUNT"], 32)
         self.assertEqual(constants["_EXECUTION_PARTITION_COUNT"], 2)
+        self.assertEqual(constants["_UDF_MAX_CONCURRENCY"], 2)
         repartition_calls = [
             node
             for node in ast.walk(functions["_input_frame"])
@@ -162,6 +163,21 @@ class TransparentUserJobContractTests(unittest.TestCase):
         partition_count = repartition_calls[0].args[0]
         self.assertIsInstance(partition_count, ast.Name)
         self.assertEqual(partition_count.id, "_EXECUTION_PARTITION_COUNT")
+        fixed_udf_calls = [
+            node
+            for node in ast.walk(functions["_fixed_udf"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "replace"
+        ]
+        self.assertEqual(len(fixed_udf_calls), 1)
+        concurrency = next(
+            keyword.value
+            for keyword in fixed_udf_calls[0].keywords
+            if keyword.arg == "max_concurrency"
+        )
+        self.assertIsInstance(concurrency, ast.Name)
+        self.assertEqual(concurrency.id, "_UDF_MAX_CONCURRENCY")
 
     def test_exception_observation_is_value_free_and_stable(self) -> None:
         error = RuntimeError(

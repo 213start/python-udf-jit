@@ -18,6 +18,7 @@ from tests.system.private_output import write_private_json
 
 _FIXTURE_PARTITION_COUNT = 32
 _EXECUTION_PARTITION_COUNT = 2
+_UDF_MAX_CONCURRENCY = 2
 
 
 def _supported(value: float) -> float:
@@ -340,6 +341,15 @@ def _input_frame(path: str, *, empty: bool = False):
     return frame.repartition(_EXECUTION_PARTITION_COUNT)
 
 
+def _fixed_udf(function: Callable[..., Any]):
+    import daft
+
+    return replace(
+        daft.func(function),
+        max_concurrency=_UDF_MAX_CONCURRENCY,
+    )
+
+
 def _original_job(
     path: str,
     function: Callable[[float], float],
@@ -352,7 +362,7 @@ def _original_job(
     _uninstall_hooks()
     try:
         frame = _input_frame(path, empty=empty)
-        udf = daft.func(function)
+        udf = _fixed_udf(function)
         original_method = udf._method
         if method_override is not None:
             udf._method = method_override
@@ -374,7 +384,7 @@ def _normal_auto_job(path: str, function: Callable[[float], float], *, empty: bo
 
     _install_hooks()
     frame = _input_frame(path, empty=empty)
-    udf = daft.func(function)
+    udf = _fixed_udf(function)
     return (
         frame.with_column("result", udf(daft.col("measurement")))
         .select("measurement", "result")
@@ -394,7 +404,7 @@ def _plain_job(
     import daft
 
     frame = _input_frame(path, empty=empty)
-    udf = daft.func(function)
+    udf = _fixed_udf(function)
     original_method = udf._method
     if method_override is not None:
         udf._method = method_override
@@ -415,7 +425,7 @@ def _diagnostic_job(path: str, function: Callable[[float], float]):
     started_ns = time.time_ns()
     _assert_hooks_installed()
     warm_frame = _input_frame(path)
-    warm_udf = daft.func(function)
+    warm_udf = _fixed_udf(function)
     (
         warm_frame
         .with_column(
@@ -426,7 +436,7 @@ def _diagnostic_job(path: str, function: Callable[[float], float]):
         .to_pydict()
     )
     frame = _input_frame(path)
-    udf = daft.func(function)
+    udf = _fixed_udf(function)
     document = (
         frame.with_column(
             "result",
@@ -452,7 +462,7 @@ def _runtime_events_since(
 
     _uninstall_hooks()
     try:
-        probe = daft.func(_diagnostic_probe_factory(started_ns))
+        probe = _fixed_udf(_diagnostic_probe_factory(started_ns))
         document = (
             _input_frame(path)
             .with_column("evidence", probe(daft.col("measurement")))
@@ -489,7 +499,7 @@ def _custom_wrapper_job(path: str, wrapper: Any):
     _uninstall_hooks()
     try:
         frame = _input_frame(path)
-        udf = daft.func(_supported)
+        udf = _fixed_udf(_supported)
         original_method = udf._method
         udf._method = wrapper
         try:
@@ -497,7 +507,7 @@ def _custom_wrapper_job(path: str, wrapper: Any):
         finally:
             udf._method = original_method
         frame = frame.with_column("result", expression)
-        probe = daft.func(_diagnostic_probe_factory(started_ns))
+        probe = _fixed_udf(_diagnostic_probe_factory(started_ns))
         frame = frame.with_column("evidence", probe(daft.col("result")))
         document = frame.select("measurement", "result", "evidence").to_pydict()
     finally:
@@ -566,7 +576,7 @@ def _fingerprint_mismatch_job(path: str) -> tuple[dict[str, list[Any]], str]:
         if result.status.value != "incompatible":
             raise AssertionError(result)
         frame = _input_frame(path)
-        udf = daft.func(_supported)
+        udf = _fixed_udf(_supported)
         document = (
             frame.with_column("result", udf(daft.col("measurement")))
             .select("measurement", "result")
