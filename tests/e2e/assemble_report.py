@@ -106,6 +106,9 @@ def assemble(
         "topology": auto_observation.get("topology"),
         "readiness": phase_evidence.get("readiness"),
         "qualification": phase_evidence.get("qualification"),
+        "supported_attempt_evidence": auto_observation.get(
+            "supported_attempt_evidence"
+        ),
         "scenarios": _merge_scenarios(off_observation, auto_observation),
     }
     run = EvidenceRun(raw_root, str(evidence["run_id"]))

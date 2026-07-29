@@ -636,6 +636,7 @@ def _state_int(record: Any, name: str, default: int = -1) -> int:
 def _task_state_document(record: Any) -> dict[str, object]:
     return {
         "task_id": _state_text(record, "task_id"),
+        "job_id": _state_text(record, "job_id"),
         "attempt_number": _state_int(record, "attempt_number"),
         "state": _state_text(record, "state"),
         "type": _state_text(record, "type"),
@@ -682,7 +683,7 @@ def _temporal_task_candidates(
         start_ms = _state_int(record, "start_time_ms")
         end_ms = _state_int(record, "end_time_ms")
         if (
-            _state_text(record, "state") == "FINISHED"
+            _state_text(record, "state") in {"FINISHED", "FAILED"}
             and _state_text(record, "type") == "ACTOR_TASK"
             and _state_identity_matches(record, event)
             and start_ms > 0
@@ -799,6 +800,16 @@ def _join_ray_task_attempts(
         item["ray_state_attempt_records"] = [
             _task_state_document(record) for record in attempt_records
         ]
+        candidate_task_ids = {
+            _state_text(record, "task_id")
+            for record in (*exact_records, *temporal_candidates)
+            if _state_text(record, "task_id")
+        }
+        item["ray_state_candidate_attempt_records"] = [
+            _task_state_document(record)
+            for task_id in sorted(candidate_task_ids)
+            for record in records_by_id.get(task_id, [])
+        ]
         if len(attempt_records) == 1:
             record = attempt_records[0]
             identity_matches = (
@@ -811,6 +822,44 @@ def _join_ray_task_attempts(
                 item["task_attempt"] = "attempt-0"
         joined.append(item)
     return joined
+
+
+def _supported_attempt_evidence(
+    events: list[dict[str, object]],
+) -> dict[str, object]:
+    semantic_events = [
+        event
+        for event in events
+        if event.get("scenario") == "supported"
+        and event.get("decision") == "semantic_execute"
+    ]
+    records: dict[str, dict[str, object]] = {}
+    uncovered_event_count = 0
+    for event in semantic_events:
+        candidates = event.get("ray_state_candidate_attempt_records", [])
+        if not isinstance(candidates, list) or not candidates:
+            uncovered_event_count += 1
+            continue
+        valid_candidates = True
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                valid_candidates = False
+                continue
+            canonical = json.dumps(
+                candidate,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            records[canonical] = candidate
+        if not valid_candidates:
+            uncovered_event_count += 1
+    return {
+        "schema_version": 1,
+        "semantic_event_count": len(semantic_events),
+        "uncovered_event_count": uncovered_event_count,
+        "records": [records[key] for key in sorted(records)],
+    }
 
 
 def run_live_job() -> dict[str, object]:
@@ -973,6 +1022,7 @@ def run_live_job() -> dict[str, object]:
             _event_documents(zero_events, scenario="zero_row", roles=roles)
         )
         raw_events = _join_ray_task_attempts(raw_events)
+        supported_attempt_evidence = _supported_attempt_evidence(raw_events)
         driver_process_generation = f"driver-{os.getpid()}"
         driver_timestamp = time.time_ns()
         for index, (scenario, decision, reason_code) in enumerate(
@@ -1031,6 +1081,7 @@ def run_live_job() -> dict[str, object]:
             },
             "manifest_sha256": manifest_sha256,
             "raw_events": raw_events,
+            "supported_attempt_evidence": supported_attempt_evidence,
             "scenarios": {
                 "supported": {
                     "result_digest": _result_digest(auto_supported),

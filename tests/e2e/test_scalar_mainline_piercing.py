@@ -19,6 +19,7 @@ from python_udf_jit.diagnostics.evidence import (
 from tests.e2e.live_job import (
     _extract_events,
     _join_ray_task_attempts,
+    _supported_attempt_evidence,
     _zero_row_runtime_counts,
 )
 
@@ -360,6 +361,16 @@ class EvidenceAggregationTests(unittest.TestCase):
             )
         self.assertEqual(ambiguous[0]["task_attempt"], "")
         self.assertEqual(len(ambiguous[0]["ray_state_temporal_candidates"]), 2)
+        self.assertEqual(
+            len(ambiguous[0]["ray_state_candidate_attempt_records"]),
+            2,
+        )
+        semantic = dict(ambiguous[0])
+        semantic["decision"] = "semantic_execute"
+        attempt_evidence = _supported_attempt_evidence([semantic])
+        self.assertEqual(attempt_evidence["semantic_event_count"], 1)
+        self.assertEqual(attempt_evidence["uncovered_event_count"], 0)
+        self.assertEqual(len(attempt_evidence["records"]), 2)
 
     def test_ray_state_join_rejects_identity_without_task_or_time_window(self) -> None:
         event = _passing_events()[0]
@@ -520,6 +531,69 @@ class EvidenceAggregationTests(unittest.TestCase):
         self.assertEqual(report["verdict"], "inconclusive")
         self.assertIn("partition_attempt_attribution_incomplete", report["reason_codes"])
         self.assertEqual(report["remote_partition_task_count"], 0)
+
+        evidence = _base_evidence()
+
+        def task_record(
+            task_id: str,
+            node_id: str,
+            actor_id: str,
+            worker_pid: int,
+        ) -> dict[str, object]:
+            return {
+                "task_id": task_id,
+                "job_id": "job-1",
+                "attempt_number": 0,
+                "state": "FINISHED",
+                "type": "ACTOR_TASK",
+                "actor_id": actor_id,
+                "node_id": node_id,
+                "worker_id": f"worker-{node_id}",
+                "worker_pid": worker_pid,
+                "name": "PhysicalScan->UDFProject",
+                "parent_task_id": "parent-1",
+                "start_time_ms": 1000,
+                "end_time_ms": 1001,
+            }
+
+        evidence["supported_attempt_evidence"] = {
+            "schema_version": 1,
+            "semantic_event_count": 2,
+            "uncovered_event_count": 0,
+            "records": [
+                task_record(
+                    "task-1",
+                    WORKER_1,
+                    "actor-1",
+                    101,
+                ),
+                task_record(
+                    "task-2",
+                    WORKER_1,
+                    "actor-1",
+                    101,
+                ),
+            ],
+        }
+        proven = aggregate_run_evidence(evidence, events)
+        self.assertEqual(proven["verdict"], "pass", proven["reason_codes"])
+        self.assertEqual(proven["remote_partition_task_count"], 2)
+
+        retry_record = dict(evidence["supported_attempt_evidence"]["records"][0])
+        retry_record["attempt_number"] = 1
+        evidence["supported_attempt_evidence"]["records"].append(retry_record)
+        retried = aggregate_run_evidence(evidence, events)
+        self.assertEqual(retried["verdict"], "inconclusive")
+        self.assertIn("partition_task_retry_observed", retried["reason_codes"])
+
+        evidence["supported_attempt_evidence"]["records"].pop()
+        evidence["supported_attempt_evidence"]["uncovered_event_count"] = 1
+        uncovered = aggregate_run_evidence(evidence, events)
+        self.assertEqual(uncovered["verdict"], "inconclusive")
+        self.assertIn(
+            "partition_attempt_attribution_incomplete",
+            uncovered["reason_codes"],
+        )
 
     def test_explicit_head_failure_is_not_masked_by_attempt_inconclusive(self) -> None:
         events = _passing_events()

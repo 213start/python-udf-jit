@@ -100,6 +100,23 @@ _MANIFEST_FIELDS = (
     "pyarrow_version",
     "udf_jit_wheel_sha256",
 )
+_TASK_STATE_FIELDS = frozenset(
+    {
+        "task_id",
+        "job_id",
+        "attempt_number",
+        "state",
+        "type",
+        "actor_id",
+        "node_id",
+        "worker_id",
+        "worker_pid",
+        "name",
+        "parent_task_id",
+        "start_time_ms",
+        "end_time_ms",
+    }
+)
 
 
 class EvidenceContractError(ValueError):
@@ -234,6 +251,106 @@ def _same_digest(scenario: Mapping[str, Any]) -> bool:
         and isinstance(scenario.get("off_result_digest"), str)
         and _SHA256.fullmatch(str(scenario["off_result_digest"])) is not None
     )
+
+
+def _supported_attempt_proof(
+    document: Mapping[str, Any],
+    supported_semantic: list[dict[str, object]],
+    workers: set[str],
+) -> tuple[dict[str, set[str]], bool, set[str]]:
+    """Validate the complete Ray State candidate set without guessing ownership."""
+
+    reasons: set[str] = set()
+    partition_attempts: dict[str, set[str]] = defaultdict(set)
+    structurally_complete = True
+    if set(document) != {
+        "schema_version",
+        "semantic_event_count",
+        "uncovered_event_count",
+        "records",
+    }:
+        structurally_complete = False
+    if (
+        type(document.get("schema_version")) is not int
+        or document.get("schema_version") != 1
+        or type(document.get("semantic_event_count")) is not int
+        or document.get("semantic_event_count") != len(supported_semantic)
+        or not supported_semantic
+        or type(document.get("uncovered_event_count")) is not int
+        or document.get("uncovered_event_count") != 0
+    ):
+        structurally_complete = False
+
+    records_raw = document.get("records")
+    records = records_raw if isinstance(records_raw, list) else []
+    if len(records) < 2:
+        structurally_complete = False
+
+    process_identities: set[tuple[str, str, int]] = set()
+    canonical_by_task: dict[str, set[tuple[object, ...]]] = defaultdict(set)
+    for record in records:
+        if not isinstance(record, Mapping) or set(record) != _TASK_STATE_FIELDS:
+            structurally_complete = False
+            continue
+        try:
+            task_id = _safe_id(record["task_id"])
+            _safe_id(record["job_id"])
+            actor_id = _safe_id(record["actor_id"])
+            node_id = _safe_id(record["node_id"])
+            _safe_id(record["worker_id"])
+            parent_task_id = _safe_id(record["parent_task_id"])
+            attempt_number = record["attempt_number"]
+            worker_pid = record["worker_pid"]
+            start_time_ms = record["start_time_ms"]
+            end_time_ms = record["end_time_ms"]
+            name = record["name"]
+            if (
+                type(attempt_number) is not int
+                or type(worker_pid) is not int
+                or type(start_time_ms) is not int
+                or type(end_time_ms) is not int
+                or worker_pid <= 0
+                or start_time_ms <= 0
+                or end_time_ms < start_time_ms
+                or record["state"] != "FINISHED"
+                or record["type"] != "ACTOR_TASK"
+                or node_id not in workers
+                or not isinstance(name, str)
+                or not name.startswith("PhysicalScan->UDFProject")
+            ):
+                raise EvidenceContractError("task_state_record_invalid")
+        except (EvidenceContractError, KeyError, TypeError):
+            structurally_complete = False
+            continue
+
+        canonical = tuple(record[field] for field in sorted(_TASK_STATE_FIELDS))
+        canonical_by_task[task_id].add(canonical)
+        partition_attempts[task_id].add(f"attempt-{attempt_number}")
+        process_identities.add((node_id, actor_id, worker_pid))
+
+    if any(len(values) != 1 for values in canonical_by_task.values()):
+        reasons.add("partition_attempt_not_unique")
+    if any(
+        attempt != "attempt-0"
+        for attempts in partition_attempts.values()
+        for attempt in attempts
+    ):
+        reasons.add("partition_task_retry_observed")
+
+    semantic_processes = {
+        (str(event["node_id"]), str(event["actor_id"]), int(event["pid"]))
+        for event in supported_semantic
+    }
+    if (
+        len(partition_attempts) < 2
+        or not semantic_processes
+        or not semantic_processes.issubset(process_identities)
+        or len(canonical_by_task) != len(partition_attempts)
+    ):
+        structurally_complete = False
+    if not structurally_complete:
+        reasons.add("partition_attempt_attribution_incomplete")
+    return dict(partition_attempts), structurally_complete, reasons
 
 
 def aggregate_run_evidence(
@@ -420,29 +537,44 @@ def aggregate_run_evidence(
         checks["supported_hit"] = "fail"
         fail_reasons.add("compile_hit_chain_invalid")
 
-    partition_attempts: dict[str, set[str]] = defaultdict(set)
-    attribution_complete = bool(supported_semantic)
-    for event in supported_semantic:
-        partition = str(event["partition_id"])
-        attempt = str(event["task_attempt"])
-        if not partition or not attempt:
-            attribution_complete = False
-            continue
-        partition_attempts[partition].add(attempt)
-    task_attempts = {
-        next(iter(attempts))
-        for attempts in partition_attempts.values()
-        if len(attempts) == 1
-    }
-    if any(len(attempts) != 1 for attempts in partition_attempts.values()):
+    attempt_evidence = evidence.get("supported_attempt_evidence")
+    if isinstance(attempt_evidence, Mapping):
+        (
+            partition_attempts,
+            attribution_complete,
+            attempt_reasons,
+        ) = _supported_attempt_proof(
+            attempt_evidence,
+            supported_semantic,
+            workers,
+        )
+        inconclusive_reasons.update(attempt_reasons)
+    else:
+        partition_attempts = defaultdict(set)
+        attribution_complete = bool(supported_semantic)
+        for event in supported_semantic:
+            partition = str(event["partition_id"])
+            attempt = str(event["task_attempt"])
+            if not partition or not attempt:
+                attribution_complete = False
+                continue
+            partition_attempts[partition].add(attempt)
+        if any(len(attempts) != 1 for attempts in partition_attempts.values()):
+            inconclusive_reasons.add("partition_attempt_not_unique")
+        if any(
+            attempt != "attempt-0"
+            for attempts in partition_attempts.values()
+            for attempt in attempts
+        ):
+            inconclusive_reasons.add("partition_task_retry_observed")
+        if not attribution_complete or len(partition_attempts) < 2:
+            inconclusive_reasons.add("partition_attempt_attribution_incomplete")
+    if inconclusive_reasons & {
+        "partition_attempt_not_unique",
+        "partition_task_retry_observed",
+        "partition_attempt_attribution_incomplete",
+    }:
         checks["attempt_attribution"] = "inconclusive"
-        inconclusive_reasons.add("partition_attempt_not_unique")
-    if any(attempt != "attempt-0" for attempt in task_attempts):
-        checks["attempt_attribution"] = "inconclusive"
-        inconclusive_reasons.add("partition_task_retry_observed")
-    if not attribution_complete or len(partition_attempts) < 2:
-        checks["attempt_attribution"] = "inconclusive"
-        inconclusive_reasons.add("partition_attempt_attribution_incomplete")
 
     guard = _scenario(evidence, "guard_miss")
     if not (
