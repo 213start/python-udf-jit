@@ -24,7 +24,7 @@ x-ray-common: &ray-common
       target: ray-auth-token
       mode: 0400
   security_opt:
-    - seccomp=./seccomp-wx.json
+    - seccomp=${SCALAR_PIERCING_SECCOMP_PROFILE:-./seccomp-wx.json}
   networks:
     - scalar-piercing
 

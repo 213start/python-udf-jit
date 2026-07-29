@@ -1337,6 +1337,12 @@ def run(arguments: argparse.Namespace) -> Path:
         compose_environment.update(
             {
                 "CINDERX_BASE_IMAGE": arguments.cinderx_base_image,
+                "SCALAR_PIERCING_SECCOMP_PROFILE": str(
+                    (
+                        repository
+                        / "docker/scalar-piercing/seccomp-wx.json"
+                    ).resolve(strict=True)
+                ),
                 "SCALAR_PIERCING_IMAGE": image,
                 "SCALAR_PIERCING_DATA_PLANE_SUBNET":
                     arguments.data_plane_subnet,

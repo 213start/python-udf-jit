@@ -62,7 +62,11 @@ class DriverWorkerIsolationTests(unittest.TestCase):
         self.assertNotIn("RAY_AUTH_TOKEN:", compose)
         self.assertIn("mode: 0400", compose)
         self.assertIn("security_opt:", compose)
-        self.assertIn("seccomp=./seccomp-wx.json", compose)
+        self.assertIn(
+            "seccomp=${SCALAR_PIERCING_SECCOMP_PROFILE:"
+            "-./seccomp-wx.json}",
+            compose,
+        )
         self.assertEqual(
             seccomp,
             {
