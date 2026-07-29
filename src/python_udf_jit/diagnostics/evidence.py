@@ -51,6 +51,8 @@ _REASON_CODES = frozenset(
         "scalar_slot_bound",
         "cinderx_force_compile_verified",
         "process_variant_cache",
+        "compile_submitted",
+        "compile_inflight",
         "success",
         "schema_mismatch",
         "artifact_mismatch",

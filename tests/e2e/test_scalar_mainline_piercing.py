@@ -581,6 +581,15 @@ class EvidenceAggregationTests(unittest.TestCase):
             sanitize_event(dependency_rejection)["reason_code"],
             "unsupported_dependency",
         )
+        for reason_code in ("compile_submitted", "compile_inflight"):
+            with self.subTest(reason_code=reason_code):
+                self.assertEqual(
+                    sanitize_event(
+                        dependency_rejection
+                        | {"reason_code": reason_code}
+                    )["reason_code"],
+                    reason_code,
+                )
         with self.assertRaisesRegex(EvidenceContractError, "event_reason_invalid"):
             sanitize_event(
                 dependency_rejection | {"reason_code": "unregistered_reason"}
