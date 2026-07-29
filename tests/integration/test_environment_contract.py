@@ -140,6 +140,7 @@ class EnvironmentContractTests(unittest.TestCase):
                 "0001-runtime-candidate.patch",
                 "0002-primitive-data-intrinsics.patch",
                 "0003-continuation-deopt.patch",
+                "0004-wx-dual-mapping.patch",
             ],
         )
         for entry in patches:
@@ -192,6 +193,14 @@ class EnvironmentContractTests(unittest.TestCase):
         )
         self.assertIn(
             "cinderx/RuntimeTests/udf_continuation_test.cpp",
+            all_changed,
+        )
+        self.assertIn(
+            "cinderx/Jit/code_allocator.cpp",
+            all_changed,
+        )
+        self.assertIn(
+            "cinderx/Jit/code_patcher.cpp",
             all_changed,
         )
         self.assertEqual(

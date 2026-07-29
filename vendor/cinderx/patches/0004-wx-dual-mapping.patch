@@ -1,0 +1,592 @@
+diff --git a/cinderx/Jit/code_allocator.cpp b/cinderx/Jit/code_allocator.cpp
+index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d6c0a3258 100644
+--- a/cinderx/Jit/code_allocator.cpp
++++ b/cinderx/Jit/code_allocator.cpp
+@@ -6,10 +6,7 @@
+ #include "cinderx/Jit/codegen/code_section.h"
+ #include "cinderx/Jit/config.h"
+ 
+-#ifdef WIN32
+-#include <Windows.h>
+-#include <memoryapi.h>
+-#else
++#ifndef WIN32
+ #include <sys/mman.h>
+ #endif
+ 
+@@ -30,27 +27,26 @@ namespace {
+ // 2MiB to match Linux's huge-page size.
+ constexpr size_t kAllocSize = 1024 * 1024 * 2;
+ 
++const asmjit::JitAllocator::CreateParams* dualMappingParams() {
++  static const asmjit::JitAllocator::CreateParams params = [] {
++    asmjit::JitAllocator::CreateParams value;
++    value.options = asmjit::JitAllocatorOptions::kUseDualMapping;
++    return value;
++  }();
++  return &params;
++}
++
+ // Allocate memory for JIT'd code.
+-uint8_t* allocPages(size_t size) {
+-#ifndef WIN32
+-  void* res = mmap(
+-      nullptr,
+-      size,
+-      PROT_EXEC | PROT_READ | PROT_WRITE,
+-      MAP_PRIVATE | MAP_ANONYMOUS,
+-      -1,
+-      0);
++asmjit::VirtMem::DualMapping allocPages(size_t size) {
++  asmjit::VirtMem::DualMapping mapping{};
++  asmjit::Error error = asmjit::VirtMem::allocDualMapping(
++      &mapping, size, asmjit::VirtMem::MemoryFlags::kAccessRWX);
+   JIT_CHECK(
+-      res != MAP_FAILED,
+-      "Failed to allocate {} bytes of memory for code",
+-      size);
+-#else
+-  void* res = VirtualAlloc(
+-      nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+-  JIT_CHECK(
+-      res != nullptr, "Failed to allocate {} bytes of memory for code", size);
+-#endif
+-  return static_cast<uint8_t*>(res);
++      error == asmjit::kErrorOk,
++      "Failed to allocate {} bytes of dual-mapped memory for code: {}",
++      size,
++      error);
++  return mapping;
+ }
+ 
+ bool setHugePages([[maybe_unused]] void* ptr, [[maybe_unused]] size_t size) {
+@@ -88,6 +84,8 @@ ICodeAllocator* CodeAllocator::make() {
+   return new CodeAllocator{};
+ }
+ 
++CodeAllocator::CodeAllocator() : runtime_{dualMappingParams()} {}
++
+ AllocateResult CodeAllocator::addCode(asmjit::CodeHolder* code) {
+   void* addr = nullptr;
+   asmjit::Error error = runtime_.add(&addr, code);
+@@ -123,6 +121,20 @@ bool CodeAllocator::contains(const void* ptr) const {
+       asmjit::kErrorOk;
+ }
+ 
++void* CodeAllocator::writableAddress(const void* executable) const {
++  asmjit::JitAllocator::Span span;
++  if (runtime_.allocator()->query(
++          span, const_cast<void*>(executable)) != asmjit::kErrorOk) {
++    return nullptr;
++  }
++  if (span.rw() == nullptr || span.rw() == span.rx()) {
++    return nullptr;
++  }
++  auto offset = static_cast<const uint8_t*>(executable) -
++      static_cast<const uint8_t*>(span.rx());
++  return static_cast<uint8_t*>(span.rw()) + offset;
++}
++
+ size_t CodeAllocator::usedBytes() const {
+   return used_bytes_.load(std::memory_order_relaxed);
+ }
+@@ -132,18 +144,17 @@ const asmjit::Environment& CodeAllocator::asmJitEnvironment() const {
+ }
+ 
+ CodeAllocatorCinder::~CodeAllocatorCinder() {
+-  for (std::span<uint8_t> alloc : allocations_) {
+-#ifndef WIN32
++  for (Allocation& alloc : allocations_) {
+     JIT_CHECK(
+-        munmap(alloc.data(), alloc.size()) == 0, "Freeing code memory failed");
+-#else
+-    VirtualFree(alloc.data(), 0, MEM_RELEASE);
+-#endif
++        asmjit::VirtMem::releaseDualMapping(
++            &alloc.mapping, alloc.size) == asmjit::kErrorOk,
++        "Freeing dual-mapped code memory failed");
+   }
+ }
+ 
+ void CodeAllocatorCinder::ensureSpace(
+-    uint8_t*& alloc,
++    uint8_t*& rx_alloc,
++    uint8_t*& rw_alloc,
+     size_t& alloc_free,
+     size_t size,
+     bool use_huge_pages) {
+@@ -154,14 +165,15 @@ void CodeAllocatorCinder::ensureSpace(
+   lost_bytes_.fetch_add(alloc_free, std::memory_order_relaxed);
+ 
+   size_t chunk_size = ((size / kAllocSize) + 1) * kAllocSize;
+-  uint8_t* res = allocPages(chunk_size);
+-  if (use_huge_pages && setHugePages(res, chunk_size)) {
++  asmjit::VirtMem::DualMapping mapping = allocPages(chunk_size);
++  if (use_huge_pages && setHugePages(mapping.rx, chunk_size)) {
+     huge_allocs_.fetch_add(1, std::memory_order_relaxed);
+   } else {
+     fragmented_allocs_.fetch_add(1, std::memory_order_relaxed);
+   }
+-  alloc = res;
+-  allocations_.emplace_back(res, chunk_size);
++  rx_alloc = static_cast<uint8_t*>(mapping.rx);
++  rw_alloc = static_cast<uint8_t*>(mapping.rw);
++  allocations_.push_back(Allocation{mapping, chunk_size});
+   alloc_free = chunk_size;
+ }
+ 
+@@ -184,22 +196,24 @@ void CodeAllocatorCinder::ensureSplitSpace(
+ 
+   size_t total_needed = hot_needed + cold_needed;
+   size_t chunk_size = ((total_needed / kAllocSize) + 1) * kAllocSize;
+-  uint8_t* res = allocPages(chunk_size);
+-  if (setHugePages(res, chunk_size)) {
++  asmjit::VirtMem::DualMapping mapping = allocPages(chunk_size);
++  if (setHugePages(mapping.rx, chunk_size)) {
+     huge_allocs_.fetch_add(1, std::memory_order_relaxed);
+   } else {
+     fragmented_allocs_.fetch_add(1, std::memory_order_relaxed);
+   }
+-  allocations_.emplace_back(res, chunk_size);
++  allocations_.push_back(Allocation{mapping, chunk_size});
+ 
+   // Hot code grows forward from the start, cold code grows forward from a
+   // split point. Split proportionally so each side gets at least what it
+   // requested, distributing any surplus evenly.
+   size_t surplus = chunk_size - total_needed;
+   size_t hot_share = hot_needed + surplus / 2;
+-  hot_alloc_ = res;
++  hot_rx_alloc_ = static_cast<uint8_t*>(mapping.rx);
++  hot_rw_alloc_ = static_cast<uint8_t*>(mapping.rw);
+   hot_alloc_free_ = hot_share;
+-  cold_alloc_ = res + hot_share;
++  cold_rx_alloc_ = hot_rx_alloc_ + hot_share;
++  cold_rw_alloc_ = hot_rw_alloc_ + hot_share;
+   cold_alloc_free_ = chunk_size - hot_share;
+ }
+ 
+@@ -225,9 +239,11 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+ #else
+   // On x86-64, RIP-relative addressing has a ±2GB range which is large enough
+   // that independent allocations are unlikely to exceed it in practice.
+-  ensureSpace(hot_alloc_, hot_alloc_free_, hot_size, true);
+   ensureSpace(
+-      cold_alloc_,
++      hot_rx_alloc_, hot_rw_alloc_, hot_alloc_free_, hot_size, true);
++  ensureSpace(
++      cold_rx_alloc_,
++      cold_rw_alloc_,
+       cold_alloc_free_,
+       cold_size,
+       getConfig().cold_code_huge_pages);
+@@ -237,7 +253,8 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+   // All offsets are relative to the hot allocation base so that asmjit can
+   // resolve cross-section jumps correctly.
+   size_t hot_offset = 0;
+-  size_t cold_offset = static_cast<size_t>(cold_alloc_ - hot_alloc_);
++  size_t cold_offset =
++      static_cast<size_t>(cold_rx_alloc_ - hot_rx_alloc_);
+   for (asmjit::Section* section : code->sections()) {
+     CodeSection cs = codeSectionFromName(section->name());
+     if (cs == CodeSection::kCold) {
+@@ -250,9 +267,9 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+   }
+ 
+   PROPAGATE_ERROR(code->resolveUnresolvedLinks());
+-  PROPAGATE_ERROR(code->relocateToBase(uintptr_t(hot_alloc_)));
++  PROPAGATE_ERROR(code->relocateToBase(uintptr_t(hot_rx_alloc_)));
+ 
+-  void* addr = hot_alloc_;
++  void* addr = hot_rx_alloc_;
+ 
+   // Copy each section's data to the appropriate allocation.
+   size_t total_size = 0;
+@@ -263,14 +280,16 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+     }
+     CodeSection cs = codeSectionFromName(section->name());
+     if (cs == CodeSection::kCold) {
+-      std::memcpy(cold_alloc_, section->data(), buffer_size);
+-      flushInstructionCache(cold_alloc_, buffer_size);
+-      cold_alloc_ += buffer_size;
++      std::memcpy(cold_rw_alloc_, section->data(), buffer_size);
++      flushInstructionCache(cold_rx_alloc_, buffer_size);
++      cold_rx_alloc_ += buffer_size;
++      cold_rw_alloc_ += buffer_size;
+       cold_alloc_free_ -= buffer_size;
+     } else {
+-      std::memcpy(hot_alloc_, section->data(), buffer_size);
+-      flushInstructionCache(hot_alloc_, buffer_size);
+-      hot_alloc_ += buffer_size;
++      std::memcpy(hot_rw_alloc_, section->data(), buffer_size);
++      flushInstructionCache(hot_rx_alloc_, buffer_size);
++      hot_rx_alloc_ += buffer_size;
++      hot_rw_alloc_ += buffer_size;
+       hot_alloc_free_ -= buffer_size;
+     }
+     total_size += buffer_size;
+@@ -291,9 +310,14 @@ AllocateResult CodeAllocatorCinder::addCode(asmjit::CodeHolder* code) {
+   PROPAGATE_ERROR(code->resolveUnresolvedLinks());
+ 
+   size_t max_code_size = code->codeSize();
+-  ensureSpace(hot_alloc_, hot_alloc_free_, max_code_size, true);
++  ensureSpace(
++      hot_rx_alloc_,
++      hot_rw_alloc_,
++      hot_alloc_free_,
++      max_code_size,
++      true);
+ 
+-  PROPAGATE_ERROR(code->relocateToBase(uintptr_t(hot_alloc_)));
++  PROPAGATE_ERROR(code->relocateToBase(uintptr_t(hot_rx_alloc_)));
+ 
+   size_t actual_code_size = code->codeSize();
+   JIT_CHECK(actual_code_size <= max_code_size, "Code grew during relocation");
+@@ -305,20 +329,23 @@ AllocateResult CodeAllocatorCinder::addCode(asmjit::CodeHolder* code) {
+ 
+     JIT_CHECK(
+         offset + buffer_size <= actual_code_size, "Inconsistent code size");
+-    std::memcpy(hot_alloc_ + offset, section->data(), buffer_size);
++    std::memcpy(hot_rw_alloc_ + offset, section->data(), buffer_size);
+ 
+     if (virtual_size > buffer_size) {
+       JIT_CHECK(
+           offset + virtual_size <= actual_code_size, "Inconsistent code size");
+       std::memset(
+-          hot_alloc_ + offset + buffer_size, 0, virtual_size - buffer_size);
++          hot_rw_alloc_ + offset + buffer_size,
++          0,
++          virtual_size - buffer_size);
+     }
+   }
+ 
+-  void* addr = hot_alloc_;
++  void* addr = hot_rx_alloc_;
+   flushInstructionCache(addr, actual_code_size);
+ 
+-  hot_alloc_ += actual_code_size;
++  hot_rx_alloc_ += actual_code_size;
++  hot_rw_alloc_ += actual_code_size;
+   hot_alloc_free_ -= actual_code_size;
+   used_bytes_.fetch_add(actual_code_size, std::memory_order_relaxed);
+ 
+@@ -332,12 +359,30 @@ asmjit::Error CodeAllocatorCinder::releaseCode([[maybe_unused]] void* code) {
+ 
+ bool CodeAllocatorCinder::contains(const void* ptr) const {
+   std::lock_guard lock{allocator_mutex_};
+-  for (std::span<uint8_t> alloc : allocations_) {
+-    if (alloc.data() <= ptr && ptr < alloc.data() + alloc.size()) {
++  auto* address = static_cast<const uint8_t*>(ptr);
++  for (const Allocation& alloc : allocations_) {
++    auto* rx = static_cast<const uint8_t*>(alloc.mapping.rx);
++    if (rx <= address && address < rx + alloc.size) {
+       return true;
+     }
+   }
+   return false;
+ }
+ 
++void* CodeAllocatorCinder::writableAddress(const void* executable) const {
++  std::lock_guard lock{allocator_mutex_};
++  auto* address = static_cast<const uint8_t*>(executable);
++  for (const Allocation& alloc : allocations_) {
++    auto* rx = static_cast<const uint8_t*>(alloc.mapping.rx);
++    if (rx <= address && address < rx + alloc.size) {
++      if (alloc.mapping.rw == nullptr || alloc.mapping.rw == alloc.mapping.rx) {
++        return nullptr;
++      }
++      auto offset = address - rx;
++      return static_cast<uint8_t*>(alloc.mapping.rw) + offset;
++    }
++  }
++  return nullptr;
++}
++
+ } // namespace jit
+diff --git a/cinderx/Jit/code_allocator.h b/cinderx/Jit/code_allocator.h
+index 013d0f7994150415f14c309788149cf0eb35474d..1cc86b24c3cb99cf1770c7281572183f372eaf06 100644
+--- a/cinderx/Jit/code_allocator.h
++++ b/cinderx/Jit/code_allocator.h
+@@ -8,7 +8,6 @@
+ 
+ #include <atomic>
+ #include <mutex>
+-#include <span>
+ #include <vector>
+ 
+ namespace jit {
+@@ -28,6 +27,7 @@ namespace jit {
+ */
+ class CodeAllocator : public ICodeAllocator {
+  public:
++  CodeAllocator();
+   ~CodeAllocator() override = default;
+ 
+   // To be called once by JIT initialization after enough configuration has been
+@@ -37,6 +37,7 @@ class CodeAllocator : public ICodeAllocator {
+   AllocateResult addCode(asmjit::CodeHolder* code) override;
+   asmjit::Error releaseCode(void* code) override;
+   bool contains(const void* ptr) const override;
++  void* writableAddress(const void* executable) const override;
+   size_t usedBytes() const override;
+   const asmjit::Environment& asmJitEnvironment() const override;
+ 
+@@ -69,8 +70,14 @@ class CodeAllocatorCinder : public CodeAllocator {
+   AllocateResult addCode(asmjit::CodeHolder* code) override;
+   asmjit::Error releaseCode(void* code) override;
+   bool contains(const void* ptr) const override;
++  void* writableAddress(const void* executable) const override;
+ 
+  private:
++  struct Allocation {
++    asmjit::VirtMem::DualMapping mapping;
++    size_t size;
++  };
++
+   // Add code with hot/cold section splitting. Called by addCode() when
+   // multiple_code_sections is enabled. Caller must hold allocator_mutex_.
+   AllocateResult addSplitCode(asmjit::CodeHolder* code);
+@@ -78,7 +85,8 @@ class CodeAllocatorCinder : public CodeAllocator {
+   // Ensure the given bump allocator has at least `size` bytes free, allocating
+   // a new chunk if necessary.
+   void ensureSpace(
+-      uint8_t*& alloc,
++      uint8_t*& rx_alloc,
++      uint8_t*& rw_alloc,
+       size_t& alloc_free,
+       size_t size,
+       bool use_huge_pages);
+@@ -94,14 +102,16 @@ class CodeAllocatorCinder : public CodeAllocator {
+   mutable std::mutex allocator_mutex_;
+ 
+   // List of all chunks allocated, for use in deallocation and contains().
+-  std::vector<std::span<uint8_t>> allocations_;
++  std::vector<Allocation> allocations_;
+ 
+   // Hot code allocation state.
+-  uint8_t* hot_alloc_{nullptr};
++  uint8_t* hot_rx_alloc_{nullptr};
++  uint8_t* hot_rw_alloc_{nullptr};
+   size_t hot_alloc_free_{0};
+ 
+   // Cold code allocation state (used when multiple code sections are enabled).
+-  uint8_t* cold_alloc_{nullptr};
++  uint8_t* cold_rx_alloc_{nullptr};
++  uint8_t* cold_rw_alloc_{nullptr};
+   size_t cold_alloc_free_{0};
+ 
+   // Number of bytes in total lost when allocations didn't fit neatly into
+diff --git a/cinderx/Jit/code_allocator_iface.h b/cinderx/Jit/code_allocator_iface.h
+index 1d2b1fd2d48bd9f1df9e44ef44efda839cf6c1f1..3e612fa6891b7c2ff1fd9047044ec7e50eb783d8 100644
+--- a/cinderx/Jit/code_allocator_iface.h
++++ b/cinderx/Jit/code_allocator_iface.h
+@@ -29,6 +29,11 @@ class ICodeAllocator {
+   // Check if a pointer is located within this allocator's memory.
+   virtual bool contains(const void* ptr) const = 0;
+ 
++  // Translate an executable address owned by this allocator to the
++  // corresponding writable alias. JIT code must never be writable through
++  // its executable address.
++  virtual void* writableAddress(const void* executable) const = 0;
++
+   // Get the number of bytes of memory used by the allocator.
+   virtual size_t usedBytes() const = 0;
+ 
+diff --git a/cinderx/Jit/code_patcher.cpp b/cinderx/Jit/code_patcher.cpp
+index d07573c9527982249e33de03d48d2c7ee710593d..8501d8e3d74432e5cc43a8af0bebd8ac48e8a68e 100644
+--- a/cinderx/Jit/code_patcher.cpp
++++ b/cinderx/Jit/code_patcher.cpp
+@@ -4,7 +4,9 @@
+ 
+ #include "cinderx/Common/log.h"
+ #include "cinderx/Common/util.h"
++#include "cinderx/Jit/code_allocator_iface.h"
+ #include "cinderx/Jit/codegen/arch/detection.h"
++#include "cinderx/module_state.h"
+ 
+ #include <array>
+ #include <cstring>
+@@ -66,6 +68,22 @@ uintptr_t resolveDisplacement(uintptr_t from, int32_t displacement) {
+   return disp;
+ }
+ 
++uint8_t* writablePatchpoint(uint8_t* executable) {
++  ICodeAllocator* allocator = cinderx::getModuleState()->code_allocator.get();
++  JIT_CHECK(allocator != nullptr, "JIT code allocator is not initialized");
++  auto* writable =
++      static_cast<uint8_t*>(allocator->writableAddress(executable));
++  JIT_CHECK(
++      writable != nullptr,
++      "Patchpoint {} is outside the JIT code allocator",
++      static_cast<void*>(executable));
++  JIT_CHECK(
++      writable != executable,
++      "Patchpoint {} does not have a distinct writable alias",
++      static_cast<void*>(executable));
++  return writable;
++}
++
+ } // namespace
+ 
+ void CodePatcher::link(uintptr_t patchpoint, std::span<const uint8_t> data) {
+@@ -126,6 +144,7 @@ void CodePatcher::swap() {
+ #ifdef Py_GIL_DISABLED
+   SwapLockGuard lock{*this};
+ #endif
++  uint8_t* writable_patchpoint = writablePatchpoint(patchpoint_);
+ 
+ #if defined(CINDER_X86_64) && defined(Py_GIL_DISABLED)
+   // On x86 the patchpoint is up to 7 bytes (aligned to 8 bytes by the code
+@@ -141,12 +160,13 @@ void CodePatcher::swap() {
+   auto* qword_bytes = reinterpret_cast<uint8_t*>(&qword);
+   std::swap_ranges(qword_bytes, qword_bytes + flags_.data_len, data_.data());
+ 
+-  std::atomic_ref<uint64_t>{*reinterpret_cast<uint64_t*>(patchpoint_)}.store(
+-      qword, std::memory_order_relaxed);
++  std::atomic_ref<uint64_t>{
++      *reinterpret_cast<uint64_t*>(writable_patchpoint)}
++      .store(qword, std::memory_order_relaxed);
+ #else
+   decltype(data_) temp;
+   std::memcpy(temp.data(), patchpoint_, flags_.data_len);
+-  std::memcpy(patchpoint_, data_.data(), flags_.data_len);
++  std::memcpy(writable_patchpoint, data_.data(), flags_.data_len);
+   std::memcpy(data_.data(), temp.data(), flags_.data_len);
+ #endif
+ 
+diff --git a/cinderx/RuntimeTests/code_allocator_test.cpp b/cinderx/RuntimeTests/code_allocator_test.cpp
+index fb43355d2f853f6a00d63f9006f6a7441f5588e6..8a7f9ce8f9df8887d1226e3310785af055831aca 100644
+--- a/cinderx/RuntimeTests/code_allocator_test.cpp
++++ b/cinderx/RuntimeTests/code_allocator_test.cpp
+@@ -10,7 +10,9 @@
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
++#include <fstream>
+ #include <memory>
++#include <string>
+ 
+ using namespace jit;
+ using namespace jit::codegen;
+@@ -40,6 +42,31 @@ const uint8_t* addressAtOffset(const void* base, uintptr_t offset) {
+       reinterpret_cast<uintptr_t>(base) + offset);
+ }
+ 
++std::string permissionsFor(const void* address) {
++#ifndef WIN32
++  std::ifstream maps{"/proc/self/maps"};
++  std::string range;
++  std::string permissions;
++  auto target = reinterpret_cast<uintptr_t>(address);
++  while (maps >> range >> permissions) {
++    auto separator = range.find('-');
++    if (separator == std::string::npos) {
++      continue;
++    }
++    uintptr_t start = std::stoull(range.substr(0, separator), nullptr, 16);
++    uintptr_t end = std::stoull(range.substr(separator + 1), nullptr, 16);
++    if (start <= target && target < end) {
++      return permissions;
++    }
++    std::string remainder;
++    std::getline(maps, remainder);
++  }
++#else
++  (void)address;
++#endif
++  return {};
++}
++
+ TEST_F(CodeAllocatorTest, AddSplitCodeCopiesHotAndColdSections) {
+   asmjit::CodeHolder code;
+   code.init(code_allocator_->asmJitEnvironment());
+@@ -87,6 +114,37 @@ TEST_F(CodeAllocatorTest, AddSplitCodeCopiesHotAndColdSections) {
+           kColdText.data(),
+           kColdText.size()),
+       0);
++
++  void* writable = code_allocator_->writableAddress(result.addr);
++  ASSERT_NE(writable, nullptr);
++  ASSERT_NE(writable, result.addr);
++#ifndef WIN32
++  EXPECT_EQ(permissionsFor(result.addr).substr(0, 3), "r-x");
++  EXPECT_EQ(permissionsFor(writable).substr(0, 3), "rw-");
++#endif
++
++  CodeAllocator standard_allocator;
++  asmjit::CodeHolder standard_code;
++  ASSERT_EQ(
++      standard_code.init(standard_allocator.asmJitEnvironment()),
++      asmjit::kErrorOk);
++  arch::Builder standard_assembler{&standard_code};
++  ASSERT_EQ(
++      standard_assembler.embed(kHotText.data(), kHotText.size()),
++      asmjit::kErrorOk);
++  ASSERT_EQ(standard_assembler.finalize(), asmjit::kErrorOk);
++
++  AllocateResult standard_result = standard_allocator.addCode(&standard_code);
++  ASSERT_EQ(standard_result.error, asmjit::kErrorOk);
++  ASSERT_NE(standard_result.addr, nullptr);
++  void* standard_writable =
++      standard_allocator.writableAddress(standard_result.addr);
++  ASSERT_NE(standard_writable, nullptr);
++  ASSERT_NE(standard_writable, standard_result.addr);
++#ifndef WIN32
++  EXPECT_EQ(permissionsFor(standard_result.addr).substr(0, 3), "r-x");
++  EXPECT_EQ(permissionsFor(standard_writable).substr(0, 3), "rw-");
++#endif
+ }
+ 
+ } // namespace
+diff --git a/cinderx/RuntimeTests/deopt_patcher_test.cpp b/cinderx/RuntimeTests/deopt_patcher_test.cpp
+index 99971f26f0b96f39dd209fd883df376eb545da7c..badbe007ee7ab9382f1f20ac288c12c942639055 100644
+--- a/cinderx/RuntimeTests/deopt_patcher_test.cpp
++++ b/cinderx/RuntimeTests/deopt_patcher_test.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <gtest/gtest.h>
+ 
++#include "cinderx/Jit/codegen/arch.h"
+ #include "cinderx/Jit/codegen/gen_asm.h"
+ #include "cinderx/Jit/compiler.h"
+ #include "cinderx/Jit/context.h"
+@@ -9,6 +10,7 @@
+ #include "cinderx/Jit/hir/hir.h"
+ #include "cinderx/Jit/hir/printer.h"
+ #include "cinderx/RuntimeTests/fixtures.h"
++#include "cinderx/module_state.h"
+ 
+ class CodePatcherTest : public RuntimeTest {
+  public:
+@@ -72,10 +74,27 @@ class MyDeoptPatcher : public jit::JumpPatcher {
+ };
+ 
+ TEST_F(CodePatcherTest, CodePatch) {
+-  // Intentionally leaving these together to catch accidental stack scribbling.
+-  uint16_t x = 123;
+-  uint16_t y = 456;
+-  uint16_t z = 789;
++  // Intentionally leave these together in allocator-owned code memory to
++  // catch accidental scribbling while exercising the real RX/RW aliases.
++  constexpr std::array<uint16_t, 3> values{123, 456, 789};
++  auto* allocator = cinderx::getModuleState()->code_allocator.get();
++  ASSERT_NE(allocator, nullptr);
++
++  asmjit::CodeHolder code;
++  ASSERT_EQ(code.init(allocator->asmJitEnvironment()), asmjit::kErrorOk);
++  jit::codegen::arch::Builder assembler{&code};
++  ASSERT_EQ(
++      assembler.embed(values.data(), sizeof(values)), asmjit::kErrorOk);
++  ASSERT_EQ(assembler.finalize(), asmjit::kErrorOk);
++
++  jit::AllocateResult allocation = allocator->addCode(&code);
++  ASSERT_EQ(allocation.error, asmjit::kErrorOk);
++  ASSERT_NE(allocation.addr, nullptr);
++  auto* allocated_values =
++      static_cast<const uint16_t*>(allocation.addr);
++  const uint16_t& x = allocated_values[0];
++  const uint16_t& y = allocated_values[1];
++  const uint16_t& z = allocated_values[2];
+ 
+   std::array<uint8_t, 2> bytes{0xef, 0xbe};
+ 
+

@@ -9,6 +9,11 @@
 实现续体载荷构造、区域代码对象内的原生去优化范围校验，以及活跃值类型、
 物化状态、源码身份和提交状态的拒绝矩阵。跨代码对象恢复始终返回 Python
 `InterpreterContinuation`，提交后不允许整函数重放。
+第四个补丁将普通代码分配器和大页代码分配器统一改为 RX/RW 双映射，代码
+执行只使用 RX 别名，生成和热修补只使用 RW 别名；无法解析到独立写别名的
+热修补地址会被直接拒绝。候选容器同时通过 seccomp 拒绝请求 W+X 权限的
+`mmap`、`mprotect` 和 `pkey_mprotect`，因此第三方库也不能重新引入可写且
+可执行的映射。
 
 构建输出、虚拟环境、IDE 状态、仅用于 CI 的文件、生成的 egg 元数据和文档
 不参与运行时源码树身份计算；具体排除项、续体 ABI 及应用补丁前后的源码树
@@ -20,6 +25,7 @@
 patch --batch -p1 < 0001-runtime-candidate.patch
 patch --batch -p1 < 0002-primitive-data-intrinsics.patch
 patch --batch -p1 < 0003-continuation-deopt.patch
+patch --batch -p1 < 0004-wx-dual-mapping.patch
 ```
 
 正式验收逐个校验补丁 SHA-256，并按清单顺序拼接补丁原始字节后计算补丁系列
