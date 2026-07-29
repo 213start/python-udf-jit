@@ -1,30 +1,40 @@
 # RFC-008：运行治理
 
-**状态 (Status):** Draft
+**状态：** 标量阶段已实现，发布门禁待完成
 
-**作者 (Authors):** Python UDF JIT 项目组
+**作者：** Python UDF JIT 项目组
 
-**创建日期 (Created):** 2026-07-17
+**创建日期：** 2026-07-17
 
-**更新日期 (Updated):** 2026-07-17
+**更新日期：** 2026-07-29
 
-**相关 Issue/PR:** 本地方案评审阶段，无外部 Issue/PR
+**本次修订：** 记录冻结治理实现状态，删除远程控制和紧急停用承诺，分离功能与性能资格
 
-**类别:** 主线特性
+**相关议题/合并请求：** 本地方案评审阶段，无外部议题或合并请求
 
-**工作量估算:** 4 人周
+**类别：** 主线特性
 
-**上游 RFC:** [RFC-007：守卫式执行](RFC-007-guarded-execution.md)
+**工作量估算：** 4 人周
+
+**上游 RFC：** [RFC-007：守卫式执行](RFC-007-guarded-execution.md)
 
 ---
+
+# 0. 实现状态与本期边界
+
+RFC-008 的本地冻结治理已进入生产代码：`off/observe/auto`、作业提交时冻结的策略和策略哈希、模式上限、灰度授权、封闭资源预算、作业/租户隔离、解释信息、有限原因码、无业务值异步遥测、兼容检查、制品检查和验收报告聚合均已实现。
+
+本期不实现远程凭据分发、运行中策略更新、中心控制服务或紧急停用通道。回滚通过停止新 `auto` 作业、新作业使用 `off` 或部署回滚完成，不能中断已经进入执行的区域。
+
+性能与功能状态分离。单次 A/B 只提供方向性观测，不要求 ABBA，也不阻断标量功能实现；累计 `1.15x` 只用于后续另行声明的性能资格，不能作为本期一次性发布门槛。
 
 # 1. 概述
 
 ## 1.1 简介
 
-本提案定义 Python UDF JIT 的运行治理闭环：`off/observe/auto` 和紧急 Kill Switch、Explain、结构化诊断、Artifact/Variant 隔离、预算与熔断、异步指标、兼容检查和端到端验收工具。治理模块不参与每 Lane 的正确性决策，也不要求常驻远端服务；Compiler/Worker 在治理不可用时使用本地只读默认策略继续执行。
+本提案定义 Python UDF JIT 的运行治理闭环：`off/observe/auto`、解释信息、结构化诊断、制品/变体隔离、预算与熔断、异步指标、兼容检查和端到端验收工具。治理模块不参与单个标量值的正确性决策，也不要求常驻远端服务；编译器和工作节点使用作业提交时冻结的本地只读策略。
 
-RFC-008 同时定义本期主线发布门槛：RFC-001～RFC-008 全部启用、RFC-009～RFC-012 关闭时，固定 Daft/Ray/Lance 标量 UDF Benchmark 相对原始 Daft UDF 达到 `1.15x`。
+RFC-008 同时定义持续性能跟踪口径：RFC-001～RFC-008 全部启用、RFC-009～RFC-012 关闭时，先以同环境单次 A/B 记录方向和热点；后续只有声明性能资格时，才以固定 Daft/Ray/Lance 标量负载和累计 `1.15x` 目标执行正式统计门禁。
 
 ## 1.2 动机
 
@@ -36,12 +46,12 @@ JIT 的收益依赖 Capture 覆盖、编译成本、Guard 命中、布局转换�
 
 ### 目标
 
-1. 提供 `off/observe/auto`、Provider/Region 开关和进程级紧急 Kill Switch。
+1. 提供 `off/observe/auto`、标量提供器开关和作业提交时冻结的模式上限。
 2. Explain 串联 Source→Capture→IR Pass→Region→Artifact→Layout→Variant→执行/回退原因。
 3. 提供编译、代码、Cache、版本、内存、并发和失败预算，以及 Region/UDF/Job 级熔断。
 4. Artifact、Variant、指标和策略按 Job/Tenant/ABI 隔离。
 5. 提供 `udfjitctl` 的 Artifact Verify、Explain、Compatibility、Benchmark 和报告能力。
-6. 定义主线 `1.15x` 与最终高阶 `1.30x` 的统一端到端口径。
+6. 定义方向性 A/B 与后续主线 `1.15x` 性能资格相互分离的端到端口径。
 
 ### 非目标
 
@@ -59,8 +69,8 @@ JIT 的收益依赖 Capture 覆盖、编译成本、Guard 命中、布局转换�
 | 单 UDF 性能差 | Explain 显示 Break、Provider、Copy、Guard、Compile 和执行时间归因 |
 | 编译连续失败 | 达阈值后 Region/UDF 熔断，后续调用直接解释执行 |
 | 兼容版本漂移 | 启动/Artifact 检查拒绝不兼容模块，不加载错误机器码 |
-| 紧急回滚 | 环境开关在新 Capture/Compile 前生效，现有作业保持原始语义路径 |
-| 发布验收 | 一条命令运行固定环境 A/B，输出结果一致性和端到端加速比 |
+| 部署回滚 | 停止新 `auto` 作业；新作业使用 `off`，现有区域自然完成 |
+| 发布验收 | 一条命令运行固定环境正确性和方向性 A/B，分离功能与性能状态 |
 
 # 3. 方案设计
 
@@ -79,7 +89,7 @@ flowchart LR
     BENCH["Fixed Daft+Ray Benchmark"] --> REPORT["A/B Result + Gate"]
 ```
 
-所有策略为不可变 Snapshot，只能在 Safe Point 切换。Telemetry Client 使用有界队列、采样和丢弃计数，不能反压 Batch 热路径。
+策略在作业提交时冻结并随载体分发，不在运行中切换。遥测客户端使用有界队列、采样和丢弃计数，不能反压标量运行路径。
 
 ### 运行模式
 
@@ -88,7 +98,6 @@ flowchart LR
 | `off` | 否 | 否 | 否 |
 | `observe` | 是 | 可选离线/影子 | 否 |
 | `auto` | 是 | 按预算 | Guard 命中且收益门禁通过 |
-| Kill Switch | 停止新工作 | 停止/取消 | 新调用解释执行 |
 
 ## 3.2 技术选型
 
@@ -97,7 +106,7 @@ flowchart LR
 | 本地策略 + 异步事件 + 离线 CLI | 无在线依赖、故障面小、易随 Wheel 交付 | 全局实时控制能力有限 | 本期采用 |
 | 中心治理服务 | 统一全局策略和画像 | 引入网络、服务和热路径依赖 | 后续可选 |
 | 仅日志 | 实现简单 | 难聚合、难自动门禁、结构不稳定 | 不采用 |
-| 每 Lane 指标 | 细粒度 | 热路径开销和数据泄露风险高 | 禁止；只做 Region/Batch 聚合 |
+| 每次标量调用指标 | 细粒度 | 热路径开销和数据泄露风险高 | 禁止；只做区域、任务和运行批次聚合 |
 
 ## 3.3 功能与性能设计
 
@@ -148,13 +157,9 @@ def revenue(extendedprice, discount):
 | Baseline | UDF JIT `off`，Daft 原始 UDF |
 | Mainline | RFC-001～008 `auto`，RFC-009～012 强制关闭 |
 
-两组先各预热一次，再交替运行五次；结果行数和 Revenue 聚合完全一致。门槛：
+功能实现阶段先执行单次同环境 A/B；结果行数和 Revenue 聚合必须完全一致，并记录真实数值、环境指纹、阶段分解和热点。该结果只作方向性观测，不设置速度门槛。
 
-```text
-speedup_mainline = median(T_baseline) / median(T_mainline) >= 1.15
-```
-
-另运行一个包含 Opaque Call/Graph Break 的 Fallback 作业，候选相对 Baseline 不得低于 `0.98x`。最终高阶门槛由 RFC-010～012 复用同一原始 Baseline，以加法口径达到 `1.30x`。
+只有后续声明性能资格时，才各预热一次、交替运行五次，并要求 `median(T_baseline) / median(T_mainline) >= 1.15`。包含不透明调用/图中断的回退作业和遥测/`off` 开销门槛也只在该正式资格阶段启用。
 
 ### 治理自身开销
 
@@ -165,7 +170,7 @@ Telemetry 开/关 A/B 的稳态端到端比 `>= 0.99`；事件队列满时丢弃
 - Event 默认不含业务值、常量内容、完整闭包或明文敏感字段；Source/Schema 支持 Hash/脱敏。
 - Artifact/Variant/Cache 按 Job/Tenant Namespace 和 ABI Key 隔离；文件权限最小化。
 - Policy 只能收紧预算/Provider，不得关闭 Verifier 或强制绕过 Guard。
-- Kill Switch 和模式配置在 Bootstrap/Runtime Safe Point 读取并记录版本，不接受热路径任意远端命令。
+- 本地模式在启动时读取；冻结策略在作业提交时绑定，不接受热路径或远端命令。
 - CLI 对 Artifact 只读；`verify` 不映射执行机器码。
 - Event/Metric 后端故障不影响 Compiler/Worker；丢弃量可见。
 
@@ -195,7 +200,7 @@ UDFJIT_POLICY=/etc/udfjit/policy.json
 | 参数名称 | 输入/输出 | 类型 | 描述 | 取值范围 |
 |---|---|---|---|---|
 | `policy_version` | 输入 | String | 不可变策略标识 | 进入 Artifact/Variant 日志 |
-| `mode` | 输入 | Enum | off/observe/auto | 必须可 Kill Switch 覆盖 |
+| `mode` | 输入 | Enum | off/observe/auto | 只能被本地禁用、兼容性和冻结策略收紧 |
 | `budgets` | 输入 | BudgetSet | Compile/Code/Cache/Variant | 非负有上限 |
 | `provider_flags` | 输入 | Map | Provider/特性开关 | 不能绕过正确性门禁 |
 
@@ -206,14 +211,13 @@ udfjitctl artifact verify <artifact>
 udfjitctl explain <artifact-or-report>
 udfjitctl compatibility --manifest <path>
 udfjitctl benchmark mainline --config <path>
-udfjitctl benchmark advanced --config <path>
 ```
 
-命令输出机器可读 JSON 和简洁人类报告；Benchmark 命令非零退出表示结果不一致、环境指纹不匹配或性能门槛未通过。
+命令输出机器可读 JSON；基准测试命令验证主线方向性报告和功能状态，不在当前阶段应用速度门槛。
 
 ### 3.5.3 编程手册设计
 
-单独输出《Python UDF JIT 运维与验收手册》，覆盖安装、模式、策略、指标字典、Explain、熔断、Kill Switch、兼容矩阵、主线/高阶 Benchmark 和发布回滚。
+单独输出《标量主线部署、灰度与回滚手册》，覆盖安装、模式、冻结策略、指标字典、解释信息、熔断、兼容矩阵、方向性基准测试和部署回滚。
 
 # 4. 缺点和风险
 
@@ -248,7 +252,7 @@ udfjitctl benchmark advanced --config <path>
 |---|---|
 | Explain | 从源码到运行 Variant 的可读决策与原因报告 |
 | Circuit Breaker | 连续内部失败/资源超限后停止优化并保持解释路径的机制 |
-| Mainline Gate | RFC-001～008 相对原始基线的 `1.15x` 端到端门槛 |
+| 主线性能资格 | 后续声明 `performance-qualified` 时应用的累计 `1.15x` 端到端门槛 |
 
 ## 附录 C：文档更新计划
 

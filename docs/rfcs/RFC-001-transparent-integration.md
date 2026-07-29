@@ -1,22 +1,30 @@
 # RFC-001：透明接入
 
-**状态 (Status):** Draft
+**状态：** 标量阶段已实现，发布门禁待完成
 
-**作者 (Authors):** Python UDF JIT 项目组
+**作者：** Python UDF JIT 项目组
 
-**创建日期 (Created):** 2026-07-17
+**创建日期：** 2026-07-17
 
-**更新日期 (Updated):** 2026-07-17
+**更新日期：** 2026-07-29
 
-**相关 Issue/PR:** 本地方案评审阶段，无外部 Issue/PR
+**本次修订：** 记录标量实现状态，删除批处理和紧急停用承诺
 
-**类别:** 主线特性
+**相关议题/合并请求：** 本地方案评审阶段，无外部议题或合并请求
 
-**工作量估算:** 4 人周
+**类别：** 主线特性
 
-**上游文档:** [Python UDF JIT 架构设计](../design/2026-07-13-python-udf-jit-architecture.md)
+**工作量估算：** 4 人周
+
+**上游文档：** [Python UDF JIT 架构设计](../design/2026-07-13-python-udf-jit-architecture.md)
 
 ---
+
+# 0. 实现状态与本期边界
+
+RFC-001 的标量路径已进入生产代码：Daft 0.7.2 的版本、签名、私有接缝和源码指纹通过后，启动引导登记 `Func.__call__`、`DataFrame.where`、`select` 和 `with_columns` 的透明适配；候选项在操作定稿时获得数据模式与用途，再生成捕获请求和工作节点载体。UDF 选项、原始异常和未安装/`off` 行为均由差分测试保护。
+
+本期只生成标量载体，不生成批处理包装器，不执行向量或 Arrow 路径。兼容检查、载体或后续编译失败时，系统在语义提交前保持原 Daft 行为。当前状态只表示标量实现及 blue-98 三容器契约通过；真实多物理节点和 Python 3.11.6 生产资格仍待完成。
 
 # 1. 概述
 
@@ -43,7 +51,7 @@
 
 1. 用户 UDF 源码、装饰器和 DataFrame 调用保持不变。
 2. 在 `Func.__call__` 阶段登记 UDF 候选，在规范 DataFrame 操作边界补齐 Schema 与用途并生成 `CaptureRequest`。
-3. 通过生成的 Scalar/Batch UDF Wrapper 或 Expression 闭包携带 Artifact Handle；大制品使用 Ray ObjectRef。
+3. 通过生成的标量 UDF 包装器或 Expression 闭包携带 Artifact Handle；大制品使用 Ray ObjectRef。
 4. Driver 和 Worker 进程通过同一个 Wheel 与 `.pth` 自动引导。
 5. 版本、指纹、签名或 Hook 失败时 Fail Open，结果和异常与插件关闭时一致。
 6. 为 PySpark、PyFlink 等未来 Adapter 保留统一 Control/Worker Adapter 接口。
@@ -130,7 +138,7 @@ Daft Adapter 生成可序列化的 UDF Wrapper/Expression。闭包只保存内�
 
 - Benchmark：Daft 0.7.2 + Ray 2.55.0 读取固定 Lance 7.0.0 Snapshot，运行数值 Projection、带分支 Filter 和不支持 UDF 三个作业。
 - A：运行包未安装/`off`；B：运行包安装且 `observe`，始终执行原始 UDF。
-- 五次正式运行的端到端中位数满足 `median(T_A) / median(T_B) >= 0.98`，即透明框架本身稳态回归不超过 2%。
+- 单次同环境 A/B 记录端到端方向和正确性哈希；该结果不作为本期功能阻断门槛。
 - 功能门槛：用户脚本字节级不变；结果、行序和异常一致；版本指纹失配时所有作业成功走原路径。
 - 本 RFC 不单独承担主线 `1.15x`，其输出进入 RFC-002～RFC-008 的组合验收。
 
@@ -140,7 +148,7 @@ Daft Adapter 生成可序列化的 UDF Wrapper/Expression。闭包只保存内�
 - 原方法引用在安装包装器前保存；包装器异常必须清除自身异常并调用原方法。
 - Registry 不记录业务值，只记录函数、Schema、表达式和 Source Location；诊断输出可对字段名脱敏。
 - Hook 安装使用进程级锁和幂等标记，避免重复 import 或并发 import 产生包装链。
-- `off` 和紧急 Kill Switch 在任何 Capture/JIT 初始化前生效。
+- `off` 和本地 `UDFJIT_DISABLE` 在任何捕获/JIT 初始化前生效。
 - Worker Wrapper 不额外扩大 Ray Job 权限，不新增网络端口或文件访问能力。
 
 ## 3.5 编程与调用设计
@@ -183,7 +191,7 @@ result = df.with_column("score", score(df["price"], df["quantity"]))
 
 ### 3.5.3 编程手册设计
 
-在项目用户手册中新增“透明安装与兼容模式”章节，包含版本矩阵、安装方式、`off/observe/auto`、兼容拒绝诊断、Kill Switch 和显式开发备用入口；不单独要求用户学习编译器 API。
+在项目用户手册中新增“透明安装与兼容模式”章节，包含版本矩阵、安装方式、`off/observe/auto`、兼容拒绝诊断、本地禁用和显式开发备用入口；不单独要求用户学习编译器 API。
 
 # 4. 缺点和风险
 

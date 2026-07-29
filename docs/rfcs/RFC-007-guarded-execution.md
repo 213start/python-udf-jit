@@ -1,22 +1,30 @@
 # RFC-007：守卫式执行
 
-**状态 (Status):** Draft
+**状态：** 标量阶段已实现，发布门禁待完成
 
-**作者 (Authors):** Python UDF JIT 项目组
+**作者：** Python UDF JIT 项目组
 
-**创建日期 (Created):** 2026-07-17
+**创建日期：** 2026-07-17
 
-**更新日期 (Updated):** 2026-07-17
+**更新日期：** 2026-07-29
 
-**相关 Issue/PR:** 本地方案评审阶段，无外部 Issue/PR
+**本次修订：** 记录异步多变体、精确续体和进程级硬预算实现状态
 
-**类别:** 主线特性
+**相关议题/合并请求：** 本地方案评审阶段，无外部议题或合并请求
 
-**工作量估算:** 6 人周
+**类别：** 主线特性
 
-**上游 RFC:** [RFC-006：标量 CinderX JIT](RFC-006-scalar-cinderx-jit.md)
+**工作量估算：** 6 人周
+
+**上游 RFC：** [RFC-006：标量 CinderX JIT](RFC-006-scalar-cinderx-jit.md)
 
 ---
+
+# 0. 实现状态与本期边界
+
+RFC-007 的守卫式标量运行时已进入生产代码：变体键绑定代码、制品、数据模式、标量布局、运行时 ABI、CPU、进程代际、作业/租户和冻结策略；编译使用有界队列、单次并发合并和看门狗超时；缓存具有硬变体/代码预算、活动引用、LRU、资源关闭、负缓存和按键熔断。
+
+提交前内部失败可安全走整函数解释；提交后只允许精确侧退出/去优化或使当前执行尝试失败，不能重放整个 UDF。缓存只存在于工作进程内，不实现跨工作节点或跨集群机器码缓存；向量和批内稀疏退出保持关闭。
 
 # 1. 概述
 
@@ -157,7 +165,7 @@ stateDiagram-v2
 ### 性能与验收
 
 - 使用 RFC-008 主线端到端 Benchmark，比较：A 强制 Interpreter；B Guard + Variant Cache + CinderX JIT。
-- 热身后 Guard Hit 稳态不应引入独立 Python 函数调用；完整主线相对原始基线必须 `>= 1.15x`。
+- 热身后守卫命中稳态不应引入独立 Python 函数调用；单次同环境 A/B 记录实际方向，累计 `1.15x` 只用于后续性能资格。
 - Guard Miss/Deopt/编译失败 Case 的结果与异常 100% 一致；Fallback-only Case 端到端回归不超过 2%。
 - 100 个并发相同 VariantKey 只允许一次实际编译；不同 Key 受线程池上限约束，无无界队列。
 - Explain 必须输出 Key 摘要、Guard Miss 原因、Variant 状态、Compile/Negative Cache 和 Deopt Source。

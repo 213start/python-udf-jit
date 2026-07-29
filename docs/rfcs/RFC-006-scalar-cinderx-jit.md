@@ -1,22 +1,30 @@
 # RFC-006：标量 CinderX JIT
 
-**状态 (Status):** Draft
+**状态：** 标量阶段已实现；向量与批处理未实现
 
-**作者 (Authors):** Python UDF JIT 项目组
+**作者：** Python UDF JIT 项目组
 
-**创建日期 (Created):** 2026-07-17
+**创建日期：** 2026-07-17
 
-**更新日期 (Updated):** 2026-07-17
+**更新日期：** 2026-07-29
 
-**相关 Issue/PR:** 本地方案评审阶段，无外部 Issue/PR
+**本次修订：** 记录五类型标量实现状态，删除 Arrow Lane 和批处理承诺
 
-**类别:** 主线特性
+**相关议题/合并请求：** 本地方案评审阶段，无外部议题或合并请求
 
-**工作量估算:** 10 人周
+**类别：** 主线特性
 
-**上游 RFC:** [RFC-005：数据布局特化](RFC-005-data-layout-specialization.md)
+**工作量估算：** 10 人周
+
+**上游 RFC：** [RFC-005：数据布局特化](RFC-005-data-layout-specialization.md)
 
 ---
+
+# 0. 实现状态与本期边界
+
+RFC-006 的标量提供器已进入生产代码：五种基础标量类型、可空值、算术、比较、选择和局部分支可通过标量槽位进入 CinderX；运行时提供受控数据内建函数、HIR/LIR 证据、强制编译、W^X 代码分配、描述符预检和解释续体。CinderX JIT 与 CPython 解释器仍属于同一个标量 Python 执行提供器。
+
+本期没有 Arrow 批次逐元素执行、非装箱 Arrow Lane、SIMD、列式输出或批处理包装器。Python 3.14.3 路径已验证；生产目标 Python 3.11.6 仍需 CinderX 适配和重新资格验证。
 
 # 1. 概述
 
@@ -40,7 +48,7 @@ CinderX JIT 与 CPython Interpreter 不是两个后端。它们共享同一个 C
 2. 将 Physical Scalar Region Lower 为专用 Bytecode/Intrinsic + Descriptor Table。
 3. 在 CinderX Frontend 新增最小 Data-aware HIR Node 与类型映射，复用现有优化和 Codegen。
 4. 支持 `bool/int32/int64/float32/float64`、Nullable、算术、比较、分支和字段/结果 Load/Store。
-5. 支持 Python Scalar Call 和 Arrow Batch 上逐 Lane Scalar Execution 两种入口。
+5. 支持 Python 单值标量调用入口，并为未来批处理入口保留独立扩展边界。
 6. 保持 CPython 异常、引用、GIL、Frame 和 Deopt 语义。
 7. 为 RFC-009 的 Execution Provider SPI 保持可替换边界。
 
@@ -74,7 +82,6 @@ def nullable(price):
 | 场景 | 执行方式 |
 |---|---|
 | 类型/Layout Guard 命中 | CinderX ScalarExecutable |
-| Arrow Batch 输入 | Runtime 循环 Lane，机器码对每个 Lane 执行标量 Load/Compute/Store |
 | Python Scalar 输入 | Descriptor 指向 Scalar Slot，机器码保持 Python/primitive 边界 |
 | Opaque PythonRegion | InterpreterContinuation 调用原始 Python 片段 |
 | CinderX Deopt | 在同一 CPython Runtime 恢复解释 Frame/Continuation |
@@ -103,18 +110,17 @@ flowchart LR
 | Intrinsic | 语义 |
 |---|---|
 | `GUARD_LAYOUT_DESC id` | 校验 Descriptor ABI/Epoch/类型集合 |
-| `IS_DATA_NULL access_id` | 读取 Scalar Null 状态或 Arrow Validity |
-| `LOAD_DATA_{I32,I64,F32,F64,BOOL}` | 从已验证 Descriptor 当前 Lane Load primitive |
-| `STORE_DATA_{...} result_id` | 写入 Scalar Result 或 Output Column 当前 Lane |
+| `IS_DATA_NULL access_id` | 读取标量槽位的空值状态 |
+| `LOAD_DATA_{I32,I64,F32,F64,BOOL}` | 从已验证标量槽位读取基础值 |
+| `STORE_DATA_{...} result_id` | 把基础值写入标量结果槽位 |
 | `MATERIALIZE_PY access_id` | Side Exit 前按需构造 Python Object |
 | `SIDE_EXIT reason,resume_id` | 转入 Region/Interpreter Continuation |
 
 Bytecode Builder 必须携带 Source Map 和 Deopt State。CinderX Frontend 只在 Descriptor Guard 已支配 Load/Store 时构造 Unboxed HIR；否则拒绝编译。
 
-### 两种标量 Variant
+### 标量变体
 
-1. **Boxed Scalar Variant**：输入/输出为 Python Object/Scalar Slot，适合无法接触 Arrow Batch 的框架边界；主要收益来自 Bytecode Dispatch 消除、类型特化和内联。
-2. **Unboxed Lane Variant**：输入/输出为 Arrow Descriptor 当前 Lane 的 primitive，Runtime 仍逐 Lane 调用同一标量机器码；收益来自对象物化和属性查找消除，但不使用跨 Lane 向量化。
+当前变体的输入和输出都通过 `ScalarSlot` 能力句柄传递。槽位内部按类型保存基础值和可空有效位，必要时在 Python 边界物化对象；不存在 Arrow Lane 或批次变体。
 
 ## 3.2 技术选型
 
@@ -158,8 +164,8 @@ ScalarCompileResult =
 
 - A：RFC-001～005、007～008 启用，但 Scalar Provider 强制 CPython Interpreter。
 - B：同一配置启用 CinderX Scalar JIT，RFC-009～012 全部关闭。
-- 每个支持用例 B 的端到端中位数不得慢于 A；Scalar Suite 几何平均必须有正收益。
-- 完整主线（RFC-001～008）相对原始 Daft UDF 的发布门槛为 `>= 1.15x`，在 RFC-008 统一执行；RFC-006 Explain 必须证明 JIT Hit、Code Size、Compile Time、Lane 模式、Box/Unbox 和 Deopt 次数。
+- 单次同环境 A/B 必须记录实际数值和正确性哈希，不以当前结果阻断功能实现。
+- 累计 `1.15x` 目标只在后续声明性能资格时由 RFC-008 统一执行；RFC-006 解释信息必须证明 JIT 命中、代码大小、编译时间、标量类型、装箱/拆箱和去优化次数。
 - 功能验收对边界值、Null、NaN/Inf、整数溢出、异常、Guard Miss 和 Deopt 与 CPython Oracle 做差分；错误结果为零容忍。
 
 ## 3.4 安全隐私与DFX设计
@@ -209,10 +215,10 @@ CinderX 集成手册新增 Descriptor Intrinsic、Bytecode→HIR 映射、Data-a
 | 风险 | 影响 | 应对 |
 |---|---|---|
 | 修改 CinderX Frontend/Opcode | 维护和上游同步成本 | 最小 Intrinsic 集、版本隔离、生成式映射测试 |
-| 逐 Lane 调用仍有循环开销 | 难达到列式上限 | 本期目标为 1.15x；RFC-010 后续跨 Lane Kernel |
+| 逐标量调用有固定开销 | 短小 UDF 收益受限 | 持续按阶段热点做 A/B；向量内核留待后续 |
 | Deopt State 不完整 | Crash/错误恢复 | 复用 CinderX Frame/Deopt + Region Continuation 差分测试 |
 | Compile 开销大于收益 | 短作业回退 | 热度/成本门禁、缓存、预算、负缓存 |
-| Python 与 Unboxed 数值语义差异 | 错误结果 | 类型白名单、溢出/NaN/异常规则、CPython Oracle |
+| Python 与槽位基础值语义差异 | 错误结果 | 类型白名单、溢出/NaN/异常规则、CPython 基准 |
 
 # 5. 现有技术
 
@@ -238,7 +244,7 @@ CinderX 集成手册新增 Descriptor Intrinsic、Bytecode→HIR 映射、Data-a
 |---|---|
 | Scalar Python Provider | 同时承载 CinderX JIT 与 CPython Interpreter Continuation 的单一执行域 |
 | Boxed Variant | 以 PyObject/Scalar Slot 为数据边界的标量机器码 |
-| Unboxed Lane Variant | 从 Arrow Descriptor 当前 Lane 读写 primitive 的标量机器码 |
+| Scalar Slot Variant | 从受能力保护的标量槽位读写基础值的机器码 |
 
 ## 附录 C：文档更新计划
 

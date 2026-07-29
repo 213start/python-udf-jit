@@ -1,20 +1,22 @@
 # RFC-011：稀疏退出
 
-**状态 (Status):** Draft
+**状态：** 后续提案，本期关闭
 
-**作者 (Authors):** Python UDF JIT 项目组
+**作者：** Python UDF JIT 项目组
 
-**创建日期 (Created):** 2026-07-17
+**创建日期：** 2026-07-17
 
-**更新日期 (Updated):** 2026-07-17
+**更新日期：** 2026-07-29
 
-**相关 Issue/PR:** 本地方案评审阶段，无外部 Issue/PR
+**本次修订：** 明确本提案未实现并在本期关闭
 
-**类别:** 高阶特性
+**相关议题/合并请求：** 本地方案评审阶段，无外部议题或合并请求
 
-**工作量估算:** 4 人周
+**类别：** 后续特性
 
-**上游 RFC:** [RFC-007：守卫式执行](RFC-007-guarded-execution.md)、[RFC-010：列式执行](RFC-010-columnar-execution.md)
+**工作量估算：** 4 人周
+
+**上游 RFC：** [RFC-007：守卫式执行](RFC-007-guarded-execution.md)、[RFC-010：列式执行](RFC-010-columnar-execution.md)
 
 ---
 

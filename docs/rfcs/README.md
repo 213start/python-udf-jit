@@ -1,38 +1,46 @@
 # Python UDF JIT RFC 索引
 
-## 1 编号与范围
+## 1. 状态与范围
 
-RFC 状态仍为 Draft。当前实现只抽取 RFC-001～RFC-008 的一个 fixed-topology scalar vertical slice；“纵向切片通过”不把任一 RFC 的完整状态改为 Done。
+RFC-001～RFC-008 的标量生产代码已经实现，并在提交 `eb97ee8a806f676cda8e1c9f78e6dedb5b501aca` 上通过单元、集成和 blue-98 三容器系统契约。真实三物理节点、Python 3.11.6 生产资格、供应链和首发业务证据尚未完成，因此当前状态是“标量阶段已实现，发布门禁待完成”，不是“发布就绪”。
 
-| RFC | 类别 | 特性 | 工作量（人周） | 状态 |
-|---|---|---|---:|---|
-| [RFC-001](RFC-001-transparent-integration.md) | 主线 | 透明接入 | 4 | Draft |
-| [RFC-002](RFC-002-dynamic-graph-capture.md) | 主线 | 动态图捕获 | 8 | Draft |
-| [RFC-003](RFC-003-semantic-ir-compilation.md) | 主线 | 语义 IR 编译 | 6 | Draft |
-| [RFC-004](RFC-004-portable-artifact.md) | 主线 | 可移植制品 | 4 | Draft |
-| [RFC-005](RFC-005-data-layout-specialization.md) | 主线 | 数据布局特化 | 6 | Draft |
-| [RFC-006](RFC-006-scalar-cinderx-jit.md) | 主线 | 标量 JIT | 10 | Draft |
-| [RFC-007](RFC-007-guarded-execution.md) | 主线 | 守卫式执行 | 6 | Draft |
-| [RFC-008](RFC-008-runtime-governance.md) | 主线 | 运行治理 | 4 | Draft |
-|  |  | **主线合计** | **48** | 目标 `1.15x` |
-| [RFC-009](RFC-009-mixed-execution-providers.md) | 可选 | 混合 Execution Provider | 8 | Draft |
-| [RFC-010](RFC-010-columnar-execution.md) | 高阶 | 列式执行 | 6 | Draft |
-| [RFC-011](RFC-011-sparse-batch-side-exit.md) | 高阶 | 稀疏退出 | 4 | Draft |
-| [RFC-012](RFC-012-equivalent-semantic-rewrite.md) | 高阶 | 等价语义回填 | 6 | Draft |
-|  |  | **高阶合计** | **16** | 相对原始基线增加 `0.15`，最终 `1.30x` |
+RFC-005 和 RFC-006 只完成标量槽位与标量 CinderX 路径。向量、Arrow 和批处理执行未实现；RFC-009～RFC-012 保持关闭。
 
-### 纵向切片证据
+| RFC | 类别 | 特性 | 当前状态 |
+|---|---|---|---|
+| [RFC-001](RFC-001-transparent-integration.md) | 主线 | 透明接入 | 标量阶段已实现，发布门禁待完成 |
+| [RFC-002](RFC-002-dynamic-graph-capture.md) | 主线 | 动态图捕获 | 标量阶段已实现，发布门禁待完成 |
+| [RFC-003](RFC-003-semantic-ir-compilation.md) | 主线 | 语义 IR 编译 | 标量阶段已实现，发布门禁待完成 |
+| [RFC-004](RFC-004-portable-artifact.md) | 主线 | 可移植制品 | 正式格式 1.0 已实现，发布门禁待完成 |
+| [RFC-005](RFC-005-data-layout-specialization.md) | 主线 | 数据布局特化 | 标量槽位已实现；向量/Arrow 未实现 |
+| [RFC-006](RFC-006-scalar-cinderx-jit.md) | 主线 | 标量 JIT | 标量阶段已实现；向量/批处理未实现 |
+| [RFC-007](RFC-007-guarded-execution.md) | 主线 | 守卫式执行 | 标量阶段已实现，发布门禁待完成 |
+| [RFC-008](RFC-008-runtime-governance.md) | 主线 | 运行治理 | 标量阶段已实现，发布门禁待完成 |
+| [RFC-009](RFC-009-mixed-execution-providers.md) | 后续 | 混合执行提供器 | 未实现、关闭 |
+| [RFC-010](RFC-010-columnar-execution.md) | 后续 | 列式执行 | 未实现、关闭 |
+| [RFC-011](RFC-011-sparse-batch-side-exit.md) | 后续 | 稀疏批次侧退出 | 未实现、关闭 |
+| [RFC-012](RFC-012-equivalent-semantic-rewrite.md) | 后续 | 等价语义回填 | 未实现、关闭 |
 
-- 入口：Ray Jobs 在 Head/Driver 启动真实 Driver；Head 逻辑 CPU 为零。
-- 部署资格：两个 Worker 分别完成 Readiness 与生产 Artifact 资格测试，和自然调度覆盖分开报告。
-- 主链：Daft Candidate/Operation → 受限 Capture/Core IR → Inline Artifact → Worker semantic reverify → Scalar Slot → Region-derived CinderX Load/Compile/Hit。
-- 回退：只允许首个语义 Data Load 前 whole-UDF fallback；提交点后异常原样传播，不重放。
-- 证据：Run/Epoch、Container Boot、Node/角色、Manifest、Ray PartitionTask/Attempt 和进程代际必须可连接；任一缺口为失败、停止或 Inconclusive，不用耗时猜路径。
-- 性能：本切片没有 `1.15x` 发布门槛；RFC 中的倍率仍是未来正式性能验收口径。
+## 2. 标量主线证据
 
-执行入口和架构处置见 [标量主线纵向切片复盘](../solutions/architecture-patterns/scalar-mainline-vertical-slice.md)。
+最近一次正式预发布运行：
 
-## 2 依赖关系
+| 项目 | 结果 |
+|---|---|
+| 运行批次 | `u13-20260729-071503-eb97ee8a` |
+| 单元测试 | 297/297，通过，零跳过 |
+| 集成测试 | 59/59，通过，零跳过 |
+| 实时系统测试 | 22/22，通过，零跳过 |
+| RFC 标量契约 | RFC-001～RFC-008 全部通过 |
+| 拓扑 | 一个 Head/Driver 容器、两个 Worker 容器 |
+| 自然 Worker 覆盖 | 2/2 |
+| 每个 Worker | 1 次编译、60 次缓存命中、60 次语义执行 |
+| Head/Driver 数据面 | 0 个事件 |
+| 清理 | 容器、网络、令牌、原始事件和临时防火墙绑定全部移除 |
+
+56 项已执行门禁全部通过。完整配置仍缺少第 57 项 `prerequisite.multi_node_environment`，所以 `release_ready=false`。详细证据见[标量主线正式验收报告](../reports/2026-07-29-mainline-scalar-acceptance.md)。
+
+## 3. 依赖关系
 
 ```mermaid
 flowchart LR
@@ -44,56 +52,60 @@ flowchart LR
     R6 --> R7["RFC-007<br/>守卫式执行"]
     R7 --> R8["RFC-008<br/>运行治理"]
 
-    R3 --> R12["RFC-012<br/>等价语义回填"]
-    R5 --> R9["RFC-009<br/>混合 Provider"]
-    R7 --> R9
-    R5 --> R10["RFC-010<br/>列式执行"]
-    R7 --> R10
-    R10 --> R11["RFC-011<br/>稀疏退出"]
-    R8 -.-> R9
-    R8 -.-> R10
-    R8 -.-> R11
-    R8 -.-> R12
+    R3 -. "后续" .-> R12["RFC-012<br/>等价语义回填"]
+    R5 -. "后续" .-> R9["RFC-009<br/>混合执行提供器"]
+    R5 -. "后续" .-> R10["RFC-010<br/>列式执行"]
+    R10 -. "后续" .-> R11["RFC-011<br/>稀疏批次侧退出"]
 ```
 
-运行治理是横切能力，虚线表示治理契约而非编译数据依赖。等价语义回填在 Driver 侧结束，不依赖 Worker Artifact、布局绑定或 CinderX Codegen。
+运行治理是横切能力。虚线表示已保留但本期没有启用的扩展方向。
 
-## 3 跨 RFC 稳定契约
+## 4. 跨 RFC 稳定契约
 
 | 契约 | 生产方 | 消费方 | 作用 |
 |---|---|---|---|
-| `CaptureRequest` | RFC-001 | RFC-002 | 传递 Callable/Expression、Schema、用途和原始语义引用 |
-| `CaptureIR` | RFC-002 | RFC-003 | 忠实表达 Python CFG、数据依赖、Effect、Graph Break 和 Source Map |
-| `CoreUdfModule` / `SemanticRegionGraph` | RFC-003 | RFC-004、RFC-012 | 提供框架物理布局无关的可验证语义表示 |
-| `PortableUdfArtifact` | RFC-004 | RFC-005 | 跨 Driver/Worker 传递 IR、Guard Template、Region 候选和兼容性信息 |
-| `LayoutDescriptorSet` / `PhysicalRegion` | RFC-005 | RFC-006、RFC-009 | Worker-local 的 Schema/Layout/Ownership 绑定结果 |
-| `ScalarExecutable` / `InterpreterContinuation` | RFC-006 | RFC-007 | Scalar Python Provider 的 JIT 与解释两级执行入口 |
-| `RuntimeVariant` | RFC-007 | RFC-008、RFC-009 | Guard、多版本、Cache、Side Exit 和执行计数 |
-| `ExecutionProvider` 基础契约 | 架构基线、RFC-006 | RFC-009、RFC-010 | 提供 Capability/Compile/Execute 扩展点；主线只实现 Scalar Python |
-| `BoundRegionPlan` / 转换契约 | RFC-009 | Worker Region Executor | 可选地在同一 UDF 中组合多个 Provider |
-| `ColumnarExecuteRequest` / `SpeculativeBatchResult` | RFC-010 | RFC-011 | 定义整批列式执行及 Lane 级退出扩展边界 |
-| `RewriteRequest` / `RewriteDecision` | RFC-012 | RFC-001 Daft Adapter | 在 Driver 构图边界回填 Daft 原生 Expression |
+| `CaptureRequest` | RFC-001 | RFC-002 | 传递可调用对象、表达式、数据模式、用途和原始语义引用 |
+| `CaptureIR` | RFC-002 | RFC-003 | 表达控制流、数据依赖、效应、图中断和源码映射 |
+| `CoreUdfModule` / `SemanticRegionGraph` | RFC-003 | RFC-004 | 提供与框架物理布局无关的可验证语义表示 |
+| `PortableUdfArtifact` | RFC-004 | RFC-005 | 跨驱动节点和工作节点传递 IR、守卫模板、区域候选和兼容信息 |
+| `LayoutDescriptorSet` / `PhysicalRegion` | RFC-005 | RFC-006 | 把逻辑访问绑定到工作进程内的标量槽位 |
+| `ScalarExecutable` / `InterpreterContinuation` | RFC-006 | RFC-007 | 提供 CinderX JIT 与 CPython 解释续体入口 |
+| `RuntimeVariant` | RFC-007 | RFC-008 | 承载守卫、多版本、缓存、侧退出和执行计数 |
+| `PolicySnapshot` / `GovernanceEvent` | RFC-008 | 适配器、编译器、工作节点 | 冻结模式、预算、权限和无业务值诊断 |
 
-## 4 性能验收总口径
+所有跨进程数据结构使用封闭字段和精确版本。当前制品格式 1.0 是首个正式格式；穿刺期对象、未知字段、其他版本和未来版本一律拒绝，不提供兼容或迁移路径。
 
-统一在相同 Daft/Ray 集群、相同 Lance Snapshot、相同并发度、Batch Size、输出 Sink 和依赖版本上进行 A/B。每组预热一次，正式运行五次，使用端到端墙钟时间中位数：
+## 5. 支持矩阵
 
-```text
-speedup = median(T_baseline) / median(T_candidate)
-```
+| 维度 | 已实现 | 未实现 |
+|---|---|---|
+| 类型 | `bool/int32/int64/float32/float64`，含可空值 | 字符串、二进制、列表、结构体、字典编码的 JIT |
+| 语义 | 算术、比较、空值、分支、精确图中断和后缀续接 | 生成器、协程、元类特化和任意对象协议 JIT |
+| 布局 | Python 标量槽位、能力句柄、有效位、所有权和进程代际 | Arrow 列描述符、批次视图、零拷贝和向量内核 |
+| 执行 | 标量 CinderX JIT、解释续体、精确侧退出 | 混合提供器、列式执行和稀疏批次侧退出 |
+| 缓存 | 工作进程内、作业/租户隔离的多变体缓存 | 跨工作节点或跨集群机器码缓存 |
 
-- `baseline`：插件关闭，执行原始 Daft UDF。
-- `mainline`：仅启用 RFC-001～RFC-008，强制关闭 RFC-009～RFC-012；门槛 `speedup >= 1.15`。
-- `advanced`：在 mainline 上启用适用的 RFC-010～RFC-012；门槛 `speedup >= 1.30`，相对原始基线按加法增加 `0.15`。
-- RFC-009 为可选扩展，不是 RFC-010 的前置条件，也不纳入主线或高阶阶段的强制门槛；仅在验收同一 UDF 的跨 Provider 混合时启用。
-- 单项 RFC 的性能验收采用同一端到端方法，但基础设施型 RFC 只要求不引入超过 2% 的稳态回退路径回归；阶段倍率由 RFC-008 和 RFC-010～012 的组合验收统一判定。
+## 6. 性能口径
 
-## 5 版本基线
+性能状态不覆盖功能状态：
 
-| 软件 | 基线 |
+- 每个优化变更至少执行一次同环境 A/B，记录正确性哈希、环境指纹、实际数值、阶段分解和热点。
+- 当前 A/B 只作方向性观测，不要求 ABBA，不进行正式统计结论。
+- 未达到正收益或累计 `1.15x` 不否定已通过的功能契约。
+- 只有另行声明 `performance-qualified` 时，才执行预热、五次交替、中位数、MAD/漂移、回退路径、遥测和 `off` 模式门槛。
+
+FineWeb 200K 文本负载的单次 A/B 结果为 `auto` 慢 2.64%，但数据模式和无序多重集哈希一致。该负载不在当前标量 JIT 支持域，只能作为不支持路径无感和开销方向证据。
+
+## 7. 版本基线
+
+| 软件 | 当前基线 |
 |---|---|
-| Daft | 0.7.2，版本与兼容指纹精确匹配 |
+| 生产目标 Python | 3.11.6，CinderX 适配待完成 |
+| 当前开发验证 Python | 3.14.3 |
+| CinderX | `ac09c68527153b43cc8b4f16f36d9245cb861d12` 与锁定补丁 |
+| Daft | 0.7.2，版本、接口和源码指纹精确匹配 |
 | Ray | 2.55.0 |
-| Lance / pylance | 7.0.0 |
-| PyArrow | 22.x |
-| CPython/CinderX | 由同一交付 Manifest 精确锁定 SOABI、CinderX ABI 和构建标识 |
+| PyArrow | 22.0.0 |
+| Lance | 7.0.0，当前不阻断标量执行 |
+
+部署和回滚步骤见[标量主线部署、灰度与回滚手册](../operations/mainline-deployment-and-rollback.md)。
