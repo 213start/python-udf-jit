@@ -111,6 +111,10 @@ class WorkerPythonRegionContinuationIntegrationTest(unittest.TestCase):
                     wraps=reference_resume_semantic,
                 ) as suffix_call,
             ):
+                adapter.invoke((None, 2.0), {})
+                fallback_calls.clear()
+                output.seek(0)
+                output.truncate(0)
                 self.assertEqual(
                     adapter.invoke((None, 3.0), {}),
                     7.0,
@@ -142,6 +146,9 @@ class WorkerPythonRegionContinuationIntegrationTest(unittest.TestCase):
         self,
     ):
         adapter, provider, report, fallback_calls = self._build_adapter()
+        with contextlib.redirect_stdout(io.StringIO()):
+            adapter.invoke((None, 2.0), {})
+        fallback_calls.clear()
         failure = RegionFailure("opaque-region-failure")
 
         with (

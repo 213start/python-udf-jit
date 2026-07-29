@@ -288,7 +288,7 @@ class MainlineAcceptanceContractTests(unittest.TestCase):
         self.assertNotIn("incomplete", report["gates"].values())
         self.assertEqual(
             set(report["missing_rfcs"]),
-            {f"RFC-{index:03d}" for index in range(7, 9)},
+            {"RFC-008"},
         )
         self.assertEqual(report["rfcs"]["RFC-001"], "pass")
         self.assertEqual(report["rfcs"]["RFC-002"], "pass")
@@ -303,6 +303,7 @@ class MainlineAcceptanceContractTests(unittest.TestCase):
             "RFC-004",
             "RFC-005",
             "RFC-006",
+            "RFC-007",
         ):
             self.assertEqual(
                 {

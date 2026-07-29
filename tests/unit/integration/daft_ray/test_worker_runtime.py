@@ -296,7 +296,7 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
 
         self.assertEqual(provider.compile_count, 1)
-        self.assertEqual(self.calls, [])
+        self.assertEqual(self.calls, [2.0])
         events = self.report.snapshot()
         self.assertEqual(
             [event.decision for event in events if event.stage == "provider"],
@@ -304,7 +304,7 @@ class WorkerRuntimeTest(unittest.TestCase):
         )
         self.assertFalse(any(event.stage == "jit" for event in events))
         self.assertEqual(
-            sum(event.decision == "semantic_execute" for event in events), 2
+            sum(event.decision == "semantic_execute" for event in events), 1
         )
         self.assertEqual(len({event.variant_key for event in events if event.variant_key}), 1)
 
@@ -447,7 +447,10 @@ class WorkerRuntimeTest(unittest.TestCase):
         )
 
     def test_descriptor_preflight_miss_falls_back_once_before_semantic_execute(self):
-        result = self.adapter(_DescriptorMissFactory()).invoke((None, 3.0), {})
+        adapter = self.adapter(_DescriptorMissFactory())
+        adapter.invoke((None, 2.0), {})
+        self.calls.clear()
+        result = adapter.invoke((None, 3.0), {})
 
         self.assertEqual(result, 9.0)
         self.assertEqual(self.calls, [3.0])
@@ -468,6 +471,8 @@ class WorkerRuntimeTest(unittest.TestCase):
 
     def test_post_entry_failure_propagates_without_replay(self):
         adapter = self.adapter(_PostEntryFactory())
+        adapter.invoke((None, 2.0), {})
+        self.calls.clear()
 
         with self.assertRaisesRegex(ArithmeticError, "controlled-post-entry"):
             adapter.invoke((None, 3.0), {})
@@ -482,6 +487,8 @@ class WorkerRuntimeTest(unittest.TestCase):
 
     def test_committed_pre_semantics_error_propagates_without_replay(self):
         adapter = self.adapter(_CommittedPreSemanticsFactory())
+        adapter.invoke((None, 2.0), {})
+        self.calls.clear()
 
         with self.assertRaisesRegex(
             PreSemanticsExecutionError,
@@ -519,6 +526,9 @@ class WorkerRuntimeTest(unittest.TestCase):
                 ),
                 wraps=reference_resume_semantic,
             ) as suffix_call:
+                adapter.invoke((None, 2.0), {})
+                self.calls.clear()
+                region_call.reset_mock()
                 result = adapter.invoke((None, 3.0), {})
 
         self.assertEqual(result, 7.0)

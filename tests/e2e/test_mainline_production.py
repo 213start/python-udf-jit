@@ -566,5 +566,119 @@ class RFC006SystemTests(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(
+    os.environ.get("UDFJIT_LIVE_RAY") == "1",
+    "requires the blue-98 fixed three-node final candidate cluster",
+)
+class RFC007SystemTests(unittest.TestCase):
+    def test_rfc007_system_contract(self):
+        import ray
+        from ray.util.scheduling_strategies import (
+            NodeAffinitySchedulingStrategy,
+        )
+
+        @ray.remote(num_cpus=1)
+        def qualify_variant_runtime(cluster_epoch):
+            import os
+
+            from python_udf_jit.runtime.variant import (
+                VariantKey,
+                WorkerProcessKey,
+            )
+            from python_udf_jit.runtime.variant_manager import (
+                VariantManager,
+                VariantNamespace,
+            )
+
+            context = ray.get_runtime_context()
+            process = WorkerProcessKey(
+                cluster_epoch,
+                context.get_node_id(),
+                context.get_worker_id(),
+                os.getpid(),
+                f"generation-{os.getpid()}",
+            )
+            key = VariantKey(
+                process,
+                "0" * 64,
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                "5" * 64,
+                1,
+                1,
+                1,
+                "cpython-314-aarch64-linux-gnu",
+                ("asimd",),
+            )
+            manager = VariantManager(
+                process=process,
+                namespace=VariantNamespace("live-job", "default"),
+                max_variants=2,
+                max_code_bytes=2,
+            )
+            try:
+                first = manager.resolve(key, lambda: "compiled")
+                manager.drain()
+                second = manager.resolve(key, lambda: "wrong")
+                return {
+                    "first": first.kind,
+                    "second": second.kind,
+                    "node_id": context.get_node_id(),
+                    "process_generation": process.process_generation,
+                }
+            finally:
+                manager.close()
+
+        cluster_epoch = os.environ["UDFJIT_CLUSTER_EPOCH"]
+        ray.init(address="auto")
+        try:
+            workers = sorted(
+                (
+                    node
+                    for node in ray.nodes()
+                    if node.get("Alive")
+                    and node.get("NodeName")
+                    in {"ray-worker-1", "ray-worker-2"}
+                ),
+                key=lambda node: node["NodeName"],
+            )
+            reports = ray.get(
+                [
+                    qualify_variant_runtime.options(
+                        scheduling_strategy=(
+                            NodeAffinitySchedulingStrategy(
+                                node_id=worker["NodeID"],
+                                soft=False,
+                            )
+                        )
+                    ).remote(cluster_epoch)
+                    for worker in workers
+                ]
+            )
+        finally:
+            ray.shutdown()
+
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(
+            {report["node_id"] for report in reports},
+            {worker["NodeID"] for worker in workers},
+        )
+        self.assertEqual(
+            {(report["first"], report["second"]) for report in reports},
+            {("compile_pending", "hit")},
+        )
+        self.assertEqual(
+            len(
+                {
+                    report["process_generation"]
+                    for report in reports
+                }
+            ),
+            2,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

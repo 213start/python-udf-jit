@@ -73,11 +73,11 @@ from python_udf_jit.runtime.layout import (
     SCALAR_SLOT_ABI_VERSION,
 )
 from python_udf_jit.runtime.physicalize import ScalarPhysicalizer
-from python_udf_jit.runtime.variant import (
-    CacheDecision,
-    ProcessVariantCache,
-    VariantKey,
-    WorkerProcessKey,
+from python_udf_jit.runtime.variant import VariantKey, WorkerProcessKey
+from python_udf_jit.runtime.variant_manager import (
+    ResolveKind,
+    VariantManager,
+    VariantNamespace,
 )
 
 
@@ -574,8 +574,26 @@ class WorkerScalarAdapter:
             context.tenant_namespace,
             context.process.process_generation,
         )
-        self._cache: ProcessVariantCache[ScalarProviderVariant] = ProcessVariantCache(
-            context.process
+        self._variants = VariantManager[ScalarProviderVariant](
+            process=context.process,
+            namespace=VariantNamespace(
+                context.run_id,
+                context.tenant_namespace,
+            ),
+            max_variants=8,
+            max_code_bytes=64 * 1024 * 1024,
+            max_compile_workers=1,
+            max_pending_compiles=8,
+            code_size=lambda variant: max(
+                1,
+                int(
+                    getattr(
+                        getattr(variant, "compiled", None),
+                        "code_size",
+                        1,
+                    )
+                ),
+            ),
         )
         self._physicalizer = ScalarPhysicalizer(
             epoch=context.process.cluster_epoch,
@@ -781,79 +799,86 @@ class WorkerScalarAdapter:
 
             def compile_variant() -> ScalarProviderVariant:
                 if continuation is None:
-                    return self._provider_factory.compile(
+                    compiled_variant = self._provider_factory.compile(
                         artifact,
                         key,
                     )
-                return self._provider_factory.compile(
-                    artifact,
-                    key,
-                    continuation=continuation,
-                )
-
-            resolution = self._cache.resolve(
-                key,
-                compile_variant,
-            )
-            if resolution.decision is CacheDecision.MISMATCH or resolution.value is None:
-                raise OuterGuardError(OuterGuardRejectCode.VARIANT_MISMATCH)
-            variant = resolution.value
-            if resolution.decision is CacheDecision.COMPILE:
-                is_production_jit = (
-                    isinstance(self._provider_factory, CinderXScalarProviderFactory)
-                    and variant.execution_mode == "cinderx-jit"
-                    and variant.intrinsic_load_count == 1
+                else:
+                    compiled_variant = self._provider_factory.compile(
+                        artifact,
+                        key,
+                        continuation=continuation,
+                    )
+                production_jit = (
+                    isinstance(
+                        self._provider_factory,
+                        CinderXScalarProviderFactory,
+                    )
+                    and compiled_variant.execution_mode == "cinderx-jit"
+                    and compiled_variant.intrinsic_load_count == 1
                     and (
-                        variant.intrinsic_store_count >= 1
-                        or getattr(
-                            variant,
-                            "continuation_enabled",
-                            False,
-                        )
+                        compiled_variant.intrinsic_store_count >= 1
+                        or compiled_variant.continuation_enabled
                     )
                 )
                 self._emit(
-                    "jit" if is_production_jit else "provider",
+                    "jit" if production_jit else "provider",
                     "compile",
                     (
                         "cinderx_force_compile_verified"
-                        if is_production_jit
+                        if production_jit
                         else "non_jit_test_or_interpreter_compile"
                     ),
                     key=key,
                     artifact_hash=self.carrier.handle.content_sha256,
-                    code_hash=variant.code_hash,
-                    execution_mode=variant.execution_mode,
+                    code_hash=compiled_variant.code_hash,
+                    execution_mode=compiled_variant.execution_mode,
                     attribution=attribution,
                 )
-            else:
-                is_production_jit = (
-                    isinstance(self._provider_factory, CinderXScalarProviderFactory)
-                    and variant.execution_mode == "cinderx-jit"
-                    and variant.intrinsic_load_count == 1
-                    and (
-                        variant.intrinsic_store_count >= 1
-                        or getattr(
-                            variant,
-                            "continuation_enabled",
-                            False,
-                        )
+                return compiled_variant
+
+            resolution = self._variants.resolve(
+                key,
+                compile_variant,
+            )
+            if resolution.kind is not ResolveKind.HIT:
+                return self._fallback(
+                    args,
+                    kwargs,
+                    resolution.reason_code,
+                    key=key,
+                    attribution=attribution,
+                )
+            if resolution.variant is None:
+                raise OuterGuardError(OuterGuardRejectCode.VARIANT_MISMATCH)
+            variant = resolution.variant.value
+            is_production_jit = (
+                isinstance(self._provider_factory, CinderXScalarProviderFactory)
+                and variant.execution_mode == "cinderx-jit"
+                and variant.intrinsic_load_count == 1
+                and (
+                    variant.intrinsic_store_count >= 1
+                    or getattr(
+                        variant,
+                        "continuation_enabled",
+                        False,
                     )
                 )
-                self._emit(
-                    "jit" if is_production_jit else "provider",
-                    "hit",
-                    (
-                        "process_variant_cache"
-                        if is_production_jit
-                        else "non_jit_process_variant_cache"
-                    ),
-                    key=key,
-                    artifact_hash=self.carrier.handle.content_sha256,
-                    code_hash=variant.code_hash,
-                    execution_mode=variant.execution_mode,
-                    attribution=attribution,
-                )
+            )
+            self._emit(
+                "jit" if is_production_jit else "provider",
+                "hit",
+                (
+                    "process_variant_cache"
+                    if is_production_jit
+                    else "non_jit_process_variant_cache"
+                ),
+                key=key,
+                artifact_hash=self.carrier.handle.content_sha256,
+                code_hash=variant.code_hash,
+                execution_mode=variant.execution_mode,
+                attribution=attribution,
+            )
         except OuterGuardError as error:
             return self._fallback(
                 args,
@@ -973,7 +998,7 @@ class WorkerScalarAdapter:
         return result
 
     def close(self) -> None:
-        self._cache.clear(lambda variant: variant.close())
+        self._variants.close(lambda variant: variant.close())
         self._physicalizer.close()
 
 
