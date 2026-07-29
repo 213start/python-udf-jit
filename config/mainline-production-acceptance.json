@@ -159,9 +159,10 @@
       "test_local_branch_and_comparison_publish_exactly_one_result",
       "test_layout_and_semantic_type_mismatch_is_rejected_before_compile",
       "test_rfc006_unit_contract",
-      "test_rfc007_unit_contract"
+      "test_rfc007_unit_contract",
+      "test_rfc008_unit_contract"
       ],
-      "expected_test_count": 285,
+      "expected_test_count": 290,
       "allow_skips": false
     },
     "integration": {
@@ -193,9 +194,10 @@
       "test_both_workers_execute_full_cinderx_scalar_matrix",
       "test_detects_every_writable_executable_permission_form",
       "test_rfc006_integration_contract",
-      "test_rfc007_integration_contract"
+      "test_rfc007_integration_contract",
+      "test_rfc008_integration_contract"
       ],
-      "expected_test_count": 58,
+      "expected_test_count": 59,
       "allow_skips": false
     },
     "live": {
@@ -215,9 +217,10 @@
       "test_rfc004_system_contract",
       "test_rfc005_system_contract",
       "test_rfc006_system_contract",
-      "test_rfc007_system_contract"
+      "test_rfc007_system_contract",
+      "test_rfc008_system_contract"
       ],
-      "expected_test_count": 21,
+      "expected_test_count": 22,
       "allow_skips": false
     }
   },

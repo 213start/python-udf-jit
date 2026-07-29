@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -169,3 +171,23 @@ class PolicySnapshot:
         if not tightened:
             raise PolicyError("policy_not_tightened")
         return candidate
+
+    @property
+    def document(self) -> dict[str, object]:
+        return {
+            "budgets": dict(self.budgets),
+            "mode_ceiling": self.mode_ceiling,
+            "observe_shadow_compile": self.observe_shadow_compile,
+            "provider_flags": dict(self.provider_flags),
+            "rollout_authorized": self.rollout_authorized,
+            "version": self.version,
+        }
+
+    @property
+    def sha256(self) -> str:
+        payload = json.dumps(
+            self.document,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return hashlib.sha256(payload).hexdigest()

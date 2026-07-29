@@ -9,6 +9,9 @@ description = "Transparent scalar Python UDF JIT piercing"
 requires-python = ">=3.11,<3.15"
 dependencies = []
 
+[project.scripts]
+udfjitctl = "python_udf_jit.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

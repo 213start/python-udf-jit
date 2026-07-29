@@ -293,6 +293,7 @@ class WorkerRuntimeTest(unittest.TestCase):
         adapter = self.adapter(provider)
 
         self.assertEqual(adapter.invoke((None, 2.0), {}), 7.0)
+        adapter.drain_compilation()
         self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
 
         self.assertEqual(provider.compile_count, 1)
@@ -449,6 +450,7 @@ class WorkerRuntimeTest(unittest.TestCase):
     def test_descriptor_preflight_miss_falls_back_once_before_semantic_execute(self):
         adapter = self.adapter(_DescriptorMissFactory())
         adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
         self.calls.clear()
         result = adapter.invoke((None, 3.0), {})
 
@@ -472,6 +474,7 @@ class WorkerRuntimeTest(unittest.TestCase):
     def test_post_entry_failure_propagates_without_replay(self):
         adapter = self.adapter(_PostEntryFactory())
         adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
         self.calls.clear()
 
         with self.assertRaisesRegex(ArithmeticError, "controlled-post-entry"):
@@ -488,6 +491,7 @@ class WorkerRuntimeTest(unittest.TestCase):
     def test_committed_pre_semantics_error_propagates_without_replay(self):
         adapter = self.adapter(_CommittedPreSemanticsFactory())
         adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
         self.calls.clear()
 
         with self.assertRaisesRegex(
@@ -527,6 +531,7 @@ class WorkerRuntimeTest(unittest.TestCase):
                 wraps=reference_resume_semantic,
             ) as suffix_call:
                 adapter.invoke((None, 2.0), {})
+                adapter.drain_compilation()
                 self.calls.clear()
                 region_call.reset_mock()
                 result = adapter.invoke((None, 3.0), {})

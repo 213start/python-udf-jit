@@ -680,5 +680,105 @@ class RFC007SystemTests(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(
+    os.environ.get("UDFJIT_LIVE_RAY") == "1",
+    "requires the blue-98 fixed three-node final candidate cluster",
+)
+class RFC008SystemTests(unittest.TestCase):
+    def test_rfc008_system_contract(self):
+        import ray
+        from ray.util.scheduling_strategies import (
+            NodeAffinitySchedulingStrategy,
+        )
+
+        @ray.remote(num_cpus=1)
+        def governance_probe():
+            from python_udf_jit.governance.policy import PolicySnapshot
+            from python_udf_jit.governance.telemetry import (
+                AsyncTelemetry,
+                GovernanceEvent,
+            )
+
+            policy = PolicySnapshot.mainline(
+                version="frozen-live",
+                budgets={
+                    "compile_concurrency": 1,
+                    "variant_limit": 8,
+                },
+                observe_shadow_compile=True,
+                rollout_authorized=True,
+            )
+            delivered = []
+            telemetry = AsyncTelemetry(delivered.append, capacity=4)
+            try:
+                accepted = telemetry.try_emit(
+                    GovernanceEvent(
+                        run_id=os.environ["UDFJIT_RUN_ID"],
+                        job_id="live-job",
+                        tenant_id="default",
+                        policy_sha256=policy.sha256,
+                        stage="execute",
+                        decision="hit",
+                        reason_code="variant_cache_hit",
+                        source_identity="b" * 64,
+                    )
+                )
+                telemetry.flush()
+                counters = telemetry.counters()
+            finally:
+                telemetry.close()
+            return {
+                "accepted": accepted,
+                "backend_failures": counters.backend_failures,
+                "delivered": counters.delivered,
+                "node_id": ray.get_runtime_context().get_node_id(),
+                "policy_sha256": policy.sha256,
+                "vector_enabled": policy.provider_flags["vector"],
+            }
+
+        ray.init(address="auto")
+        try:
+            workers = [
+                node
+                for node in ray.nodes()
+                if node.get("Alive")
+                and node.get("NodeName")
+                in {"ray-worker-1", "ray-worker-2"}
+            ]
+            reports = ray.get(
+                [
+                    governance_probe.options(
+                        scheduling_strategy=(
+                            NodeAffinitySchedulingStrategy(
+                                node_id=worker["NodeID"],
+                                soft=False,
+                            )
+                        )
+                    ).remote()
+                    for worker in workers
+                ]
+            )
+        finally:
+            ray.shutdown()
+
+        by_node = {report["node_id"]: report for report in reports}
+        self.assertEqual(
+            set(by_node),
+            {worker["NodeID"] for worker in workers},
+        )
+        self.assertEqual(
+            {report["policy_sha256"] for report in reports},
+            {reports[0]["policy_sha256"]},
+        )
+        self.assertTrue(all(report["accepted"] for report in reports))
+        self.assertTrue(
+            all(report["delivered"] == 1 for report in reports)
+        )
+        self.assertTrue(
+            all(report["backend_failures"] == 0 for report in reports)
+        )
+        self.assertFalse(any(report["vector_enabled"] for report in reports))
+
+
 if __name__ == "__main__":
     unittest.main()

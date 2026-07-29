@@ -612,6 +612,11 @@ class WorkerScalarAdapter:
     def owner_pid(self) -> int:
         return self.context.process.pid
 
+    def drain_compilation(self) -> None:
+        """Wait at a diagnostic/test safe point, never from the UDF hot path."""
+
+        self._variants.drain()
+
     def _emit(
         self,
         stage: str,
