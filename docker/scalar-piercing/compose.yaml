@@ -23,6 +23,8 @@ x-ray-common: &ray-common
     - source: ray-auth-token
       target: ray-auth-token
       mode: 0400
+  security_opt:
+    - seccomp=./seccomp-wx.json
   networks:
     - scalar-piercing
 

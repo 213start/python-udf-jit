@@ -1,0 +1,24 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": [
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "mmap",
+        "mprotect",
+        "pkey_mprotect"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "args": [
+        {
+          "index": 2,
+          "value": 6,
+          "valueTwo": 6,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    }
+  ]
+}

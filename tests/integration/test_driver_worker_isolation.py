@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -16,6 +17,11 @@ class DriverWorkerIsolationTests(unittest.TestCase):
     def test_compose_exposes_only_loopback_dashboard_jobs_port(self) -> None:
         compose = (ROOT / "docker/scalar-piercing/compose.yaml").read_text()
         entrypoint = (ROOT / "docker/scalar-piercing/entrypoint.sh").read_text()
+        seccomp = json.loads(
+            (
+                ROOT / "docker/scalar-piercing/seccomp-wx.json"
+            ).read_text(encoding="utf-8")
+        )
 
         self.assertIn('version: "3.7"', compose)
         self.assertNotIn("name: scalar-piercing", compose)
@@ -55,6 +61,29 @@ class DriverWorkerIsolationTests(unittest.TestCase):
         self.assertIn("UDFJIT_MANIFEST_PATH:", compose)
         self.assertNotIn("RAY_AUTH_TOKEN:", compose)
         self.assertIn("mode: 0400", compose)
+        self.assertIn("security_opt:", compose)
+        self.assertIn("seccomp=./seccomp-wx.json", compose)
+        self.assertEqual(
+            seccomp,
+            {
+                "defaultAction": "SCMP_ACT_ALLOW",
+                "architectures": ["SCMP_ARCH_AARCH64"],
+                "syscalls": [
+                    {
+                        "names": ["mmap", "mprotect", "pkey_mprotect"],
+                        "action": "SCMP_ACT_ERRNO",
+                        "args": [
+                            {
+                                "index": 2,
+                                "value": 6,
+                                "valueTwo": 6,
+                                "op": "SCMP_CMP_MASKED_EQ",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
         self.assertNotIn("export RAY_AUTH_TOKEN", entrypoint)
         self.assertIn('--node-ip-address="$head_ip"', entrypoint)
         self.assertIn('socket.create_connection((host, 6379), 1)', entrypoint)
