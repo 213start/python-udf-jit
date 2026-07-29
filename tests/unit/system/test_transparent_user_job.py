@@ -91,11 +91,12 @@ class TransparentUserJobContractTests(unittest.TestCase):
             DIAGNOSTIC_JOB_PATH.read_text(encoding="utf-8"),
             filename=str(DIAGNOSTIC_JOB_PATH),
         )
-        function = next(
-            node
+        functions = {
+            node.name: node
             for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_diagnostic_job"
-        )
+            if isinstance(node, ast.FunctionDef)
+        }
+        function = functions["_diagnostic_job"]
         calls = [
             node
             for node in ast.walk(function)
@@ -107,12 +108,37 @@ class TransparentUserJobContractTests(unittest.TestCase):
         install_lines = [
             node.lineno for node in calls if node.func.id == "_install_hooks"
         ]
+        evidence_lines = [
+            node.lineno
+            for node in calls
+            if node.func.id == "_runtime_events_since"
+        ]
 
-        self.assertTrue(install_lines, "diagnostic probe must restore hooks afterward")
         self.assertTrue(
-            all(line > udf_use_line for line in install_lines),
+            install_lines or evidence_lines,
+            "diagnostic probe must restore hooks afterward",
+        )
+        self.assertTrue(
+            all(
+                line > udf_use_line
+                for line in (*install_lines, *evidence_lines)
+            ),
             "supported path may only use hooks installed by process bootstrap",
         )
+
+        if evidence_lines:
+            helper_calls = [
+                node
+                for node in ast.walk(functions["_runtime_events_since"])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+            ]
+            self.assertTrue(
+                any(node.func.id == "_uninstall_hooks" for node in helper_calls)
+            )
+            self.assertTrue(
+                any(node.func.id == "_install_hooks" for node in helper_calls)
+            )
 
     def test_exception_observation_is_value_free_and_stable(self) -> None:
         error = RuntimeError(
