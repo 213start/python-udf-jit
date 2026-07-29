@@ -29,6 +29,7 @@ class DriverWorkerCarrierProbeTests(unittest.TestCase):
         self.assertFalse(state.finalized)
         self.assertEqual("placeholder", state.handle.kind)
         document = json.loads(state.to_bytes())
+        self.assertEqual(document["policy_sha256"], state.policy.sha256)
         cases = {}
         for name, value in (
             ("schema_version", "1"),
@@ -46,6 +47,9 @@ class DriverWorkerCarrierProbeTests(unittest.TestCase):
         changed_extra = dict(document)
         changed_extra["future_field"] = None
         cases["unknown_field"] = changed_extra
+        changed_policy = dict(document)
+        changed_policy["policy_sha256"] = "b" * 64
+        cases["policy_hash"] = changed_policy
 
         for name, changed in cases.items():
             with self.subTest(name=name):

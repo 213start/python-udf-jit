@@ -106,6 +106,12 @@ class CompiledScalarFunction:
 
         return self._function
 
+    @property
+    def code_size(self) -> int:
+        """Exact serialized size of the generated Worker-local code object."""
+
+        return len(marshal.dumps(self.code_object))
+
     def __reduce__(self) -> object:
         raise TypeError("compiled scalar functions are worker-process-local")
 

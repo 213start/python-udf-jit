@@ -22,6 +22,7 @@ from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.compiler.region import form_semantic_region_graph
 from python_udf_jit.compiler.reference import reference_resume_semantic
 from python_udf_jit.diagnostics.report import InMemoryRuntimeReport
+from python_udf_jit.governance.policy import PolicySnapshot
 from python_udf_jit.integration.daft_ray.carrier import (
     InlineArtifactHandle,
     ProductionCarrierState,
@@ -219,6 +220,7 @@ class _PostEntryVariant:
     execution_mode = "python-interpreter-test-double"
     intrinsic_load_count = 0
     code_hash = "f" * 64
+    code_size = 1
 
     def execute(self, _value, *, boundary):
         boundary.commit()
@@ -297,6 +299,7 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
 
         self.assertEqual(provider.compile_count, 1)
+        self.assertGreater(adapter._variants.budget_state()[1], 1)
         self.assertEqual(self.calls, [2.0])
         events = self.report.snapshot()
         self.assertEqual(
@@ -334,6 +337,57 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(attribution, ("task-live", ""))
         self.assertEqual(fake_ray.get_runtime_context.call_count, 2)
         self.assertEqual(runtime.get_task_id.call_count, 2)
+
+    def test_policy_hash_and_job_namespace_bind_worker_managers(self):
+        drifted = PolicySnapshot.mainline(
+            version="drifted",
+            budgets={
+                "code_bytes": 1024 * 1024,
+                "compile_concurrency": 1,
+                "variant_limit": 2,
+            },
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "worker_policy_hash_mismatch",
+        ):
+            WorkerScalarAdapter(
+                candidate_id="candidate-a",
+                original_callable=self.original,
+                carrier=self.carrier,
+                logical_schema="{'value': 'float64'}",
+                context=dataclasses.replace(
+                    self.context,
+                    policy=drifted,
+                ),
+            )
+
+        first = WorkerScalarAdapter(
+            candidate_id="candidate-a",
+            original_callable=self.original,
+            carrier=self.carrier,
+            logical_schema="{'value': 'float64'}",
+            context=dataclasses.replace(self.context, run_id="job-one"),
+        )
+        second = WorkerScalarAdapter(
+            candidate_id="candidate-a",
+            original_callable=self.original,
+            carrier=self.carrier,
+            logical_schema="{'value': 'float64'}",
+            context=dataclasses.replace(self.context, run_id="job-two"),
+        )
+        try:
+            self.assertIsNot(first._variants, second._variants)
+            self.assertEqual(
+                first._variants.budget_limits(),
+                (
+                    self.carrier.policy.budgets["variant_limit"],
+                    self.carrier.policy.budgets["code_bytes"],
+                ),
+            )
+        finally:
+            first.close()
+            second.close()
 
     def test_each_invoke_freezes_one_ray_task_identity_for_all_events(self):
         provider = _LocalProviderFactory()
@@ -438,11 +492,21 @@ class WorkerRuntimeTest(unittest.TestCase):
 
     def test_compile_failure_is_pre_semantics_and_calls_original_once(self):
         provider = _FailingProviderFactory()
-        result = self.adapter(provider).invoke((None, 3.0), {})
+        adapter = self.adapter(provider)
+        first = adapter.invoke((None, 3.0), {})
+        adapter.drain_compilation()
+        self.calls.clear()
+        second = adapter.invoke((None, 3.0), {})
 
-        self.assertEqual(result, 9.0)
+        self.assertEqual((first, second), (9.0, 9.0))
         self.assertEqual(provider.compile_count, 1)
         self.assertEqual(self.calls, [3.0])
+        self.assertTrue(
+            any(
+                event.reason_code == "negative_cache"
+                for event in self.report.snapshot()
+            )
+        )
         self.assertFalse(
             any(event.decision == "semantic_execute" for event in self.report.snapshot())
         )
@@ -660,6 +724,7 @@ class WorkerRuntimeTest(unittest.TestCase):
                 len(payload),
                 payload,
             ),
+            policy=self.context.policy,
         )
         provider = _LocalProviderFactory()
 
@@ -715,13 +780,13 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(provider.compile_count, 0)
         self.assertTrue(
             any(
-                event.reason_code
-                == (
-                    "artifact_load_rejected:dependency_missing:"
-                    "python-udf-jit-definitely-missing"
-                )
+                event.reason_code == "artifact_load_rejected"
                 for event in self.report.snapshot()
             )
+        )
+        self.assertNotIn(
+            "python-udf-jit-definitely-missing",
+            repr(self.report.snapshot()),
         )
 
 

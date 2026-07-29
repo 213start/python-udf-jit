@@ -61,6 +61,17 @@ _REASON_CODES = frozenset(
         "func_call_fingerprint_mismatch",
         "u2_fallback_only",
         "descriptor_epoch_mismatch",
+        "artifact_load_rejected",
+        "circuit_open",
+        "compile_capacity_exhausted",
+        "compile_pool_closed",
+        "continuation_proof_incomplete",
+        "negative_cache",
+        "physicalization_failed",
+        "post_entry_failure",
+        "pre_semantics_failure",
+        "variant_unavailable",
+        "worker_process_mismatch",
     }
 )
 _ROLES = frozenset({"ray-head-driver", "ray-worker-1", "ray-worker-2"})

@@ -6,6 +6,35 @@ import os
 import unittest
 
 
+def _live_scalar(value: float) -> float:
+    return value * 2.0 + 3.0
+
+
+def _live_carrier(policy):
+    from python_udf_jit.compiler.capture import CaptureRequest, capture
+    from python_udf_jit.compiler.pipeline import compile_semantic
+    from python_udf_jit.integration.daft_ray.carrier import (
+        ProductionCarrierState,
+    )
+    from python_udf_jit.protocol.artifact import build_artifact
+    from python_udf_jit.protocol.codec import encode_artifact
+
+    captured = capture(CaptureRequest(_live_scalar))
+    compiled = compile_semantic(captured)
+    artifact = encode_artifact(
+        build_artifact(
+            compiled.core_module,
+            compiled.region_graph,
+            captured.fallback_identity,
+        )
+    )
+    return ProductionCarrierState.placeholder(
+        "live-scalar",
+        hashlib.sha256(b"live-mainline-manifest").hexdigest(),
+        policy=policy,
+    ).finalize(artifact)
+
+
 @unittest.skipUnless(
     os.environ.get("UDFJIT_LIVE_RAY") == "1",
     "requires the blue-98 fixed three-node final candidate cluster",
@@ -577,61 +606,70 @@ class RFC007SystemTests(unittest.TestCase):
             NodeAffinitySchedulingStrategy,
         )
 
+        from python_udf_jit.governance.policy import PolicySnapshot
+
+        policy = PolicySnapshot.mainline(
+            version="rfc007-live",
+            budgets={
+                "code_bytes": 8 * 1024 * 1024,
+                "compile_concurrency": 1,
+                "variant_limit": 8,
+            },
+            rollout_authorized=True,
+        )
+        carrier = _live_carrier(policy)
+
         @ray.remote(num_cpus=1)
-        def qualify_variant_runtime(cluster_epoch):
-            import os
-
-            from python_udf_jit.runtime.variant import (
-                VariantKey,
-                WorkerProcessKey,
+        def qualify_variant_runtime(carrier_state):
+            from python_udf_jit.diagnostics.report import (
+                InMemoryRuntimeReport,
             )
-            from python_udf_jit.runtime.variant_manager import (
-                VariantManager,
-                VariantNamespace,
+            from python_udf_jit.integration.daft_ray.worker import (
+                WorkerRuntimeContext,
+                WorkerScalarAdapter,
             )
 
-            context = ray.get_runtime_context()
-            process = WorkerProcessKey(
-                cluster_epoch,
-                context.get_node_id(),
-                context.get_worker_id(),
-                os.getpid(),
-                f"generation-{os.getpid()}",
+            runtime = ray.get_runtime_context()
+            report = InMemoryRuntimeReport()
+            context = WorkerRuntimeContext.from_environment(
+                policy=carrier_state.policy,
             )
-            key = VariantKey(
-                process,
-                "0" * 64,
-                "1" * 64,
-                "2" * 64,
-                "3" * 64,
-                "4" * 64,
-                "5" * 64,
-                1,
-                1,
-                1,
-                "cpython-314-aarch64-linux-gnu",
-                ("asimd",),
-            )
-            manager = VariantManager(
-                process=process,
-                namespace=VariantNamespace("live-job", "default"),
-                max_variants=2,
-                max_code_bytes=2,
+            adapter = WorkerScalarAdapter(
+                candidate_id="live-scalar",
+                original_callable=_live_scalar,
+                carrier=carrier_state,
+                logical_schema='{"value":"float64"}',
+                context=context,
+                event_sink=report,
             )
             try:
-                first = manager.resolve(key, lambda: "compiled")
-                manager.drain()
-                second = manager.resolve(key, lambda: "wrong")
+                first = adapter.invoke((2.0,), {})
+                adapter.drain_compilation()
+                second = adapter.invoke((4.0,), {})
+                events = report.snapshot()
                 return {
-                    "first": first.kind,
-                    "second": second.kind,
-                    "node_id": context.get_node_id(),
-                    "process_generation": process.process_generation,
+                    "code_bytes": adapter._variants.budget_state()[1],
+                    "compile_count": sum(
+                        event.decision == "compile" for event in events
+                    ),
+                    "first": first,
+                    "hit_count": sum(
+                        event.decision == "hit" for event in events
+                    ),
+                    "node_id": runtime.get_node_id(),
+                    "policy_sha256": adapter._key.policy_sha256,
+                    "process_generation": (
+                        context.process.process_generation
+                    ),
+                    "second": second,
+                    "semantic_execute_count": sum(
+                        event.decision == "semantic_execute"
+                        for event in events
+                    ),
                 }
             finally:
-                manager.close()
+                adapter.close()
 
-        cluster_epoch = os.environ["UDFJIT_CLUSTER_EPOCH"]
         ray.init(address="auto")
         try:
             workers = sorted(
@@ -653,7 +691,7 @@ class RFC007SystemTests(unittest.TestCase):
                                 soft=False,
                             )
                         )
-                    ).remote(cluster_epoch)
+                    ).remote(carrier)
                     for worker in workers
                 ]
             )
@@ -667,7 +705,22 @@ class RFC007SystemTests(unittest.TestCase):
         )
         self.assertEqual(
             {(report["first"], report["second"]) for report in reports},
-            {("compile_pending", "hit")},
+            {(7.0, 11.0)},
+        )
+        self.assertTrue(
+            all(report["compile_count"] == 1 for report in reports)
+        )
+        self.assertTrue(all(report["hit_count"] == 1 for report in reports))
+        self.assertTrue(
+            all(
+                report["semantic_execute_count"] == 1
+                for report in reports
+            )
+        )
+        self.assertTrue(all(report["code_bytes"] > 1 for report in reports))
+        self.assertEqual(
+            {report["policy_sha256"] for report in reports},
+            {policy.sha256},
         )
         self.assertEqual(
             len(
@@ -691,23 +744,51 @@ class RFC008SystemTests(unittest.TestCase):
             NodeAffinitySchedulingStrategy,
         )
 
+        from python_udf_jit.governance.policy import PolicySnapshot
+
+        policy = PolicySnapshot.mainline(
+            version="rfc008-live",
+            budgets={
+                "code_bytes": 8 * 1024 * 1024,
+                "compile_concurrency": 1,
+                "variant_limit": 8,
+            },
+            observe_shadow_compile=True,
+            rollout_authorized=True,
+        )
+        carrier = _live_carrier(policy)
+
         @ray.remote(num_cpus=1)
-        def governance_probe():
-            from python_udf_jit.governance.policy import PolicySnapshot
+        def governance_probe(carrier_state):
+            from python_udf_jit.diagnostics.report import (
+                InMemoryRuntimeReport,
+            )
             from python_udf_jit.governance.telemetry import (
                 AsyncTelemetry,
                 GovernanceEvent,
             )
-
-            policy = PolicySnapshot.mainline(
-                version="frozen-live",
-                budgets={
-                    "compile_concurrency": 1,
-                    "variant_limit": 8,
-                },
-                observe_shadow_compile=True,
-                rollout_authorized=True,
+            from python_udf_jit.integration.daft_ray.worker import (
+                WorkerRuntimeContext,
+                WorkerScalarAdapter,
             )
+
+            runtime_report = InMemoryRuntimeReport()
+            context = WorkerRuntimeContext.from_environment(
+                policy=carrier_state.policy,
+            )
+            adapter = WorkerScalarAdapter(
+                candidate_id="live-scalar",
+                original_callable=_live_scalar,
+                carrier=carrier_state,
+                logical_schema='{"value":"float64"}',
+                context=context,
+                event_sink=runtime_report,
+            )
+            first = adapter.invoke((2.0,), {})
+            adapter.drain_compilation()
+            second = adapter.invoke((4.0,), {})
+            key = adapter._key
+            runtime_events = runtime_report.snapshot()
             delivered = []
             telemetry = AsyncTelemetry(delivered.append, capacity=4)
             try:
@@ -716,26 +797,41 @@ class RFC008SystemTests(unittest.TestCase):
                         run_id=os.environ["UDFJIT_RUN_ID"],
                         job_id="live-job",
                         tenant_id="default",
-                        policy_sha256=policy.sha256,
+                        policy_sha256=carrier_state.policy.sha256,
                         stage="execute",
                         decision="hit",
                         reason_code="variant_cache_hit",
-                        source_identity="b" * 64,
-                        artifact_sha256="c" * 64,
-                        variant_sha256="d" * 64,
+                        source_identity=key.callable_code_sha256,
+                        artifact_sha256=key.artifact_content_sha256,
+                        variant_sha256=key.sha256,
                     )
                 )
                 telemetry.flush()
                 counters = telemetry.counters()
             finally:
                 telemetry.close()
+                adapter.close()
             return {
                 "accepted": accepted,
                 "backend_failures": counters.backend_failures,
+                "compile_count": sum(
+                    event.decision == "compile"
+                    for event in runtime_events
+                ),
                 "delivered": counters.delivered,
+                "first": first,
+                "hit_count": sum(
+                    event.decision == "hit" for event in runtime_events
+                ),
                 "node_id": ray.get_runtime_context().get_node_id(),
-                "policy_sha256": policy.sha256,
-                "vector_enabled": policy.provider_flags["vector"],
+                "policy_sha256": key.policy_sha256,
+                "second": second,
+                "variant_limit": adapter.context.policy.budgets[
+                    "variant_limit"
+                ],
+                "vector_enabled": adapter.context.policy.provider_flags[
+                    "vector"
+                ],
             }
 
         ray.init(address="auto")
@@ -756,7 +852,7 @@ class RFC008SystemTests(unittest.TestCase):
                                 soft=False,
                             )
                         )
-                    ).remote()
+                    ).remote(carrier)
                     for worker in workers
                 ]
             )
@@ -770,7 +866,7 @@ class RFC008SystemTests(unittest.TestCase):
         )
         self.assertEqual(
             {report["policy_sha256"] for report in reports},
-            {reports[0]["policy_sha256"]},
+            {policy.sha256},
         )
         self.assertTrue(all(report["accepted"] for report in reports))
         self.assertTrue(
@@ -778,6 +874,19 @@ class RFC008SystemTests(unittest.TestCase):
         )
         self.assertTrue(
             all(report["backend_failures"] == 0 for report in reports)
+        )
+        self.assertTrue(
+            all(
+                (
+                    report["first"],
+                    report["second"],
+                    report["compile_count"],
+                    report["hit_count"],
+                    report["variant_limit"],
+                )
+                == (7.0, 11.0, 1, 1, 8)
+                for report in reports
+            )
         )
         self.assertFalse(any(report["vector_enabled"] for report in reports))
 

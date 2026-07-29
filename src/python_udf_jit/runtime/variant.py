@@ -48,8 +48,9 @@ class VariantKey:
     scalar_slot_abi: int
     cpython_cinderx_soabi: str
     cpu_features: tuple[str, ...]
+    policy_version: str
+    policy_sha256: str
     provider_id: str = "scalar-python-cinderx"
-    policy_version: str = "scalar-mainline-v1"
 
     def __post_init__(self) -> None:
         if not isinstance(self.process, WorkerProcessKey):
@@ -61,6 +62,7 @@ class VariantKey:
             "callable_code_sha256",
             "artifact_manifest_sha256",
             "experiment_manifest_sha256",
+            "policy_sha256",
         ):
             value = _require_text(getattr(self, field), field)
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
@@ -92,6 +94,7 @@ class VariantKey:
             "experiment_manifest_sha256": self.experiment_manifest_sha256,
             "node_id": self.process.node_id,
             "pid": self.process.pid,
+            "policy_sha256": self.policy_sha256,
             "policy_version": self.policy_version,
             "process_generation": self.process.process_generation,
             "provider_id": self.provider_id,

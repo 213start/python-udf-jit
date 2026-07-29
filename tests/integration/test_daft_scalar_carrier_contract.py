@@ -68,6 +68,10 @@ print(base64.b64encode(wrapper.scalar_call_view().to_bytes()).decode("ascii"))
         self.assertEqual(actual, expected)
         document = json.loads(actual)
         self.assertEqual(document["handle_kind"], "inline-artifact")
+        self.assertEqual(
+            document["policy_sha256"],
+            wrapper.carrier.policy.sha256,
+        )
         self.assertNotIn("payload", document)
         self.assertFalse(
             any(

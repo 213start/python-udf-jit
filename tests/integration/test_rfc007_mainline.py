@@ -21,13 +21,15 @@ from python_udf_jit.runtime.variant_manager import VariantManager, VariantNamesp
 process = WorkerProcessKey("epoch", "node", "worker", os.getpid(), "fresh")
 key = VariantKey(
     process, "0" * 64, "1" * 64, "2" * 64, "3" * 64, "4" * 64,
-    "5" * 64, 1, 1, 1, "cpython-314-aarch64-linux-gnu", ("asimd",)
+    "5" * 64, 1, 1, 1, "cpython-314-aarch64-linux-gnu", ("asimd",),
+    "scalar-mainline", "6" * 64
 )
 manager = VariantManager(
     process=process,
     namespace=VariantNamespace("job-a", "tenant-a"),
     max_variants=2,
     max_code_bytes=2,
+    code_size=lambda _value: 1,
 )
 try:
     first = manager.resolve(key, lambda: "fresh-code")

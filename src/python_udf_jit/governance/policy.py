@@ -16,6 +16,36 @@ _ADVANCED_FLAGS = (
     "rfc_011",
     "rfc_012",
 )
+DEFAULT_RUNTIME_BUDGETS = MappingProxyType({
+    "circuit_failure_threshold": 3,
+    "circuit_reset_ms": 30_000,
+    "code_bytes": 64 * 1024 * 1024,
+    "compile_concurrency": 1,
+    "compile_pending": 32,
+    "compile_timeout_ms": 30_000,
+    "namespace_idle_ms": 300_000,
+    "negative_cache_entries": 1024,
+    "negative_ttl_ms": 30_000,
+    "process_code_bytes": 256 * 1024 * 1024,
+    "process_namespace_limit": 32,
+    "process_variant_limit": 256,
+    "variant_limit": 64,
+})
+_BUDGET_RANGES = {
+    "circuit_failure_threshold": (1, 100),
+    "circuit_reset_ms": (1, 3_600_000),
+    "code_bytes": (1, 4 * 1024 * 1024 * 1024),
+    "compile_concurrency": (1, 64),
+    "compile_pending": (0, 4096),
+    "compile_timeout_ms": (1, 3_600_000),
+    "namespace_idle_ms": (1, 86_400_000),
+    "negative_cache_entries": (1, 1_000_000),
+    "negative_ttl_ms": (1, 86_400_000),
+    "process_code_bytes": (1, 16 * 1024 * 1024 * 1024),
+    "process_namespace_limit": (1, 4096),
+    "process_variant_limit": (1, 1_000_000),
+    "variant_limit": (1, 100_000),
+}
 
 
 class PolicyError(ValueError):
@@ -31,16 +61,24 @@ def _text(value: object, field: str) -> str:
 def _freeze_budgets(values: Mapping[str, int]) -> Mapping[str, int]:
     if not isinstance(values, Mapping) or not values:
         raise PolicyError("budgets_invalid")
-    frozen: dict[str, int] = {}
+    frozen = dict(DEFAULT_RUNTIME_BUDGETS)
     for name, value in values.items():
         if (
             not isinstance(name, str)
             or not name
             or type(value) is not int
-            or value < 0
+            or name not in _BUDGET_RANGES
         ):
             raise PolicyError("budget_invalid")
+        lower, upper = _BUDGET_RANGES[name]
+        if not lower <= value <= upper:
+            raise PolicyError("budget_invalid")
         frozen[name] = value
+    if (
+        frozen["variant_limit"] > frozen["process_variant_limit"]
+        or frozen["code_bytes"] > frozen["process_code_bytes"]
+    ):
+        raise PolicyError("namespace_budget_exceeds_process_budget")
     return MappingProxyType(dict(sorted(frozen.items())))
 
 
@@ -52,7 +90,12 @@ def _freeze_flags(values: Mapping[str, bool]) -> Mapping[str, bool]:
         **{name: False for name in _ADVANCED_FLAGS},
     }
     for name, enabled in values.items():
-        if not isinstance(name, str) or not name or type(enabled) is not bool:
+        if (
+            not isinstance(name, str)
+            or not name
+            or name not in flags
+            or type(enabled) is not bool
+        ):
             raise PolicyError("provider_flag_invalid")
         flags[name] = enabled
     if any(flags.get(name) is True for name in _ADVANCED_FLAGS):
@@ -172,6 +215,32 @@ class PolicySnapshot:
             raise PolicyError("policy_not_tightened")
         return candidate
 
+    @classmethod
+    def from_document(cls, document: object) -> PolicySnapshot:
+        expected = {
+            "budgets",
+            "mode_ceiling",
+            "observe_shadow_compile",
+            "provider_flags",
+            "rollout_authorized",
+            "version",
+        }
+        if not isinstance(document, dict) or set(document) != expected:
+            raise PolicyError("policy_document_invalid")
+        try:
+            return cls(
+                version=document["version"],
+                mode_ceiling=document["mode_ceiling"],
+                budgets=document["budgets"],
+                provider_flags=document["provider_flags"],
+                observe_shadow_compile=document[
+                    "observe_shadow_compile"
+                ],
+                rollout_authorized=document["rollout_authorized"],
+            )
+        except (KeyError, TypeError, PolicyError) as error:
+            raise PolicyError("policy_document_invalid") from error
+
     @property
     def document(self) -> dict[str, object]:
         return {
@@ -191,3 +260,12 @@ class PolicySnapshot:
             separators=(",", ":"),
         ).encode("ascii")
         return hashlib.sha256(payload).hexdigest()
+
+    def __reduce__(self) -> object:
+        return (type(self).from_document, (self.document,))
+
+
+DEFAULT_MAINLINE_POLICY = PolicySnapshot.mainline(
+    version="scalar-mainline",
+    budgets=DEFAULT_RUNTIME_BUDGETS,
+)

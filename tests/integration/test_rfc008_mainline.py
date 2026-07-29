@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import sys
@@ -7,6 +8,9 @@ import unittest
 
 from python_udf_jit.governance.modes import RuntimeMode, resolve_mode
 from python_udf_jit.governance.policy import PolicySnapshot
+from python_udf_jit.integration.daft_ray.carrier import (
+    ProductionCarrierState,
+)
 from tests.integration.test_driver_worker_artifact_roundtrip import (
     worker_environment,
 )
@@ -20,23 +24,32 @@ class RFC008IntegrationTests(unittest.TestCase):
             observe_shadow_compile=True,
             rollout_authorized=True,
         )
+        carrier = ProductionCarrierState.placeholder(
+            "candidate-policy",
+            "a" * 64,
+            policy=policy,
+        )
         script = r"""
+import base64
 import json
-from python_udf_jit.governance.policy import PolicySnapshot
-policy = PolicySnapshot.mainline(
-    version="frozen-a",
-    budgets={"variant_limit": 8, "compile_concurrency": 1},
-    observe_shadow_compile=True,
-    rollout_authorized=True,
+import os
+from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
+carrier = ProductionCarrierState.from_bytes(
+    base64.b64decode(os.environ["UDFJIT_POLICY_CARRIER"])
 )
+policy = carrier.policy
 print(json.dumps({"document": policy.document, "sha256": policy.sha256}, sort_keys=True))
 """
+        environment = worker_environment()
+        environment["UDFJIT_POLICY_CARRIER"] = base64.b64encode(
+            carrier.to_bytes()
+        ).decode("ascii")
         completed = subprocess.run(
             [sys.executable, "-c", script],
             check=False,
             capture_output=True,
             text=True,
-            env=worker_environment(),
+            env=environment,
             timeout=30,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)

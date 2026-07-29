@@ -8,7 +8,9 @@ import platform
 import secrets
 import sysconfig
 import threading
+import time
 import types
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -28,6 +30,10 @@ from python_udf_jit.diagnostics.report import (
     DEFAULT_RUNTIME_REPORT,
     RuntimeEvent,
     RuntimeEventSink,
+)
+from python_udf_jit.governance.policy import (
+    DEFAULT_MAINLINE_POLICY,
+    PolicySnapshot,
 )
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
 from python_udf_jit.protocol.artifact import PortableUdfArtifact
@@ -74,6 +80,7 @@ from python_udf_jit.runtime.layout import (
     SCALAR_SLOT_ABI_VERSION,
 )
 from python_udf_jit.runtime.physicalize import ScalarPhysicalizer
+from python_udf_jit.runtime.process_governor import ProcessVariantGovernor
 from python_udf_jit.runtime.variant import VariantKey, WorkerProcessKey
 from python_udf_jit.runtime.variant_manager import (
     ResolveKind,
@@ -84,9 +91,22 @@ from python_udf_jit.runtime.variant_manager import (
 
 _PROCESS_GENERATION = secrets.token_hex(16)
 _PROCESS_ARTIFACT_LOADER = ArtifactLoader()
+
+
+@dataclass
+class _ProcessManagerEntry:
+    manager: VariantManager[ScalarProviderVariant]
+    last_used_ns: int
+    clients: int
+
+
 _PROCESS_VARIANT_MANAGERS: dict[
-    tuple[WorkerProcessKey, VariantNamespace],
-    VariantManager[ScalarProviderVariant],
+    tuple[WorkerProcessKey, VariantNamespace, str],
+    _ProcessManagerEntry,
+] = {}
+_PROCESS_VARIANT_GOVERNORS: dict[
+    tuple[WorkerProcessKey, str],
+    ProcessVariantGovernor,
 ] = {}
 _PROCESS_VARIANT_MANAGERS_LOCK = threading.Lock()
 _CONTINUATION_LIVE_KIND = {
@@ -96,10 +116,93 @@ _CONTINUATION_LIVE_KIND = {
     FLOAT32_SCALAR_TYPE: LiveValueKind.FLOAT32,
     FLOAT64_SCALAR_TYPE: LiveValueKind.FLOAT64,
 }
+_STABLE_RUNTIME_REASON_CODES = frozenset(
+    {
+        "artifact_load_rejected",
+        "artifact_mismatch",
+        "callable_mismatch",
+        "cinderx_force_compile_verified",
+        "circuit_open",
+        "compile_capacity_exhausted",
+        "compile_inflight",
+        "compile_pool_closed",
+        "compile_submitted",
+        "continuation_proof_incomplete",
+        "cpu_feature_mismatch",
+        "descriptor_epoch_mismatch",
+        "input_shape_mismatch",
+        "input_type_mismatch",
+        "invalid_context",
+        "late_descriptor_miss",
+        "manifest_mismatch",
+        "negative_cache",
+        "non_jit_process_variant_cache",
+        "non_jit_test_or_interpreter_compile",
+        "physicalization_failed",
+        "post_entry_failure",
+        "pre_semantics_failure",
+        "process_mismatch",
+        "process_variant_cache",
+        "schema_mismatch",
+        "semantic_mismatch",
+        "success",
+        "target_python_mismatch",
+        "target_soabi_mismatch",
+        "variant_mismatch",
+        "variant_unavailable",
+        "verified",
+        "worker_process_mismatch",
+    }
+)
+
+
+def _stable_runtime_reason(reason_code: str) -> str:
+    if reason_code in _STABLE_RUNTIME_REASON_CODES:
+        return reason_code
+    return "pre_semantics_failure"
 
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _variant_code_size(variant: ScalarProviderVariant) -> int:
+    compiled = getattr(variant, "compiled", None)
+    size = getattr(compiled, "code_size", None)
+    if size is None:
+        size = getattr(variant, "code_size", None)
+    if type(size) is not int or size <= 0:
+        raise ValueError("variant_code_size_unavailable")
+    return size
+
+
+def _manager_from_policy(
+    context: WorkerRuntimeContext,
+    namespace: VariantNamespace,
+    *,
+    governor: ProcessVariantGovernor | None = None,
+    governor_owner: str | None = None,
+) -> VariantManager[ScalarProviderVariant]:
+    budgets = context.policy.budgets
+    return VariantManager[ScalarProviderVariant](
+        process=context.process,
+        namespace=namespace,
+        max_variants=budgets["variant_limit"],
+        max_code_bytes=budgets["code_bytes"],
+        max_compile_workers=budgets["compile_concurrency"],
+        max_pending_compiles=budgets["compile_pending"],
+        compile_timeout_ns=budgets["compile_timeout_ms"] * 1_000_000,
+        negative_ttl_ns=budgets["negative_ttl_ms"] * 1_000_000,
+        max_negative_entries=budgets["negative_cache_entries"],
+        circuit_failure_threshold=budgets[
+            "circuit_failure_threshold"
+        ],
+        circuit_reset_ns=budgets["circuit_reset_ms"] * 1_000_000,
+        code_size=_variant_code_size,
+        closer=lambda variant: variant.close(),
+        process_governor=governor,
+        governor_owner=governor_owner,
+    )
 
 
 def _process_variant_manager(
@@ -109,37 +212,129 @@ def _process_variant_manager(
         context.run_id,
         context.tenant_namespace,
     )
-    identity = (context.process, namespace)
+    policy_sha256 = context.policy.sha256
+    identity = (context.process, namespace, policy_sha256)
+    now = time.monotonic_ns()
     with _PROCESS_VARIANT_MANAGERS_LOCK:
-        manager = _PROCESS_VARIANT_MANAGERS.get(identity)
-        if manager is None:
-            manager = VariantManager[ScalarProviderVariant](
-                process=context.process,
-                namespace=namespace,
-                max_variants=64,
-                max_code_bytes=256 * 1024 * 1024,
-                max_compile_workers=1,
-                max_pending_compiles=32,
-                code_size=lambda variant: max(
-                    1,
-                    int(
-                        getattr(
-                            getattr(variant, "compiled", None),
-                            "code_size",
-                            1,
-                        )
-                    ),
-                ),
+        idle_ns = (
+            context.policy.budgets["namespace_idle_ms"] * 1_000_000
+        )
+        expired = [
+            (key, value)
+            for key, value in _PROCESS_VARIANT_MANAGERS.items()
+            if key[0] == context.process
+            and key[2] == policy_sha256
+            and not value.clients
+            and now - value.last_used_ns >= idle_ns
+            and value.manager.can_retire()
+        ]
+        for key, value in expired:
+            _PROCESS_VARIANT_MANAGERS.pop(key)
+            value.manager.close()
+
+        entry = _PROCESS_VARIANT_MANAGERS.get(identity)
+        if entry is not None:
+            entry.clients += 1
+            entry.last_used_ns = now
+            return entry.manager
+
+        conflicting = [
+            (key, value)
+            for key, value in _PROCESS_VARIANT_MANAGERS.items()
+            if key[0] == context.process
+            and key[1] == namespace
+            and key[2] != policy_sha256
+        ]
+        for key, value in conflicting:
+            if value.clients or not value.manager.can_retire():
+                raise ValueError("worker_policy_drift")
+            _PROCESS_VARIANT_MANAGERS.pop(key)
+            value.manager.close()
+
+        process_entries = [
+            (key, value)
+            for key, value in _PROCESS_VARIANT_MANAGERS.items()
+            if key[0] == context.process and key[2] == policy_sha256
+        ]
+        namespace_limit = context.policy.budgets[
+            "process_namespace_limit"
+        ]
+        if len(process_entries) >= namespace_limit:
+            retireable = [
+                (key, value)
+                for key, value in process_entries
+                if not value.clients and value.manager.can_retire()
+            ]
+            if not retireable:
+                raise ValueError("process_namespace_capacity_exhausted")
+            retire_key, retire_entry = min(
+                retireable,
+                key=lambda item: item[1].last_used_ns,
             )
-            _PROCESS_VARIANT_MANAGERS[identity] = manager
+            _PROCESS_VARIANT_MANAGERS.pop(retire_key)
+            retire_entry.manager.close()
+
+        active_governors = {
+            (key[0], key[2]) for key in _PROCESS_VARIANT_MANAGERS
+        }
+        for stale_key in tuple(_PROCESS_VARIANT_GOVERNORS):
+            if (
+                stale_key[0] == context.process
+                and stale_key not in active_governors
+            ):
+                _PROCESS_VARIANT_GOVERNORS.pop(stale_key)
+
+        governor_key = (context.process, policy_sha256)
+        governor = _PROCESS_VARIANT_GOVERNORS.get(governor_key)
+        if governor is None:
+            budgets = context.policy.budgets
+            governor = ProcessVariantGovernor(
+                max_namespaces=budgets["process_namespace_limit"],
+                max_variants=budgets["process_variant_limit"],
+                max_code_bytes=budgets["process_code_bytes"],
+            )
+            _PROCESS_VARIANT_GOVERNORS[governor_key] = governor
+        owner = hashlib.sha256(
+            (
+                f"{namespace.job_id}\0{namespace.tenant_id}\0"
+                f"{policy_sha256}"
+            ).encode("utf-8")
+        ).hexdigest()
+        manager = _manager_from_policy(
+            context,
+            namespace,
+            governor=governor,
+            governor_owner=owner,
+        )
+        _PROCESS_VARIANT_MANAGERS[identity] = _ProcessManagerEntry(
+            manager,
+            now,
+            1,
+        )
         return manager
+
+
+def _release_process_variant_manager(context: WorkerRuntimeContext) -> None:
+    namespace = VariantNamespace(
+        context.run_id,
+        context.tenant_namespace,
+    )
+    identity = (context.process, namespace, context.policy.sha256)
+    with _PROCESS_VARIANT_MANAGERS_LOCK:
+        entry = _PROCESS_VARIANT_MANAGERS.get(identity)
+        if entry is None or entry.clients <= 0:
+            return
+        entry.clients -= 1
+        entry.last_used_ns = time.monotonic_ns()
 
 
 def drain_process_compilation() -> None:
     """Wait only at an explicit qualification/diagnostic safe point."""
 
     with _PROCESS_VARIANT_MANAGERS_LOCK:
-        managers = tuple(_PROCESS_VARIANT_MANAGERS.values())
+        managers = tuple(
+            entry.manager for entry in _PROCESS_VARIANT_MANAGERS.values()
+        )
     for manager in managers:
         manager.drain()
 
@@ -163,9 +358,14 @@ class WorkerRuntimeContext:
     task_attempt: str = ""
     refresh_partition_from_ray: bool = False
     tenant_namespace: str = "default"
+    policy: PolicySnapshot = DEFAULT_MAINLINE_POLICY
 
     @classmethod
-    def from_environment(cls) -> "WorkerRuntimeContext":
+    def from_environment(
+        cls,
+        *,
+        policy: PolicySnapshot = DEFAULT_MAINLINE_POLICY,
+    ) -> "WorkerRuntimeContext":
         cluster_epoch = os.environ.get("UDFJIT_CLUSTER_EPOCH", "")
         run_id = os.environ.get("UDFJIT_RUN_ID", cluster_epoch)
         node_id = os.environ.get("UDFJIT_NODE_ID", "")
@@ -209,6 +409,7 @@ class WorkerRuntimeContext:
             task_attempt,
             refresh_partition_from_ray,
             tenant_namespace,
+            policy,
         )
 
     def event_attribution(self) -> tuple[str, str]:
@@ -608,6 +809,8 @@ class WorkerScalarAdapter:
             raise ValueError("worker_candidate_not_finalized")
         if context.process.pid != os.getpid():
             raise ValueError("worker_context_process_mismatch")
+        if context.policy.sha256 != carrier.policy.sha256:
+            raise ValueError("worker_policy_hash_mismatch")
         self.candidate_id = candidate_id
         self.original_callable = original_callable
         self.carrier = carrier
@@ -626,30 +829,23 @@ class WorkerScalarAdapter:
             self._provider_factory,
             CinderXScalarProviderFactory,
         )
+        self._closed = False
+        self._release_finalizer: weakref.finalize | None = None
         if self._owns_variant_manager:
-            self._variants = VariantManager[ScalarProviderVariant](
-                process=context.process,
-                namespace=VariantNamespace(
+            self._variants = _manager_from_policy(
+                context,
+                VariantNamespace(
                     context.run_id,
                     context.tenant_namespace,
-                ),
-                max_variants=8,
-                max_code_bytes=64 * 1024 * 1024,
-                max_compile_workers=1,
-                max_pending_compiles=8,
-                code_size=lambda variant: max(
-                    1,
-                    int(
-                        getattr(
-                            getattr(variant, "compiled", None),
-                            "code_size",
-                            1,
-                        )
-                    ),
                 ),
             )
         else:
             self._variants = _process_variant_manager(context)
+            self._release_finalizer = weakref.finalize(
+                self,
+                _release_process_variant_manager,
+                context,
+            )
         self._physicalizer = ScalarPhysicalizer(
             epoch=context.process.cluster_epoch,
             process=ProcessIdentity(
@@ -694,7 +890,7 @@ class WorkerScalarAdapter:
                 RuntimeEvent(
                     stage,
                     decision,
-                    reason_code,
+                    _stable_runtime_reason(reason_code),
                     self.context.run_id,
                     self.context.process,
                     "" if key is None else key.sha256,
@@ -774,6 +970,8 @@ class WorkerScalarAdapter:
             SCALAR_SLOT_ABI_VERSION,
             target.cpython_cinderx_soabi,
             target.cpu_features,
+            self.context.policy.version,
+            self.context.policy.sha256,
         )
         self._artifact = artifact
         self._expectation = expectation
@@ -826,6 +1024,121 @@ class WorkerScalarAdapter:
             attribution=attribution,
         )
         return self.original_callable(*args, **kwargs)
+
+    def _execute_variant(
+        self,
+        *,
+        artifact: PortableUdfArtifact,
+        key: VariantKey,
+        variant: Any,
+        value: float,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        continuation: InterpreterContinuation[object] | None,
+        attribution: tuple[str, str],
+    ) -> Any:
+        is_production_jit = (
+            isinstance(self._provider_factory, CinderXScalarProviderFactory)
+            and variant.execution_mode == "cinderx-jit"
+            and variant.intrinsic_load_count == 1
+            and (
+                variant.intrinsic_store_count >= 1
+                or getattr(
+                    variant,
+                    "continuation_enabled",
+                    False,
+                )
+            )
+        )
+        self._emit(
+            "jit" if is_production_jit else "provider",
+            "hit",
+            (
+                "process_variant_cache"
+                if is_production_jit
+                else "non_jit_process_variant_cache"
+            ),
+            key=key,
+            artifact_hash=self.carrier.handle.content_sha256,
+            code_hash=variant.code_hash,
+            execution_mode=variant.execution_mode,
+            attribution=attribution,
+        )
+
+        boundary = CommitBoundary()
+        try:
+            frame = self._physicalizer.open_call(
+                artifact.input_access_specs[0],
+                artifact.output_access_spec,
+                value,
+                keepalive=args,
+            )
+            with frame:
+                physical_value = frame.load_input()
+                if continuation is None:
+                    result = variant.execute(
+                        physical_value,
+                        boundary=boundary,
+                    )
+                else:
+                    result = variant.execute(
+                        physical_value,
+                        boundary=boundary,
+                        continuation=continuation,
+                    )
+                frame.stage_output(result)
+                result = frame.publish_output()
+        except PreSemanticsExecutionError as error:
+            if not boundary.committed:
+                return self._fallback(
+                    args,
+                    kwargs,
+                    error.reason_code,
+                    key=key,
+                    attribution=attribution,
+                )
+            self._emit(
+                "execute",
+                "post_entry_failure",
+                error.reason_code,
+                key=key,
+                artifact_hash=self.carrier.handle.content_sha256,
+                code_hash=variant.code_hash,
+                execution_mode=variant.execution_mode,
+                attribution=attribution,
+            )
+            raise
+        except Exception:
+            if not boundary.committed:
+                return self._fallback(
+                    args,
+                    kwargs,
+                    "physicalization_failed",
+                    key=key,
+                    attribution=attribution,
+                )
+            self._emit(
+                "execute",
+                "post_entry_failure",
+                "post_entry_failure",
+                key=key,
+                artifact_hash=self.carrier.handle.content_sha256,
+                code_hash=variant.code_hash,
+                execution_mode=variant.execution_mode,
+                attribution=attribution,
+            )
+            raise
+        self._emit(
+            "execute",
+            "semantic_execute",
+            "success",
+            key=key,
+            artifact_hash=self.carrier.handle.content_sha256,
+            code_hash=variant.code_hash,
+            execution_mode=variant.execution_mode,
+            attribution=attribution,
+        )
+        return result
 
     def invoke(
         self,
@@ -911,34 +1224,6 @@ class WorkerScalarAdapter:
                 )
             if resolution.variant is None:
                 raise OuterGuardError(OuterGuardRejectCode.VARIANT_MISMATCH)
-            variant = resolution.variant.value
-            is_production_jit = (
-                isinstance(self._provider_factory, CinderXScalarProviderFactory)
-                and variant.execution_mode == "cinderx-jit"
-                and variant.intrinsic_load_count == 1
-                and (
-                    variant.intrinsic_store_count >= 1
-                    or getattr(
-                        variant,
-                        "continuation_enabled",
-                        False,
-                    )
-                )
-            )
-            self._emit(
-                "jit" if is_production_jit else "provider",
-                "hit",
-                (
-                    "process_variant_cache"
-                    if is_production_jit
-                    else "non_jit_process_variant_cache"
-                ),
-                key=key,
-                artifact_hash=self.carrier.handle.content_sha256,
-                code_hash=variant.code_hash,
-                execution_mode=variant.execution_mode,
-                attribution=attribution,
-            )
         except OuterGuardError as error:
             return self._fallback(
                 args,
@@ -947,18 +1232,11 @@ class WorkerScalarAdapter:
                 key=self._key,
                 attribution=attribution,
             )
-        except ArtifactLoadError as error:
+        except ArtifactLoadError:
             return self._fallback(
                 args,
                 kwargs,
-                (
-                    f"artifact_load_rejected:{error.code.value}"
-                    + (
-                        ""
-                        if not error.detail
-                        else f":{error.detail}"
-                    )
-                ),
+                "artifact_load_rejected",
                 key=self._key,
                 attribution=attribution,
             )
@@ -970,96 +1248,48 @@ class WorkerScalarAdapter:
                 key=self._key,
                 attribution=attribution,
             )
-        except Exception as error:
+        except Exception:
             return self._fallback(
                 args,
                 kwargs,
-                f"pre_semantics_failure:{type(error).__name__}",
+                "pre_semantics_failure",
                 key=self._key,
                 attribution=attribution,
             )
 
-        boundary = CommitBoundary()
+        lease = self._variants.acquire(key)
         try:
-            frame = self._physicalizer.open_call(
-                artifact.input_access_specs[0],
-                artifact.output_access_spec,
-                value,
-                keepalive=args,
-            )
-            with frame:
-                physical_value = frame.load_input()
-                if continuation is None:
-                    result = variant.execute(
-                        physical_value,
-                        boundary=boundary,
-                    )
-                else:
-                    result = variant.execute(
-                        physical_value,
-                        boundary=boundary,
-                        continuation=continuation,
-                    )
-                frame.stage_output(result)
-                result = frame.publish_output()
-        except PreSemanticsExecutionError as error:
-            if not boundary.committed:
-                return self._fallback(
-                    args,
-                    kwargs,
-                    error.reason_code,
-                    key=key,
-                    attribution=attribution,
-                )
-            self._emit(
-                "execute",
-                "post_entry_failure",
-                error.reason_code,
+            variant = lease.__enter__()
+        except KeyError:
+            return self._fallback(
+                args,
+                kwargs,
+                "variant_unavailable",
                 key=key,
-                artifact_hash=self.carrier.handle.content_sha256,
-                code_hash=variant.code_hash,
-                execution_mode=variant.execution_mode,
                 attribution=attribution,
             )
-            raise
-        except Exception as error:
-            if not boundary.committed:
-                return self._fallback(
-                    args,
-                    kwargs,
-                    (
-                        "physicalization_failed:"
-                        f"{type(error).__name__}"
-                    ),
-                    key=key,
-                    attribution=attribution,
-                )
-            self._emit(
-                "execute",
-                "post_entry_failure",
-                type(error).__name__,
+        try:
+            return self._execute_variant(
+                artifact=artifact,
                 key=key,
-                artifact_hash=self.carrier.handle.content_sha256,
-                code_hash=variant.code_hash,
-                execution_mode=variant.execution_mode,
+                variant=variant,
+                value=value,
+                args=args,
+                kwargs=kwargs,
+                continuation=continuation,
                 attribution=attribution,
             )
-            raise
-        self._emit(
-            "execute",
-            "semantic_execute",
-            "success",
-            key=key,
-            artifact_hash=self.carrier.handle.content_sha256,
-            code_hash=variant.code_hash,
-            execution_mode=variant.execution_mode,
-            attribution=attribution,
-        )
-        return result
+        finally:
+            lease.__exit__(None, None, None)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if self._owns_variant_manager:
-            self._variants.close(lambda variant: variant.close())
+            self._variants.close()
+        elif self._release_finalizer is not None:
+            self._release_finalizer()
         self._physicalizer.close()
 
 
@@ -1069,5 +1299,7 @@ def build_default_worker_adapter(wrapper: Any) -> WorkerScalarAdapter:
         original_callable=wrapper.original_callable,
         carrier=wrapper.carrier,
         logical_schema=wrapper.logical_schema,
-        context=WorkerRuntimeContext.from_environment(),
+        context=WorkerRuntimeContext.from_environment(
+            policy=wrapper.carrier.policy,
+        ),
     )

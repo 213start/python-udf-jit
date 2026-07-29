@@ -27,6 +27,7 @@ def _key(process: WorkerProcessKey, schema: str) -> VariantKey:
         cpython_cinderx_soabi="cpython-314-aarch64-linux-gnu",
         cpu_features=("asimd",),
         policy_version="policy-a",
+        policy_sha256="6" * 64,
     )
 
 
@@ -47,6 +48,7 @@ class RFC007UnitTests(unittest.TestCase):
             max_compile_workers=1,
             max_pending_compiles=0,
             circuit_failure_threshold=2,
+            code_size=lambda _value: 1,
         )
         entered = threading.Event()
         release = threading.Event()

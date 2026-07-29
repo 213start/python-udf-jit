@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Callable, Generic, TypeVar
+from typing import Callable, Generic, TypeVar, cast
 
 
 T = TypeVar("T")
@@ -23,17 +24,30 @@ class CompileOutcome(Generic[T]):
     error: BaseException | None = None
 
 
+class CompileTimeoutError(TimeoutError):
+    """A compiler invocation exceeded the frozen runtime budget."""
+
+
 class CompilePool(Generic[T]):
     """Bounded process-local compiler pool with exact-key singleflight."""
 
-    def __init__(self, *, max_workers: int, max_pending: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        max_pending: int,
+        compile_timeout_ns: int = 30_000_000_000,
+    ) -> None:
         if (
             type(max_workers) is not int
             or max_workers <= 0
             or type(max_pending) is not int
             or max_pending < 0
+            or type(compile_timeout_ns) is not int
+            or compile_timeout_ns <= 0
         ):
             raise ValueError("invalid_compile_pool_budget")
+        self._compile_timeout_seconds = compile_timeout_ns / 1_000_000_000
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="udfjit-compile",
@@ -45,6 +59,33 @@ class CompilePool(Generic[T]):
         self._idle = threading.Condition(self._lock)
         self._inflight: dict[str, Future[T]] = {}
         self._closed = False
+
+    def _run_with_timeout(self, compiler: Callable[[], T]) -> T:
+        result: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+        def invoke() -> None:
+            try:
+                result.put((True, compiler()))
+            except BaseException as error:
+                result.put((False, error))
+
+        worker = threading.Thread(
+            target=invoke,
+            name="udfjit-compile-invocation",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            succeeded, value = result.get(
+                timeout=self._compile_timeout_seconds
+            )
+        except queue.Empty as error:
+            raise CompileTimeoutError("compile_timeout") from error
+        if succeeded:
+            return cast(T, value)
+        if isinstance(value, BaseException):
+            raise value
+        raise RuntimeError("compile_outcome_invalid")
 
     def submit(
         self,
@@ -62,7 +103,10 @@ class CompilePool(Generic[T]):
             if not self._capacity.acquire(blocking=False):
                 return SubmitDecision.CAPACITY_EXHAUSTED
             try:
-                future = self._executor.submit(compiler)
+                future = self._executor.submit(
+                    self._run_with_timeout,
+                    compiler,
+                )
             except BaseException:
                 self._capacity.release()
                 raise

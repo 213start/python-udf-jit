@@ -22,6 +22,10 @@ from python_udf_jit.compiler.capture_cache import CaptureCache
 from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.diagnostics import events
 from python_udf_jit.diagnostics.events import DecisionEvent
+from python_udf_jit.governance.policy import (
+    DEFAULT_MAINLINE_POLICY,
+    PolicySnapshot,
+)
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
 from python_udf_jit.integration.daft_ray.schema import canonicalize_schema
 from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
@@ -97,6 +101,7 @@ class CandidateRegistry:
         job_namespace: str = "local-test-job",
         ttl_seconds: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
+        policy: PolicySnapshot = DEFAULT_MAINLINE_POLICY,
     ):
         if max_candidates <= 0:
             raise ValueError("max_candidates must be positive")
@@ -104,11 +109,14 @@ class CandidateRegistry:
             raise ValueError("job_namespace must not be empty")
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        if not isinstance(policy, PolicySnapshot):
+            raise ValueError("policy snapshot is required")
         self._manifest_sha256 = manifest_sha256
         self._max_candidates = max_candidates
         self._job_namespace = job_namespace
         self._ttl_seconds = float(ttl_seconds)
         self._clock = clock
+        self._policy = policy
         self._capture_cache = CaptureCache(
             capacity=max_candidates,
             ttl_seconds=ttl_seconds,
@@ -216,7 +224,9 @@ class CandidateRegistry:
                 candidate_id=candidate_id,
                 original_callable=original_callable,
                 carrier=ProductionCarrierState.placeholder(
-                    candidate_id, self._manifest_sha256
+                    candidate_id,
+                    self._manifest_sha256,
+                    policy=self._policy,
                 ),
             )
             record = CandidateRecord(

@@ -25,6 +25,8 @@ def key(process: WorkerProcessKey, **changes) -> VariantKey:
         "scalar_slot_abi": 1,
         "cpython_cinderx_soabi": "cpython-314-aarch64-linux-gnu",
         "cpu_features": ("asimd",),
+        "policy_version": "scalar-mainline",
+        "policy_sha256": "6" * 64,
     }
     values.update(changes)
     return VariantKey(**values)

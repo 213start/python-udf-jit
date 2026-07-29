@@ -179,7 +179,7 @@ class WorkerPythonRegionContinuationIntegrationTest(unittest.TestCase):
         self.assertTrue(
             any(
                 event.decision == "post_entry_failure"
-                and event.reason_code == "RegionFailure"
+                and event.reason_code == "post_entry_failure"
                 for event in report.snapshot()
             )
         )

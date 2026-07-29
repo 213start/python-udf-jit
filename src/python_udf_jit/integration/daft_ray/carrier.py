@@ -6,6 +6,11 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from python_udf_jit.governance.policy import (
+    DEFAULT_MAINLINE_POLICY,
+    PolicySnapshot,
+)
+
 
 class CarrierContractError(ValueError):
     """Raised when carrier state or runtime evidence is not trustworthy."""
@@ -55,6 +60,7 @@ class ScalarCallView:
     carrier_schema_version: int
     handle_kind: str
     content_sha256: str
+    policy_sha256: str
     size_bytes: int
 
     @classmethod
@@ -74,6 +80,7 @@ class ScalarCallView:
             carrier_schema_version=carrier.schema_version,
             handle_kind=carrier.handle.kind,
             content_sha256=carrier.handle.content_sha256,
+            policy_sha256=carrier.policy.sha256,
             size_bytes=carrier.handle.size_bytes,
         )
         view._validate()
@@ -88,6 +95,7 @@ class ScalarCallView:
                 "content_sha256": self.content_sha256,
                 "handle_kind": self.handle_kind,
                 "logical_schema_sha256": self.logical_schema_sha256,
+                "policy_sha256": self.policy_sha256,
                 "schema_version": self.schema_version,
                 "size_bytes": self.size_bytes,
                 "usage_context": self.usage_context,
@@ -107,6 +115,7 @@ class ScalarCallView:
                 "content_sha256",
                 "handle_kind",
                 "logical_schema_sha256",
+                "policy_sha256",
                 "schema_version",
                 "size_bytes",
                 "usage_context",
@@ -123,6 +132,7 @@ class ScalarCallView:
                 carrier_schema_version=document["carrier_schema_version"],
                 handle_kind=document["handle_kind"],
                 content_sha256=document["content_sha256"],
+                policy_sha256=document["policy_sha256"],
                 size_bytes=document["size_bytes"],
             )
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
@@ -150,10 +160,12 @@ class ScalarCallView:
             or self.size_bytes < 0
             or type(self.logical_schema_sha256) is not str
             or type(self.content_sha256) is not str
+            or type(self.policy_sha256) is not str
         ):
             raise CarrierContractError("invalid scalar call view")
         _require_sha256(self.logical_schema_sha256, "logical_schema_sha256")
         _require_sha256(self.content_sha256, "content_sha256")
+        _require_sha256(self.policy_sha256, "policy_sha256")
 
 
 @dataclass(frozen=True)
@@ -164,22 +176,31 @@ class ProductionCarrierState:
     candidate_id: str
     manifest_sha256: str
     handle: ArtifactHandle
+    policy: PolicySnapshot
 
     @classmethod
     def placeholder(
-        cls, candidate_id: str, manifest_sha256: str
+        cls,
+        candidate_id: str,
+        manifest_sha256: str,
+        *,
+        policy: PolicySnapshot = DEFAULT_MAINLINE_POLICY,
     ) -> "ProductionCarrierState":
         if type(candidate_id) is not str or not candidate_id:
             raise CarrierContractError("candidate_id must not be empty")
         _require_sha256(manifest_sha256, "manifest_sha256")
+        if not isinstance(policy, PolicySnapshot):
+            raise CarrierContractError("policy snapshot is required")
         placeholder_payload = (
-            f"python-udf-jit:placeholder:{candidate_id}:{manifest_sha256}"
+            "python-udf-jit:placeholder:"
+            f"{candidate_id}:{manifest_sha256}:{policy.sha256}"
         ).encode("utf-8")
         return cls(
             schema_version=1,
             candidate_id=candidate_id,
             manifest_sha256=manifest_sha256,
             handle=InlineArtifactHandle("placeholder", _sha256(placeholder_payload), 0),
+            policy=policy,
         )
 
     @property
@@ -247,6 +268,7 @@ class ProductionCarrierState:
             self.candidate_id,
             self.manifest_sha256,
             handle,
+            self.policy,
         )
 
     @property
@@ -269,6 +291,8 @@ class ProductionCarrierState:
                 "size_bytes": self.handle.size_bytes,
             },
             "manifest_sha256": self.manifest_sha256,
+            "policy": self.policy.document,
+            "policy_sha256": self.policy.sha256,
             "schema_version": self.schema_version,
         }
 
@@ -301,6 +325,8 @@ class ProductionCarrierState:
                     "candidate_id",
                     "handle",
                     "manifest_sha256",
+                    "policy",
+                    "policy_sha256",
                     "schema_version",
                 }
             ):
@@ -349,7 +375,12 @@ class ProductionCarrierState:
                     handle_doc["size_bytes"],
                     artifact_payload,
                 ),
+                policy=PolicySnapshot.from_document(
+                    document["policy"]
+                ),
             )
+            if state.policy.sha256 != document["policy_sha256"]:
+                raise CarrierContractError("carrier policy hash mismatch")
         except (
             UnicodeDecodeError,
             json.JSONDecodeError,
@@ -369,6 +400,7 @@ class ProductionCarrierState:
             or type(self.candidate_id) is not str
             or not self.candidate_id
             or type(self.manifest_sha256) is not str
+            or not isinstance(self.policy, PolicySnapshot)
             or type(self.handle.kind) is not str
             or type(self.handle.content_sha256) is not str
             or type(self.handle.size_bytes) is not int

@@ -174,6 +174,8 @@ class _WorkerScalarSlotProbe:
                     sysconfig.get_config_var("SOABI")
                 ),
                 cpu_features=("scalar",),
+                policy_version="scalar-mainline",
+                policy_sha256=digest("scalar-mainline-policy"),
             )
             variant = factory.compile(artifact, key)
             variants.append(variant)
