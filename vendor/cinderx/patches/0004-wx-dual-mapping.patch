@@ -1,8 +1,8 @@
 diff --git a/cinderx/Jit/code_allocator.cpp b/cinderx/Jit/code_allocator.cpp
-index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d6c0a3258 100644
+index ddec51f299a2eb882c037bd22213f518d88afc82..72ea63bc7c36b884d33c65cd58ce88d25793007d 100644
 --- a/cinderx/Jit/code_allocator.cpp
 +++ b/cinderx/Jit/code_allocator.cpp
-@@ -6,10 +6,7 @@
+@@ -6,11 +6,11 @@
  #include "cinderx/Jit/codegen/code_section.h"
  #include "cinderx/Jit/config.h"
  
@@ -12,22 +12,17 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
 -#else
 +#ifndef WIN32
  #include <sys/mman.h>
++#include <unistd.h>
++#else
++#include <process.h>
  #endif
  
-@@ -30,27 +27,26 @@ namespace {
+ #include <cstring>
+@@ -30,27 +30,34 @@ namespace {
  // 2MiB to match Linux's huge-page size.
  constexpr size_t kAllocSize = 1024 * 1024 * 2;
  
-+const asmjit::JitAllocator::CreateParams* dualMappingParams() {
-+  static const asmjit::JitAllocator::CreateParams params = [] {
-+    asmjit::JitAllocator::CreateParams value;
-+    value.options = asmjit::JitAllocatorOptions::kUseDualMapping;
-+    return value;
-+  }();
-+  return &params;
-+}
-+
- // Allocate memory for JIT'd code.
+-// Allocate memory for JIT'd code.
 -uint8_t* allocPages(size_t size) {
 -#ifndef WIN32
 -  void* res = mmap(
@@ -37,21 +32,38 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
 -      MAP_PRIVATE | MAP_ANONYMOUS,
 -      -1,
 -      0);
-+asmjit::VirtMem::DualMapping allocPages(size_t size) {
-+  asmjit::VirtMem::DualMapping mapping{};
-+  asmjit::Error error = asmjit::VirtMem::allocDualMapping(
-+      &mapping, size, asmjit::VirtMem::MemoryFlags::kAccessRWX);
-   JIT_CHECK(
+-  JIT_CHECK(
 -      res != MAP_FAILED,
 -      "Failed to allocate {} bytes of memory for code",
 -      size);
--#else
++uint64_t currentProcessId() {
++#ifdef WIN32
++  return static_cast<uint64_t>(_getpid());
+ #else
 -  void* res = VirtualAlloc(
 -      nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 -  JIT_CHECK(
 -      res != nullptr, "Failed to allocate {} bytes of memory for code", size);
--#endif
++  return static_cast<uint64_t>(getpid());
+ #endif
 -  return static_cast<uint8_t*>(res);
++}
++
++const asmjit::JitAllocator::CreateParams* dualMappingParams() {
++  static const asmjit::JitAllocator::CreateParams params = [] {
++    asmjit::JitAllocator::CreateParams value;
++    value.options = asmjit::JitAllocatorOptions::kUseDualMapping;
++    return value;
++  }();
++  return &params;
++}
++
++// Allocate memory for JIT'd code.
++asmjit::VirtMem::DualMapping allocPages(size_t size) {
++  asmjit::VirtMem::DualMapping mapping{};
++  asmjit::Error error = asmjit::VirtMem::allocDualMapping(
++      &mapping, size, asmjit::VirtMem::MemoryFlags::kAccessRWX);
++  JIT_CHECK(
 +      error == asmjit::kErrorOk,
 +      "Failed to allocate {} bytes of dual-mapped memory for code: {}",
 +      size,
@@ -60,37 +72,121 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
  }
  
  bool setHugePages([[maybe_unused]] void* ptr, [[maybe_unused]] size_t size) {
-@@ -88,6 +84,8 @@ ICodeAllocator* CodeAllocator::make() {
+@@ -88,9 +95,27 @@ ICodeAllocator* CodeAllocator::make() {
    return new CodeAllocator{};
  }
  
-+CodeAllocator::CodeAllocator() : runtime_{dualMappingParams()} {}
-+
- AllocateResult CodeAllocator::addCode(asmjit::CodeHolder* code) {
-   void* addr = nullptr;
-   asmjit::Error error = runtime_.add(&addr, code);
-@@ -123,6 +121,20 @@ bool CodeAllocator::contains(const void* ptr) const {
-       asmjit::kErrorOk;
- }
- 
-+void* CodeAllocator::writableAddress(const void* executable) const {
-+  asmjit::JitAllocator::Span span;
-+  if (runtime_.allocator()->query(
-+          span, const_cast<void*>(executable)) != asmjit::kErrorOk) {
-+    return nullptr;
-+  }
-+  if (span.rw() == nullptr || span.rw() == span.rx()) {
-+    return nullptr;
-+  }
-+  auto offset = static_cast<const uint8_t*>(executable) -
-+      static_cast<const uint8_t*>(span.rx());
-+  return static_cast<uint8_t*>(span.rw()) + offset;
++CodeAllocator::CodeAllocator() {
++  ensureRuntimeForCurrentProcess();
 +}
 +
- size_t CodeAllocator::usedBytes() const {
-   return used_bytes_.load(std::memory_order_relaxed);
++void CodeAllocator::ensureRuntimeForCurrentProcess() const {
++  uint64_t process_id = currentProcessId();
++  if (
++      runtimes_.empty() ||
++      runtimes_.back().process_id != process_id) {
++    runtimes_.push_back(RuntimeGeneration{
++        process_id,
++        std::make_unique<asmjit::JitRuntime>(dualMappingParams()),
++    });
++  }
++}
++
+ AllocateResult CodeAllocator::addCode(asmjit::CodeHolder* code) {
++  std::lock_guard lock{runtime_mutex_};
++  ensureRuntimeForCurrentProcess();
+   void* addr = nullptr;
+-  asmjit::Error error = runtime_.add(&addr, code);
++  asmjit::Error error = runtimes_.back().runtime->add(&addr, code);
+ 
+   if (addr != nullptr && error == asmjit::kErrorOk) {
+     used_bytes_.fetch_add(code->codeSize(), std::memory_order_relaxed);
+@@ -100,27 +125,62 @@ AllocateResult CodeAllocator::addCode(asmjit::CodeHolder* code) {
  }
-@@ -132,18 +144,17 @@ const asmjit::Environment& CodeAllocator::asmJitEnvironment() const {
+ 
+ asmjit::Error CodeAllocator::releaseCode(void* code) {
+-  // Find the size of the allocated region.
+-  asmjit::JitAllocator* inner = runtime_.allocator();
+-  asmjit::JitAllocator::Span span;
+-  if (auto error = inner->query(span, code); error != asmjit::kErrorOk) {
+-    return error;
+-  }
+-
+-  if (auto error = runtime_.release(code); error != asmjit::kErrorOk) {
+-    return error;
++  std::lock_guard lock{runtime_mutex_};
++  for (RuntimeGeneration& generation : runtimes_) {
++    asmjit::JitAllocator::Span span;
++    if (
++        generation.runtime->allocator()->query(span, code) !=
++        asmjit::kErrorOk) {
++      continue;
++    }
++    if (
++        auto error = generation.runtime->release(code);
++        error != asmjit::kErrorOk) {
++      return error;
++    }
++    used_bytes_.fetch_sub(span.size(), std::memory_order_relaxed);
++    return asmjit::kErrorOk;
+   }
+-
+-  used_bytes_.fetch_sub(span.size(), std::memory_order_relaxed);
+-  return asmjit::kErrorOk;
++  return asmjit::kErrorInvalidArgument;
+ }
+ 
+ bool CodeAllocator::contains(const void* ptr) const {
+-  asmjit::JitAllocator::Span unused;
++  std::lock_guard lock{runtime_mutex_};
+   // asmjit docs don't say that query() is thread-safe, but peeking at the
+   // implementation shows that it is.
+-  return runtime_.allocator()->query(unused, const_cast<void*>(ptr)) ==
+-      asmjit::kErrorOk;
++  for (const RuntimeGeneration& generation : runtimes_) {
++    asmjit::JitAllocator::Span unused;
++    if (
++        generation.runtime->allocator()->query(
++            unused, const_cast<void*>(ptr)) == asmjit::kErrorOk) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void* CodeAllocator::writableAddress(const void* executable) const {
++  std::lock_guard lock{runtime_mutex_};
++  ensureRuntimeForCurrentProcess();
++  uint64_t process_id = currentProcessId();
++  for (const RuntimeGeneration& generation : runtimes_) {
++    asmjit::JitAllocator::Span span;
++    if (
++        generation.runtime->allocator()->query(
++            span, const_cast<void*>(executable)) != asmjit::kErrorOk) {
++      continue;
++    }
++    if (
++        generation.process_id != process_id ||
++        span.rw() == nullptr ||
++        span.rw() == span.rx()) {
++      return nullptr;
++    }
++    auto offset = static_cast<const uint8_t*>(executable) -
++        static_cast<const uint8_t*>(span.rx());
++    return static_cast<uint8_t*>(span.rw()) + offset;
++  }
++  return nullptr;
+ }
+ 
+ size_t CodeAllocator::usedBytes() const {
+@@ -128,22 +188,23 @@ size_t CodeAllocator::usedBytes() const {
+ }
+ 
+ const asmjit::Environment& CodeAllocator::asmJitEnvironment() const {
+-  return runtime_.environment();
++  std::lock_guard lock{runtime_mutex_};
++  ensureRuntimeForCurrentProcess();
++  return runtimes_.back().runtime->environment();
  }
  
  CodeAllocatorCinder::~CodeAllocatorCinder() {
@@ -115,7 +211,7 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
      size_t& alloc_free,
      size_t size,
      bool use_huge_pages) {
-@@ -154,14 +165,15 @@ void CodeAllocatorCinder::ensureSpace(
+@@ -154,14 +215,16 @@ void CodeAllocatorCinder::ensureSpace(
    lost_bytes_.fetch_add(alloc_free, std::memory_order_relaxed);
  
    size_t chunk_size = ((size / kAllocSize) + 1) * kAllocSize;
@@ -131,11 +227,12 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
 -  allocations_.emplace_back(res, chunk_size);
 +  rx_alloc = static_cast<uint8_t*>(mapping.rx);
 +  rw_alloc = static_cast<uint8_t*>(mapping.rw);
-+  allocations_.push_back(Allocation{mapping, chunk_size});
++  allocations_.push_back(
++      Allocation{mapping, chunk_size, currentProcessId()});
    alloc_free = chunk_size;
  }
  
-@@ -184,22 +196,24 @@ void CodeAllocatorCinder::ensureSplitSpace(
+@@ -184,22 +247,25 @@ void CodeAllocatorCinder::ensureSplitSpace(
  
    size_t total_needed = hot_needed + cold_needed;
    size_t chunk_size = ((total_needed / kAllocSize) + 1) * kAllocSize;
@@ -148,7 +245,8 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
      fragmented_allocs_.fetch_add(1, std::memory_order_relaxed);
    }
 -  allocations_.emplace_back(res, chunk_size);
-+  allocations_.push_back(Allocation{mapping, chunk_size});
++  allocations_.push_back(
++      Allocation{mapping, chunk_size, currentProcessId()});
  
    // Hot code grows forward from the start, cold code grows forward from a
    // split point. Split proportionally so each side gets at least what it
@@ -165,7 +263,7 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
    cold_alloc_free_ = chunk_size - hot_share;
  }
  
-@@ -225,9 +239,11 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+@@ -225,9 +291,11 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
  #else
    // On x86-64, RIP-relative addressing has a ±2GB range which is large enough
    // that independent allocations are unlikely to exceed it in practice.
@@ -179,7 +277,7 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
        cold_alloc_free_,
        cold_size,
        getConfig().cold_code_huge_pages);
-@@ -237,7 +253,8 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+@@ -237,7 +305,8 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
    // All offsets are relative to the hot allocation base so that asmjit can
    // resolve cross-section jumps correctly.
    size_t hot_offset = 0;
@@ -189,7 +287,7 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
    for (asmjit::Section* section : code->sections()) {
      CodeSection cs = codeSectionFromName(section->name());
      if (cs == CodeSection::kCold) {
-@@ -250,9 +267,9 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+@@ -250,9 +319,9 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
    }
  
    PROPAGATE_ERROR(code->resolveUnresolvedLinks());
@@ -201,7 +299,7 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
  
    // Copy each section's data to the appropriate allocation.
    size_t total_size = 0;
-@@ -263,14 +280,16 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+@@ -263,14 +332,16 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
      }
      CodeSection cs = codeSectionFromName(section->name());
      if (cs == CodeSection::kCold) {
@@ -224,7 +322,15 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
        hot_alloc_free_ -= buffer_size;
      }
      total_size += buffer_size;
-@@ -291,9 +310,14 @@ AllocateResult CodeAllocatorCinder::addCode(asmjit::CodeHolder* code) {
+@@ -282,6 +353,7 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
+ 
+ AllocateResult CodeAllocatorCinder::addCode(asmjit::CodeHolder* code) {
+   std::lock_guard lock{allocator_mutex_};
++  ensureProcessGeneration();
+ 
+   if (getConfig().multiple_code_sections) {
+     return addSplitCode(code);
+@@ -291,9 +363,14 @@ AllocateResult CodeAllocatorCinder::addCode(asmjit::CodeHolder* code) {
    PROPAGATE_ERROR(code->resolveUnresolvedLinks());
  
    size_t max_code_size = code->codeSize();
@@ -241,7 +347,7 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
  
    size_t actual_code_size = code->codeSize();
    JIT_CHECK(actual_code_size <= max_code_size, "Code grew during relocation");
-@@ -305,20 +329,23 @@ AllocateResult CodeAllocatorCinder::addCode(asmjit::CodeHolder* code) {
+@@ -305,26 +382,43 @@ AllocateResult CodeAllocatorCinder::addCode(asmjit::CodeHolder* code) {
  
      JIT_CHECK(
          offset + buffer_size <= actual_code_size, "Inconsistent code size");
@@ -269,7 +375,27 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
    hot_alloc_free_ -= actual_code_size;
    used_bytes_.fetch_add(actual_code_size, std::memory_order_relaxed);
  
-@@ -332,12 +359,30 @@ asmjit::Error CodeAllocatorCinder::releaseCode([[maybe_unused]] void* code) {
+   return AllocateResult{addr, asmjit::kErrorOk};
+ }
+ 
++void CodeAllocatorCinder::ensureProcessGeneration() {
++  uint64_t process_id = currentProcessId();
++  if (process_id_ == process_id) {
++    return;
++  }
++  process_id_ = process_id;
++  hot_rx_alloc_ = nullptr;
++  hot_rw_alloc_ = nullptr;
++  hot_alloc_free_ = 0;
++  cold_rx_alloc_ = nullptr;
++  cold_rw_alloc_ = nullptr;
++  cold_alloc_free_ = 0;
++}
++
+ asmjit::Error CodeAllocatorCinder::releaseCode([[maybe_unused]] void* code) {
+   // TODO(T233607793): Actually implement deallocating memory.
+   return asmjit::kErrorOk;
+@@ -332,12 +426,33 @@ asmjit::Error CodeAllocatorCinder::releaseCode([[maybe_unused]] void* code) {
  
  bool CodeAllocatorCinder::contains(const void* ptr) const {
    std::lock_guard lock{allocator_mutex_};
@@ -294,6 +420,9 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
 +      if (alloc.mapping.rw == nullptr || alloc.mapping.rw == alloc.mapping.rx) {
 +        return nullptr;
 +      }
++      if (alloc.process_id != currentProcessId()) {
++        return nullptr;
++      }
 +      auto offset = address - rx;
 +      return static_cast<uint8_t*>(alloc.mapping.rw) + offset;
 +    }
@@ -303,18 +432,21 @@ index ddec51f299a2eb882c037bd22213f518d88afc82..71f05cc2812efd4a33b4d7da72cf613d
 +
  } // namespace jit
 diff --git a/cinderx/Jit/code_allocator.h b/cinderx/Jit/code_allocator.h
-index 013d0f7994150415f14c309788149cf0eb35474d..1cc86b24c3cb99cf1770c7281572183f372eaf06 100644
+index 013d0f7994150415f14c309788149cf0eb35474d..be0ae45f3e721a8c018946a39e203ae511c1f2a9 100644
 --- a/cinderx/Jit/code_allocator.h
 +++ b/cinderx/Jit/code_allocator.h
-@@ -8,7 +8,6 @@
+@@ -7,8 +7,9 @@
+ #include <asmjit/asmjit.h>
  
  #include <atomic>
++#include <cstdint>
++#include <memory>
  #include <mutex>
 -#include <span>
  #include <vector>
  
  namespace jit {
-@@ -28,6 +27,7 @@ namespace jit {
+@@ -28,6 +29,7 @@ namespace jit {
  */
  class CodeAllocator : public ICodeAllocator {
   public:
@@ -322,7 +454,7 @@ index 013d0f7994150415f14c309788149cf0eb35474d..1cc86b24c3cb99cf1770c7281572183f
    ~CodeAllocator() override = default;
  
    // To be called once by JIT initialization after enough configuration has been
-@@ -37,6 +37,7 @@ class CodeAllocator : public ICodeAllocator {
+@@ -37,11 +39,20 @@ class CodeAllocator : public ICodeAllocator {
    AllocateResult addCode(asmjit::CodeHolder* code) override;
    asmjit::Error releaseCode(void* code) override;
    bool contains(const void* ptr) const override;
@@ -330,7 +462,21 @@ index 013d0f7994150415f14c309788149cf0eb35474d..1cc86b24c3cb99cf1770c7281572183f
    size_t usedBytes() const override;
    const asmjit::Environment& asmJitEnvironment() const override;
  
-@@ -69,8 +70,14 @@ class CodeAllocatorCinder : public CodeAllocator {
+  protected:
+-  asmjit::JitRuntime runtime_;
++  struct RuntimeGeneration {
++    uint64_t process_id;
++    std::unique_ptr<asmjit::JitRuntime> runtime;
++  };
++
++  void ensureRuntimeForCurrentProcess() const;
++
++  mutable std::mutex runtime_mutex_;
++  mutable std::vector<RuntimeGeneration> runtimes_;
+   std::atomic<size_t> used_bytes_{0};
+ };
+ 
+@@ -69,8 +80,15 @@ class CodeAllocatorCinder : public CodeAllocator {
    AllocateResult addCode(asmjit::CodeHolder* code) override;
    asmjit::Error releaseCode(void* code) override;
    bool contains(const void* ptr) const override;
@@ -340,12 +486,13 @@ index 013d0f7994150415f14c309788149cf0eb35474d..1cc86b24c3cb99cf1770c7281572183f
 +  struct Allocation {
 +    asmjit::VirtMem::DualMapping mapping;
 +    size_t size;
++    uint64_t process_id;
 +  };
 +
    // Add code with hot/cold section splitting. Called by addCode() when
    // multiple_code_sections is enabled. Caller must hold allocator_mutex_.
    AllocateResult addSplitCode(asmjit::CodeHolder* code);
-@@ -78,7 +85,8 @@ class CodeAllocatorCinder : public CodeAllocator {
+@@ -78,7 +96,8 @@ class CodeAllocatorCinder : public CodeAllocator {
    // Ensure the given bump allocator has at least `size` bytes free, allocating
    // a new chunk if necessary.
    void ensureSpace(
@@ -355,7 +502,14 @@ index 013d0f7994150415f14c309788149cf0eb35474d..1cc86b24c3cb99cf1770c7281572183f
        size_t& alloc_free,
        size_t size,
        bool use_huge_pages);
-@@ -94,14 +102,16 @@ class CodeAllocatorCinder : public CodeAllocator {
+@@ -90,20 +109,27 @@ class CodeAllocatorCinder : public CodeAllocator {
+   // (±128MB for B/BL, ±1MB for B.cond). Used only on aarch64.
+   void ensureSplitSpace(size_t hot_needed, size_t cold_needed);
+ 
++  // Stop allocating into inherited shared backing pages after fork().
++  void ensureProcessGeneration();
++
+   // Protects all allocator-owned state used by addCode()/contains().
    mutable std::mutex allocator_mutex_;
  
    // List of all chunks allocated, for use in deallocation and contains().
@@ -374,7 +528,11 @@ index 013d0f7994150415f14c309788149cf0eb35474d..1cc86b24c3cb99cf1770c7281572183f
 +  uint8_t* cold_rw_alloc_{nullptr};
    size_t cold_alloc_free_{0};
  
++  uint64_t process_id_{0};
++
    // Number of bytes in total lost when allocations didn't fit neatly into
+   // the bytes remaining in a chunk so a new one was allocated.
+   std::atomic<size_t> lost_bytes_{0};
 diff --git a/cinderx/Jit/code_allocator_iface.h b/cinderx/Jit/code_allocator_iface.h
 index 1d2b1fd2d48bd9f1df9e44ef44efda839cf6c1f1..3e612fa6891b7c2ff1fd9047044ec7e50eb783d8 100644
 --- a/cinderx/Jit/code_allocator_iface.h
@@ -454,20 +612,25 @@ index d07573c9527982249e33de03d48d2c7ee710593d..8501d8e3d74432e5cc43a8af0bebd8ac
  #endif
  
 diff --git a/cinderx/RuntimeTests/code_allocator_test.cpp b/cinderx/RuntimeTests/code_allocator_test.cpp
-index fb43355d2f853f6a00d63f9006f6a7441f5588e6..8a7f9ce8f9df8887d1226e3310785af055831aca 100644
+index fb43355d2f853f6a00d63f9006f6a7441f5588e6..b755934514aa0cf29eace36b1e4f9fc907fcafa5 100644
 --- a/cinderx/RuntimeTests/code_allocator_test.cpp
 +++ b/cinderx/RuntimeTests/code_allocator_test.cpp
-@@ -10,7 +10,9 @@
+@@ -10,7 +10,14 @@
  #include <array>
  #include <cstdint>
  #include <cstring>
 +#include <fstream>
  #include <memory>
 +#include <string>
++
++#ifndef WIN32
++#include <sys/wait.h>
++#include <unistd.h>
++#endif
  
  using namespace jit;
  using namespace jit::codegen;
-@@ -40,6 +42,31 @@ const uint8_t* addressAtOffset(const void* base, uintptr_t offset) {
+@@ -40,6 +47,31 @@ const uint8_t* addressAtOffset(const void* base, uintptr_t offset) {
        reinterpret_cast<uintptr_t>(base) + offset);
  }
  
@@ -499,7 +662,7 @@ index fb43355d2f853f6a00d63f9006f6a7441f5588e6..8a7f9ce8f9df8887d1226e3310785af0
  TEST_F(CodeAllocatorTest, AddSplitCodeCopiesHotAndColdSections) {
    asmjit::CodeHolder code;
    code.init(code_allocator_->asmJitEnvironment());
-@@ -87,6 +114,37 @@ TEST_F(CodeAllocatorTest, AddSplitCodeCopiesHotAndColdSections) {
+@@ -87,6 +119,86 @@ TEST_F(CodeAllocatorTest, AddSplitCodeCopiesHotAndColdSections) {
            kColdText.data(),
            kColdText.size()),
        0);
@@ -533,6 +696,55 @@ index fb43355d2f853f6a00d63f9006f6a7441f5588e6..8a7f9ce8f9df8887d1226e3310785af0
 +#ifndef WIN32
 +  EXPECT_EQ(permissionsFor(standard_result.addr).substr(0, 3), "r-x");
 +  EXPECT_EQ(permissionsFor(standard_writable).substr(0, 3), "rw-");
++
++  pid_t child = fork();
++  ASSERT_NE(child, -1);
++  if (child == 0) {
++    asmjit::CodeHolder child_huge_code;
++    asmjit::CodeHolder child_standard_code;
++    if (
++        child_huge_code.init(code_allocator_->asmJitEnvironment()) !=
++            asmjit::kErrorOk ||
++        child_standard_code.init(standard_allocator.asmJitEnvironment()) !=
++            asmjit::kErrorOk) {
++      _exit(1);
++    }
++    arch::Builder child_huge_assembler{&child_huge_code};
++    arch::Builder child_standard_assembler{&child_standard_code};
++    bool assembled =
++        child_huge_assembler.embed(kHotText.data(), kHotText.size()) ==
++            asmjit::kErrorOk &&
++        child_huge_assembler.finalize() == asmjit::kErrorOk &&
++        child_standard_assembler.embed(kHotText.data(), kHotText.size()) ==
++            asmjit::kErrorOk &&
++        child_standard_assembler.finalize() == asmjit::kErrorOk;
++    AllocateResult child_huge_result =
++        code_allocator_->addCode(&child_huge_code);
++    AllocateResult child_standard_result =
++        standard_allocator.addCode(&child_standard_code);
++    bool added =
++        child_huge_result.error == asmjit::kErrorOk &&
++        child_huge_result.addr != nullptr &&
++        child_standard_result.error == asmjit::kErrorOk &&
++        child_standard_result.addr != nullptr;
++    bool isolated =
++        added &&
++        code_allocator_->writableAddress(result.addr) == nullptr &&
++        standard_allocator.writableAddress(standard_result.addr) == nullptr &&
++        code_allocator_->writableAddress(child_huge_result.addr) != nullptr &&
++        standard_allocator.writableAddress(child_standard_result.addr) !=
++            nullptr;
++    _exit(
++        assembled &&
++            added &&
++            isolated
++        ? 0
++        : 1);
++  }
++  int status = 0;
++  ASSERT_EQ(waitpid(child, &status, 0), child);
++  ASSERT_TRUE(WIFEXITED(status));
++  EXPECT_EQ(WEXITSTATUS(status), 0);
 +#endif
  }
  
