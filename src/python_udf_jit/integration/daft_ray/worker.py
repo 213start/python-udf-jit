@@ -7,6 +7,7 @@ import os
 import platform
 import secrets
 import sysconfig
+import threading
 import types
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -83,6 +84,11 @@ from python_udf_jit.runtime.variant_manager import (
 
 _PROCESS_GENERATION = secrets.token_hex(16)
 _PROCESS_ARTIFACT_LOADER = ArtifactLoader()
+_PROCESS_VARIANT_MANAGERS: dict[
+    tuple[WorkerProcessKey, VariantNamespace],
+    VariantManager[ScalarProviderVariant],
+] = {}
+_PROCESS_VARIANT_MANAGERS_LOCK = threading.Lock()
 _CONTINUATION_LIVE_KIND = {
     BOOL_SCALAR_TYPE: LiveValueKind.BOOL,
     INT32_SCALAR_TYPE: LiveValueKind.INT32,
@@ -94,6 +100,48 @@ _CONTINUATION_LIVE_KIND = {
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _process_variant_manager(
+    context: WorkerRuntimeContext,
+) -> VariantManager[ScalarProviderVariant]:
+    namespace = VariantNamespace(
+        context.run_id,
+        context.tenant_namespace,
+    )
+    identity = (context.process, namespace)
+    with _PROCESS_VARIANT_MANAGERS_LOCK:
+        manager = _PROCESS_VARIANT_MANAGERS.get(identity)
+        if manager is None:
+            manager = VariantManager[ScalarProviderVariant](
+                process=context.process,
+                namespace=namespace,
+                max_variants=64,
+                max_code_bytes=256 * 1024 * 1024,
+                max_compile_workers=1,
+                max_pending_compiles=32,
+                code_size=lambda variant: max(
+                    1,
+                    int(
+                        getattr(
+                            getattr(variant, "compiled", None),
+                            "code_size",
+                            1,
+                        )
+                    ),
+                ),
+            )
+            _PROCESS_VARIANT_MANAGERS[identity] = manager
+        return manager
+
+
+def drain_process_compilation() -> None:
+    """Wait only at an explicit qualification/diagnostic safe point."""
+
+    with _PROCESS_VARIANT_MANAGERS_LOCK:
+        managers = tuple(_PROCESS_VARIANT_MANAGERS.values())
+    for manager in managers:
+        manager.drain()
 
 
 def _runtime_context_value(context: Any, method: str) -> str:
@@ -574,27 +622,34 @@ class WorkerScalarAdapter:
             context.tenant_namespace,
             context.process.process_generation,
         )
-        self._variants = VariantManager[ScalarProviderVariant](
-            process=context.process,
-            namespace=VariantNamespace(
-                context.run_id,
-                context.tenant_namespace,
-            ),
-            max_variants=8,
-            max_code_bytes=64 * 1024 * 1024,
-            max_compile_workers=1,
-            max_pending_compiles=8,
-            code_size=lambda variant: max(
-                1,
-                int(
-                    getattr(
-                        getattr(variant, "compiled", None),
-                        "code_size",
-                        1,
-                    )
-                ),
-            ),
+        self._owns_variant_manager = not isinstance(
+            self._provider_factory,
+            CinderXScalarProviderFactory,
         )
+        if self._owns_variant_manager:
+            self._variants = VariantManager[ScalarProviderVariant](
+                process=context.process,
+                namespace=VariantNamespace(
+                    context.run_id,
+                    context.tenant_namespace,
+                ),
+                max_variants=8,
+                max_code_bytes=64 * 1024 * 1024,
+                max_compile_workers=1,
+                max_pending_compiles=8,
+                code_size=lambda variant: max(
+                    1,
+                    int(
+                        getattr(
+                            getattr(variant, "compiled", None),
+                            "code_size",
+                            1,
+                        )
+                    ),
+                ),
+            )
+        else:
+            self._variants = _process_variant_manager(context)
         self._physicalizer = ScalarPhysicalizer(
             epoch=context.process.cluster_epoch,
             process=ProcessIdentity(
@@ -1003,7 +1058,8 @@ class WorkerScalarAdapter:
         return result
 
     def close(self) -> None:
-        self._variants.close(lambda variant: variant.close())
+        if self._owns_variant_manager:
+            self._variants.close(lambda variant: variant.close())
         self._physicalizer.close()
 
 

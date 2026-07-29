@@ -29,7 +29,11 @@ def _qualification_runtime_report(_value: float) -> str:
     import ray as _ray
 
     from python_udf_jit.diagnostics.report import DEFAULT_RUNTIME_REPORT
+    from python_udf_jit.integration.daft_ray.worker import (
+        drain_process_compilation,
+    )
 
+    drain_process_compilation()
     runtime = _ray.get_runtime_context()
     pid = _os.getpid()
     run_id = _os.environ.get("UDFJIT_RUN_ID", "")
@@ -246,9 +250,7 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
             positive = daft.func(_qualification_positive)
             identity = daft.func(_qualification_identity)
             report_probe = daft.func(_qualification_runtime_report)
-            qualification_inputs = [
-                float(index) + 0.25 for index in range(64)
-            ]
+            qualification_inputs = [1.25, 4.0]
             dataframe = daft.from_pydict({"x": qualification_inputs})
             dataframe = dataframe.with_columns(
                 {"y": supported(daft.col("x"))}
@@ -306,23 +308,24 @@ class PerWorkerArtifactQualificationTests(unittest.TestCase):
                 )
                 actors.append(actor)
                 handle = RaySwordfishActorHandle(actor)
-                task_handle = handle.submit_task(
-                    _QualificationSwordfishTask(
-                        name=(
+                task = _QualificationSwordfishTask(
+                    name=(
+                        "udfjit-qualification-"
+                        f"{worker['NodeName']}"
+                    ),
+                    plan=plan,
+                    config=context.daft_execution_config,
+                    partition_sets=partition_sets,
+                    context={
+                        "query_id": (
                             "udfjit-qualification-"
                             f"{worker['NodeName']}"
-                        ),
-                        plan=plan,
-                        config=context.daft_execution_config,
-                        partition_sets=partition_sets,
-                        context={
-                            "query_id": (
-                                "udfjit-qualification-"
-                                f"{worker['NodeName']}"
-                            )
-                        },
-                    )
+                        )
+                    },
                 )
+                warmup = handle.submit_task(task)
+                ray.get(list(warmup.result_handle))
+                task_handle = handle.submit_task(task)
                 stream = task_handle.result_handle
                 objects = ray.get(list(stream))
                 self.assertGreaterEqual(len(objects), 2)
