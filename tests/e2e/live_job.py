@@ -227,7 +227,13 @@ def _write_parquet_fixture(directory: str) -> dict[str, object]:
 
     root = Path(directory)
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
-    partitions = ([0.0, 1.25], [-2.5, 9.0])
+    partitions = tuple(
+        (
+            float(index) - 8.0,
+            float(index) + 0.25,
+        )
+        for index in range(32)
+    )
     for index, values in enumerate(partitions):
         pq.write_table(
             pa.table({"measurement": pa.array(values, type=pa.float64())}),
@@ -237,7 +243,10 @@ def _write_parquet_fixture(directory: str) -> dict[str, object]:
         pa.table({"measurement": pa.array([], type=pa.float64())}),
         root / "empty.parquet",
     )
-    return {"hostname": socket.gethostname(), "file_count": 3}
+    return {
+        "hostname": socket.gethostname(),
+        "file_count": len(partitions) + 1,
+    }
 
 
 def _cleanup_fixture(directory: str) -> str:
