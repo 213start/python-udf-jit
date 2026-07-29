@@ -407,17 +407,31 @@ def _diagnostic_job(path: str, function: Callable[[float], float]):
 
     started_ns = time.time_ns()
     _assert_hooks_installed()
+    warm_frame = _input_frame(path)
+    warm_udf = daft.func(function)
+    (
+        warm_frame
+        .with_column(
+            "result",
+            warm_udf(daft.col("measurement")),
+        )
+        .select("measurement", "result")
+        .to_pydict()
+    )
     frame = _input_frame(path)
     udf = daft.func(function)
-    frame = frame.with_column("result", udf(daft.col("measurement")))
-    _uninstall_hooks()
-    try:
-        probe = daft.func(_diagnostic_probe_factory(started_ns))
-        frame = frame.with_column("evidence", probe(daft.col("result")))
-    finally:
-        _install_hooks()
-    document = frame.select("measurement", "result", "evidence").to_pydict()
-    return document, _extract_events(document["evidence"])
+    document = (
+        frame.with_column(
+            "result",
+            udf(daft.col("measurement")),
+        )
+        .select("measurement", "result")
+        .to_pydict()
+    )
+    return document, _runtime_events_since(
+        path,
+        started_ns=started_ns,
+    )
 
 
 def _runtime_events_since(
