@@ -6,12 +6,72 @@ from dataclasses import dataclass
 from typing import Callable
 
 
+GOVERNANCE_STAGES = (
+    "adapter",
+    "capture",
+    "ir",
+    "artifact",
+    "layout",
+    "variant",
+    "execute",
+)
+GOVERNANCE_DECISIONS = frozenset(
+    {
+        "accept",
+        "bind",
+        "compile",
+        "deopt",
+        "discover",
+        "fail_open",
+        "hit",
+        "interpret",
+        "load",
+        "miss",
+        "reject",
+    }
+)
+GOVERNANCE_REASON_CODES = frozenset(
+    {
+        "artifact_load_rejected",
+        "artifact_verified",
+        "candidate_discovered",
+        "capture_rejected",
+        "capture_succeeded",
+        "circuit_open",
+        "compile_capacity_exhausted",
+        "compile_failed",
+        "compile_inflight",
+        "compile_pool_closed",
+        "compile_rejected_code_budget",
+        "compile_submitted",
+        "compile_timeout",
+        "guard_miss",
+        "layout_bound",
+        "negative_cache",
+        "pre_semantics_failure",
+        "region_formed",
+        "semantic_execute",
+        "variant_cache_hit",
+        "worker_process_mismatch",
+    }
+)
+
+
 def _safe_identity(value: str, field: str) -> str:
     if (
         not isinstance(value, str)
         or not value
         or len(value) > 160
         or any(character in value for character in ("/", "\\", "\n", "\r"))
+    ):
+        raise ValueError(f"unsafe_{field}")
+    return value
+
+
+def _sha256(value: str, field: str) -> str:
+    _safe_identity(value, field)
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
     ):
         raise ValueError(f"unsafe_{field}")
     return value
@@ -29,6 +89,8 @@ class GovernanceEvent:
     decision: str
     reason_code: str
     source_identity: str
+    artifact_sha256: str | None = None
+    variant_sha256: str | None = None
     count: int = 1
     duration_ns: int = 0
 
@@ -37,18 +99,20 @@ class GovernanceEvent:
             "run_id",
             "job_id",
             "tenant_id",
-            "policy_sha256",
-            "stage",
-            "decision",
-            "reason_code",
-            "source_identity",
         ):
             _safe_identity(getattr(self, field), field)
-        if len(self.policy_sha256) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in self.policy_sha256
-        ):
-            raise ValueError("unsafe_policy_sha256")
+        _sha256(self.policy_sha256, "policy_sha256")
+        _sha256(self.source_identity, "source_identity")
+        for field in ("artifact_sha256", "variant_sha256"):
+            value = getattr(self, field)
+            if value is not None:
+                _sha256(value, field)
+        if self.stage not in GOVERNANCE_STAGES:
+            raise ValueError("unsafe_stage")
+        if self.decision not in GOVERNANCE_DECISIONS:
+            raise ValueError("unsafe_decision")
+        if self.reason_code not in GOVERNANCE_REASON_CODES:
+            raise ValueError("unsafe_reason_code")
         if (
             type(self.count) is not int
             or self.count < 0
@@ -60,6 +124,7 @@ class GovernanceEvent:
     @property
     def document(self) -> dict[str, object]:
         return {
+            "artifact_sha256": self.artifact_sha256,
             "count": self.count,
             "decision": self.decision,
             "duration_ns": self.duration_ns,
@@ -70,6 +135,7 @@ class GovernanceEvent:
             "source_identity": self.source_identity,
             "stage": self.stage,
             "tenant_id": self.tenant_id,
+            "variant_sha256": self.variant_sha256,
         }
 
 
@@ -116,13 +182,11 @@ class AsyncTelemetry:
             if self._closed:
                 self._dropped += 1
                 return False
-        try:
-            self._queue.put_nowait(event)
-        except queue.Full:
-            with self._lock:
+            try:
+                self._queue.put_nowait(event)
+            except queue.Full:
                 self._dropped += 1
-            return False
-        with self._lock:
+                return False
             self._accepted += 1
         return True
 

@@ -721,6 +721,8 @@ class RFC008SystemTests(unittest.TestCase):
                         decision="hit",
                         reason_code="variant_cache_hit",
                         source_identity="b" * 64,
+                        artifact_sha256="c" * 64,
+                        variant_sha256="d" * 64,
                     )
                 )
                 telemetry.flush()

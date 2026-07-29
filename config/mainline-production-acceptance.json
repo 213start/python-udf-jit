@@ -162,7 +162,7 @@
       "test_rfc007_unit_contract",
       "test_rfc008_unit_contract"
       ],
-      "expected_test_count": 290,
+      "expected_test_count": 294,
       "allow_skips": false
     },
     "integration": {

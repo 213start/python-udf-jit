@@ -4,6 +4,7 @@ import unittest
 
 from python_udf_jit.governance.explain import (
     build_explain_report,
+    decode_explain_report,
     source_identity,
 )
 from python_udf_jit.governance.policy import PolicySnapshot
@@ -48,6 +49,8 @@ class RFC008UnitTests(unittest.TestCase):
             decision="interpret",
             reason_code="compile_inflight",
             source_identity=identity,
+            artifact_sha256="c" * 64,
+            variant_sha256="d" * 64,
         )
         report = build_explain_report(
             [event],
@@ -58,5 +61,30 @@ class RFC008UnitTests(unittest.TestCase):
         )
         encoded = repr(report)
         self.assertTrue(report["dropped_business_values"])
+        self.assertEqual(decode_explain_report(report), report)
+        variant_event = report["stages"][5]["events"][0]
+        self.assertEqual(variant_event["source_identity"], identity)
+        self.assertEqual(variant_event["artifact_sha256"], "c" * 64)
+        self.assertEqual(variant_event["variant_sha256"], "d" * 64)
         self.assertNotIn("private.module", encoded)
         self.assertNotIn("private_function", encoded)
+
+        malformed = dict(report)
+        malformed["private_business_value"] = "customer-42"
+        with self.assertRaisesRegex(ValueError, "explain_report_invalid"):
+            decode_explain_report(malformed)
+
+        conflated = GovernanceEvent(
+            **{
+                **event.__dict__,
+                "source_identity": "e" * 64,
+            }
+        )
+        scoped = build_explain_report(
+            [event, conflated],
+            run_id="run-a",
+            job_id="job-a",
+            tenant_id="tenant-a",
+            policy_sha256=policy.sha256,
+        )
+        self.assertEqual(len(scoped["stages"][5]["events"]), 2)
