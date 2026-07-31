@@ -50,6 +50,7 @@ class BundleRejectCode(StrEnum):
     UNSUPPORTED_VERSION = "bundle_unsupported_version"
     HASH_MISMATCH = "bundle_hash_mismatch"
     SIZE_MISMATCH = "bundle_size_mismatch"
+    ARTIFACT_UNLISTED = "bundle_artifact_unlisted"
     PERMISSION_INVALID = "bundle_permission_invalid"
     COMPLETE_MARKER_INVALID = "bundle_complete_marker_invalid"
     TOTAL_SIZE_LIMIT = "bundle_total_size_limit"
@@ -555,26 +556,30 @@ def open_bundle(
     return BundleWriter(policy, run_context)
 
 
-def _validate_json_shape(value: object) -> None:
+def _validate_json_shape(
+    value: object,
+    *,
+    reject_code: BundleRejectCode = BundleRejectCode.MANIFEST_INVALID,
+) -> None:
     nodes = 0
     stack: list[tuple[object, int]] = [(value, 1)]
     while stack:
         current, depth = stack.pop()
         nodes += 1
         if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
-            _fail(BundleRejectCode.MANIFEST_INVALID)
+            _fail(reject_code)
         if isinstance(current, str):
             if len(current) > _MAX_JSON_STRING:
-                _fail(BundleRejectCode.MANIFEST_INVALID)
+                _fail(reject_code)
         elif isinstance(current, list):
             stack.extend((item, depth + 1) for item in current)
         elif isinstance(current, dict):
             for key, item in current.items():
                 if not isinstance(key, str) or len(key) > _MAX_JSON_STRING:
-                    _fail(BundleRejectCode.MANIFEST_INVALID)
+                    _fail(reject_code)
                 stack.append((item, depth + 1))
         elif current is not None and type(current) not in (bool, int, float):
-            _fail(BundleRejectCode.MANIFEST_INVALID)
+            _fail(reject_code)
 
 
 def _parse_artifact(document: object) -> ArtifactRef:
@@ -789,3 +794,63 @@ def validate_bundle(path: str | os.PathLike[str]) -> DiagnosticBundle:
     """Validate a bundle using the same non-executing bounded reader."""
 
     return read_bundle(path)
+
+
+def _artifact_ref(bundle: DiagnosticBundle, path: str) -> ArtifactRef:
+    relative = _relative_path(path).as_posix()
+    for artifact in bundle.artifacts:
+        if artifact.path == relative:
+            return artifact
+    _fail(BundleRejectCode.ARTIFACT_UNLISTED, relative)
+
+
+def read_artifact_bytes(bundle: DiagnosticBundle, path: str) -> bytes:
+    """Read one manifest-listed artifact and recheck its size and digest."""
+
+    artifact = _artifact_ref(bundle, path)
+    root = bundle.path
+    if root.is_symlink() or not root.is_dir():
+        _fail(BundleRejectCode.PATH_INVALID)
+    _private_directory(root)
+    relative = PurePosixPath(artifact.path)
+    current = root
+    for part in relative.parts[:-1]:
+        current /= part
+        if current.is_symlink():
+            _fail(BundleRejectCode.PATH_SYMLINK, artifact.path)
+        if not current.is_dir():
+            _fail(BundleRejectCode.PATH_INVALID, artifact.path)
+        _private_directory(current)
+    payload = _read_regular(
+        root.joinpath(*relative.parts),
+        limit=artifact.byte_size,
+    )
+    if len(payload) != artifact.byte_size:
+        _fail(BundleRejectCode.SIZE_MISMATCH, artifact.path)
+    if hashlib.sha256(payload).hexdigest() != artifact.sha256:
+        _fail(BundleRejectCode.HASH_MISMATCH, artifact.path)
+    return payload
+
+
+def read_json_artifact(bundle: DiagnosticBundle, path: str) -> object:
+    """Decode a bounded JSON artifact without importing or executing content."""
+
+    artifact = _artifact_ref(bundle, path)
+    if not (
+        artifact.media_type == "application/json"
+        or artifact.media_type.endswith("+json")
+    ):
+        _fail(BundleRejectCode.PAYLOAD_INVALID, "media_type")
+    payload = read_artifact_bytes(bundle, artifact.path)
+    try:
+        document = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        _fail(BundleRejectCode.PAYLOAD_INVALID, "json")
+    _validate_json_shape(
+        document,
+        reject_code=BundleRejectCode.PAYLOAD_INVALID,
+    )
+    return document

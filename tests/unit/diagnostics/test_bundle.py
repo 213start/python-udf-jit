@@ -14,7 +14,9 @@ from python_udf_jit.diagnostics.bundle import (
     BundleStatus,
     DiagnosticBundleError,
     open_bundle,
+    read_artifact_bytes,
     read_bundle,
+    read_json_artifact,
 )
 from python_udf_jit.diagnostics.config import (
     DiagnosticRuntimeContext,
@@ -171,6 +173,57 @@ class DiagnosticBundleTests(unittest.TestCase):
             BundleRejectCode.PATH_INVALID.value,
         ):
             read_bundle(bundle_ref.path)
+
+    def test_artifact_reader_is_manifest_scoped_and_revalidates_content(self) -> None:
+        writer = self._writer()
+        payload = b'{"operation_id":1}'
+        writer.add(
+            "semantic/core.final.json",
+            "application/json",
+            payload,
+            {"layer": "semantic"},
+        )
+        bundle_ref = writer.complete()
+        loaded = read_bundle(bundle_ref.path)
+
+        self.assertEqual(
+            read_artifact_bytes(loaded, "semantic/core.final.json"),
+            payload,
+        )
+        self.assertEqual(
+            read_json_artifact(loaded, "semantic/core.final.json"),
+            {"operation_id": 1},
+        )
+        with self.assertRaisesRegex(
+            DiagnosticBundleError,
+            BundleRejectCode.ARTIFACT_UNLISTED.value,
+        ):
+            read_artifact_bytes(loaded, "semantic/not-listed.json")
+
+        artifact_path = bundle_ref.path / "semantic" / "core.final.json"
+        artifact_path.chmod(0o600)
+        artifact_path.write_bytes(b'{"operation_id":2}')
+        with self.assertRaisesRegex(
+            DiagnosticBundleError,
+            BundleRejectCode.HASH_MISMATCH.value,
+        ):
+            read_artifact_bytes(loaded, "semantic/core.final.json")
+
+    def test_json_artifact_reader_rejects_non_json_media_and_shape(self) -> None:
+        writer = self._writer()
+        writer.add(
+            "opaque/value.bin",
+            "application/octet-stream",
+            b'{"looks":"json"}',
+        )
+        bundle_ref = writer.complete()
+        loaded = read_bundle(bundle_ref.path)
+
+        with self.assertRaisesRegex(
+            DiagnosticBundleError,
+            BundleRejectCode.PAYLOAD_INVALID.value,
+        ):
+            read_json_artifact(loaded, "opaque/value.bin")
 
 
 if __name__ == "__main__":

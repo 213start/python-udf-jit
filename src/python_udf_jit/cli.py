@@ -254,6 +254,56 @@ def _benchmark_mainline(path: Path) -> dict[str, object]:
     }
 
 
+_DIAGNOSTIC_GROUPS = (
+    "source",
+    "original_bytecode",
+    "operation",
+    "region",
+    "generated_bytecode",
+    "hir",
+    "lir",
+    "machine",
+    "symbol",
+    "phase",
+)
+
+
+def _diagnostics(arguments: argparse.Namespace) -> dict[str, object]:
+    # Query-only diagnostics stay lazy so ordinary CLI and worker startup do
+    # not load provenance or hotspot projection code.
+    from python_udf_jit.diagnostics.bundle import DiagnosticBundleError
+    from python_udf_jit.diagnostics.report import (
+        diff_diagnostic_bundles,
+        hotspots_diagnostic_bundle,
+        trace_diagnostic_bundle,
+        validate_diagnostic_bundle,
+    )
+
+    try:
+        if arguments.diagnostics_command == "validate":
+            return validate_diagnostic_bundle(arguments.path)
+        if arguments.diagnostics_command == "trace":
+            return trace_diagnostic_bundle(
+                arguments.path,
+                arguments.node_id,
+                direction=arguments.direction,
+            )
+        if arguments.diagnostics_command == "hotspots":
+            return hotspots_diagnostic_bundle(
+                arguments.path,
+                group_by=arguments.group_by,
+            )
+        return diff_diagnostic_bundles(
+            arguments.baseline,
+            arguments.candidate,
+            group_by=arguments.group_by,
+        )
+    except KeyError as error:
+        raise CliError("diagnostic_node_not_found") from error
+    except (DiagnosticBundleError, OSError, TypeError, ValueError) as error:
+        raise CliError("diagnostic_bundle_invalid") from error
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="udfjitctl")
     commands = root.add_subparsers(dest="command", required=True)
@@ -277,6 +327,36 @@ def parser() -> argparse.ArgumentParser:
     )
     mainline = benchmark_commands.add_parser("mainline")
     mainline.add_argument("--config", required=True, type=Path)
+    diagnostics = commands.add_parser("diagnostics")
+    diagnostic_commands = diagnostics.add_subparsers(
+        dest="diagnostics_command",
+        required=True,
+    )
+    diagnostic_validate = diagnostic_commands.add_parser("validate")
+    diagnostic_validate.add_argument("path", type=Path)
+    diagnostic_trace = diagnostic_commands.add_parser("trace")
+    diagnostic_trace.add_argument("path", type=Path)
+    diagnostic_trace.add_argument("--id", dest="node_id", required=True)
+    diagnostic_trace.add_argument(
+        "--direction",
+        choices=("upstream", "downstream", "both"),
+        default="both",
+    )
+    diagnostic_hotspots = diagnostic_commands.add_parser("hotspots")
+    diagnostic_hotspots.add_argument("path", type=Path)
+    diagnostic_hotspots.add_argument(
+        "--group-by",
+        choices=_DIAGNOSTIC_GROUPS,
+        required=True,
+    )
+    diagnostic_diff = diagnostic_commands.add_parser("diff")
+    diagnostic_diff.add_argument("baseline", type=Path)
+    diagnostic_diff.add_argument("candidate", type=Path)
+    diagnostic_diff.add_argument(
+        "--group-by",
+        choices=_DIAGNOSTIC_GROUPS,
+        default="source",
+    )
     return root
 
 
@@ -292,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
             document = _explain(arguments.path)
         elif arguments.command == "compatibility":
             document = _compatibility(arguments.manifest)
+        elif arguments.command == "diagnostics":
+            document = _diagnostics(arguments)
         else:
             document = _benchmark_mainline(arguments.config)
     except CliError as error:
@@ -302,7 +384,11 @@ def main(argv: list[str] | None = None) -> int:
         reason_code = "internal_failure"
     else:
         print(json.dumps(document, sort_keys=True, separators=(",", ":")))
-        return 0 if document.get("status", "pass") == "pass" else 2
+        return (
+            0
+            if document.get("status", "pass") in ("pass", "valid")
+            else 2
+        )
     print(
         json.dumps(
             {

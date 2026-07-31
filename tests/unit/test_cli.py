@@ -18,9 +18,16 @@ from python_udf_jit.governance.explain import build_explain_report
 from python_udf_jit.governance.telemetry import GovernanceEvent
 from python_udf_jit.protocol.codec import encode_artifact
 from tests.unit.protocol.test_artifact_codec import artifact
+from tests.unit.diagnostics.test_report import build_diagnostic_bundle
 
 
 class CliTests(unittest.TestCase):
+    def _run(self, arguments: list[str]) -> tuple[int, dict[str, object]]:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = main(arguments)
+        return status, json.loads(output.getvalue())
+
     def test_artifact_verify_is_private_and_never_maps_machine_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "artifact.udfjit"
@@ -240,3 +247,78 @@ class CliTests(unittest.TestCase):
         self.assertEqual(benchmark["conclusion_scope"], "directional_only")
         self.assertFalse(benchmark["blocks_functional_completion"])
         self.assertEqual(benchmark["speedup"], 0.5)
+
+    def test_diagnostic_queries_validate_trace_project_and_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = build_diagnostic_bundle(root, run_id="run-a")
+            candidate = build_diagnostic_bundle(
+                root,
+                run_id="run-b",
+                second_period=12,
+            )
+
+            validate_status, validation = self._run(
+                ["diagnostics", "validate", str(baseline)]
+            )
+            trace_status, trace = self._run(
+                [
+                    "diagnostics",
+                    "trace",
+                    str(baseline),
+                    "--id",
+                    "hir:c:1",
+                    "--direction",
+                    "both",
+                ]
+            )
+            hotspot_status, hotspots = self._run(
+                [
+                    "diagnostics",
+                    "hotspots",
+                    str(baseline),
+                    "--group-by",
+                    "source",
+                ]
+            )
+            diff_status, difference = self._run(
+                [
+                    "diagnostics",
+                    "diff",
+                    str(baseline),
+                    str(candidate),
+                    "--group-by",
+                    "source",
+                ]
+            )
+
+        self.assertEqual(validate_status, 0)
+        self.assertEqual(validation["status"], "valid")
+        self.assertFalse(validation["executed_content"])
+        self.assertEqual(trace_status, 0)
+        self.assertEqual(trace["node"]["node_id"], "hir:c:1")
+        self.assertTrue(trace["upstream"])
+        self.assertTrue(trace["downstream"])
+        self.assertEqual(hotspot_status, 0)
+        self.assertEqual(hotspots["coverage"], 0.8)
+        self.assertEqual(diff_status, 0)
+        self.assertEqual(
+            difference["results"]["hotspots"]["total_weight_delta"],
+            6,
+        )
+
+    def test_diagnostic_query_failure_uses_a_finite_reason_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            status, document = self._run(
+                [
+                    "diagnostics",
+                    "validate",
+                    str(Path(directory) / "missing"),
+                ]
+            )
+
+        self.assertEqual(status, 2)
+        self.assertEqual(
+            document["reason_code"],
+            "diagnostic_bundle_invalid",
+        )
