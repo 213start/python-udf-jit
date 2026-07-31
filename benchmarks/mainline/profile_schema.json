@@ -11,6 +11,7 @@
     "environment",
     "correctness_sha256",
     "functional_status",
+    "diagnostics",
     "phase_timings",
     "hotspots",
     "performance"
@@ -62,6 +63,7 @@
       "pattern": "^[0-9a-f]{64}$"
     },
     "functional_status": {"enum": ["pass", "fail"]},
+    "diagnostics": {"const": "off"},
     "phase_timings": {
       "type": "array",
       "items": {

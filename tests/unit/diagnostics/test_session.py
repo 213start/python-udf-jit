@@ -128,6 +128,34 @@ class DiagnosticSessionTests(unittest.TestCase):
             self.assertIs(loaded.status, BundleStatus.COMPLETE)
             self.assertEqual(loaded.manifest["diagnostic_policy_hash"], policy.sha256)
 
+    def test_failed_diagnostic_stage_finalizes_as_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy = self._active_policy(root)
+            session = open_diagnostic_session(
+                policy,
+                bundle_writer=open_bundle(
+                    policy,
+                    BundleRunContext(
+                        run_id="run-1",
+                        runtime_mode="auto",
+                        process_key="worker-1",
+                    ),
+                ),
+                clock_ns=_Clock(1, 3),
+            )
+            with self.assertRaises(RuntimeError):
+                with session.span("compile", "variant:abc"):
+                    raise RuntimeError("compile failed")
+
+            bundle_ref = session.finalize(BundleStatus.COMPLETE)
+
+            self.assertIsNotNone(bundle_ref)
+            self.assertIs(
+                read_bundle(bundle_ref.path).status,
+                BundleStatus.PARTIAL,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

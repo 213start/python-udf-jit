@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 import pickle
+import tempfile
 import unittest
+from pathlib import Path
 
+from python_udf_jit.diagnostics.config import (
+    DiagnosticRuntimeContext,
+    resolve_diagnostic_policy,
+)
 from python_udf_jit.integration.daft_ray.carrier import (
     CarrierContractError,
     ExecutionCarrierObservation,
@@ -13,6 +19,40 @@ from python_udf_jit.integration.daft_ray.carrier import (
 
 
 class DriverWorkerCarrierProbeTests(unittest.TestCase):
+    def test_carrier_binds_the_frozen_diagnostic_policy_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            diagnostic_policy = resolve_diagnostic_policy(
+                {
+                    "UDFJIT_DIAGNOSTICS": "summary",
+                    "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
+                    "UDFJIT_DIAGNOSTIC_FILTER": "artifact:abc123",
+                    "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                    "UDFJIT_DIAGNOSTIC_PERF": "off",
+                    "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                    "UDFJIT_DIAGNOSTIC_MAX_BYTES": "1048576",
+                },
+                DiagnosticRuntimeContext(
+                    workspace_root=root / "workspace",
+                    home_root=root / "home",
+                ),
+            )
+            state = ProductionCarrierState.placeholder(
+                "calibration",
+                "a" * 64,
+                diagnostic_policy=diagnostic_policy,
+            )
+
+        document = json.loads(state.to_bytes())
+        self.assertEqual(
+            document["diagnostic_policy_sha256"],
+            diagnostic_policy.sha256,
+        )
+        self.assertEqual(
+            ProductionCarrierState.from_bytes(state.to_bytes()),
+            state,
+        )
+
     def test_placeholder_state_hash_is_deterministic_and_serializable(self) -> None:
         state = ProductionCarrierState.placeholder(
             candidate_id="calibration",

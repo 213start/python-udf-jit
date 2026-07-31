@@ -6,13 +6,14 @@ import hashlib
 import os
 import platform
 import secrets
+import sys
 import sysconfig
 import threading
 import time
 import types
 import weakref
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from python_udf_jit.compiler.abstract_interpreter import analyze_function
 from python_udf_jit.compiler.capture import FallbackIdentity
@@ -30,6 +31,13 @@ from python_udf_jit.diagnostics.report import (
     DEFAULT_RUNTIME_REPORT,
     RuntimeEvent,
     RuntimeEventSink,
+)
+from python_udf_jit.diagnostics.config import (
+    DiagnosticPolicySnapshot,
+    DiagnosticProfile,
+    DiagnosticRuntimeContext as DiagnosticBootstrapContext,
+    OFF_DIAGNOSTIC_POLICY,
+    resolve_diagnostic_policy,
 )
 from python_udf_jit.governance.policy import (
     DEFAULT_MAINLINE_POLICY,
@@ -359,12 +367,16 @@ class WorkerRuntimeContext:
     refresh_partition_from_ray: bool = False
     tenant_namespace: str = "default"
     policy: PolicySnapshot = DEFAULT_MAINLINE_POLICY
+    diagnostic_policy: DiagnosticPolicySnapshot = OFF_DIAGNOSTIC_POLICY
+    diagnostic_bootstrapped: bool = False
 
     @classmethod
     def from_environment(
         cls,
         *,
         policy: PolicySnapshot = DEFAULT_MAINLINE_POLICY,
+        diagnostic_environment: Mapping[str, str] | None = None,
+        diagnostic_runtime: DiagnosticBootstrapContext | None = None,
     ) -> "WorkerRuntimeContext":
         cluster_epoch = os.environ.get("UDFJIT_CLUSTER_EPOCH", "")
         run_id = os.environ.get("UDFJIT_RUN_ID", cluster_epoch)
@@ -402,6 +414,30 @@ class WorkerRuntimeContext:
             os.getpid(),
             os.environ.get("UDFJIT_PROCESS_GENERATION", _PROCESS_GENERATION),
         )
+        diagnostic_source = (
+            os.environ
+            if diagnostic_environment is None
+            else diagnostic_environment
+        )
+        diagnostic_policy = resolve_diagnostic_policy(
+            diagnostic_source,
+            diagnostic_runtime or DiagnosticBootstrapContext(),
+        )
+        diagnostic_bootstrapped = False
+        if diagnostic_policy.profile is DiagnosticProfile.FULL:
+            if diagnostic_source.get("PYTHONJITUDFDIAGNOSTICS") != "1":
+                raise ValueError(
+                    "diagnostic_backend_bootstrap_missing"
+                )
+            if any(
+                name in {"cinderx", "_cinderx", "cinderjit"}
+                or name.startswith("cinderx.")
+                for name in sys.modules
+            ):
+                raise ValueError(
+                    "diagnostic_backend_already_initialized"
+                )
+            diagnostic_bootstrapped = True
         return cls(
             run_id,
             process,
@@ -410,6 +446,8 @@ class WorkerRuntimeContext:
             refresh_partition_from_ray,
             tenant_namespace,
             policy,
+            diagnostic_policy,
+            diagnostic_bootstrapped,
         )
 
     def event_attribution(self) -> tuple[str, str]:
@@ -811,13 +849,54 @@ class WorkerScalarAdapter:
             raise ValueError("worker_context_process_mismatch")
         if context.policy.sha256 != carrier.policy.sha256:
             raise ValueError("worker_policy_hash_mismatch")
+        if (
+            context.diagnostic_policy.sha256
+            != carrier.diagnostic_policy_sha256
+        ):
+            raise ValueError(
+                "worker_diagnostic_policy_hash_mismatch"
+            )
+        if (
+            context.diagnostic_policy.profile is DiagnosticProfile.FULL
+            and not context.diagnostic_bootstrapped
+        ):
+            raise ValueError(
+                "worker_diagnostic_backend_not_bootstrapped"
+            )
         self.candidate_id = candidate_id
         self.original_callable = original_callable
         self.carrier = carrier
         self.logical_schema = logical_schema
         self.context = context
         self._target_provider = target_provider
-        self._provider_factory = provider_factory or CinderXScalarProviderFactory()
+        self._diagnostic_runtime = None
+        if context.diagnostic_policy.enabled:
+            from python_udf_jit.diagnostics.worker_runtime import (
+                open_worker_diagnostic_runtime,
+            )
+
+            process_key = (
+                "worker-" + _sha256_text(repr(context.process))[:24]
+            )
+            self._diagnostic_runtime = open_worker_diagnostic_runtime(
+                context.diagnostic_policy,
+                run_id=context.run_id,
+                runtime_mode=context.policy.mode_ceiling,
+                process_key=process_key,
+                candidate_id=candidate_id,
+                artifact_sha256=carrier.handle.content_sha256,
+                user_function=_user_function(original_callable),
+            )
+        if provider_factory is None:
+            self._provider_factory = (
+                CinderXScalarProviderFactory()
+                if self._diagnostic_runtime is None
+                else CinderXScalarProviderFactory(
+                    diagnostic_observer=self._diagnostic_runtime,
+                )
+            )
+        else:
+            self._provider_factory = provider_factory
         self._event_sink = event_sink
         self._artifact_loader = artifact_loader
         self._loader_namespace = LoaderNamespace(
@@ -1291,6 +1370,8 @@ class WorkerScalarAdapter:
         elif self._release_finalizer is not None:
             self._release_finalizer()
         self._physicalizer.close()
+        if self._diagnostic_runtime is not None:
+            self._diagnostic_runtime.finalize()
 
 
 def build_default_worker_adapter(wrapper: Any) -> WorkerScalarAdapter:

@@ -285,8 +285,8 @@ Profile，返回 `performance_status`、`speedup` 和 `conclusion_scope` 等字�
 
 ## 7. 诊断命令一览表
 
-所有命令都要求输入是当前用户拥有的普通文件，大小不超过 16 MiB，且组和其他用户没有任何权限；
-符号链接会被拒绝。常用做法是把部署方提供的文件复制到私有目录后执行 `chmod 0600 <文件>`。
+文件型命令要求输入是当前用户拥有的普通文件，大小不超过 16 MiB，且组和其他用户没有任何权限；
+符号链接会被拒绝。诊断命令读取权限为 `0700` 的 Bundle 目录，并逐个校验清单内 `0600` 文件。
 
 | 命令 | 作用 | 成功时退出码 |
 |---|---|:---:|
@@ -295,9 +295,66 @@ Profile，返回 `performance_status`、`speedup` 和 `conclusion_scope` 等字�
 | `udfjitctl artifact inspect <文件>` | 输出制品的结构化元数据 | 0 |
 | `udfjitctl explain <文件>` | 校验并规范化已有解释报告 | 0 |
 | `udfjitctl benchmark mainline --config <文件>` | 校验并摘要已有主线性能 Profile | 0 |
+| `udfjitctl diagnostics validate <Bundle>` | 只读校验 Bundle、哈希和来源图 | 0 |
+| `udfjitctl diagnostics trace <Bundle> --id <ID>` | 双向追踪中间层身份 | 0 |
+| `udfjitctl diagnostics hotspots <Bundle> --group-by <层>` | 聚合规范化 perf 热点 | 0 |
+| `udfjitctl diagnostics diff <A> <B>` | 比较产物哈希和热点变化 | 0 |
 
 文件读取、格式校验或状态检查失败时退出码为 `2`，并输出包含 `reason_code` 的 JSON。
 命令名或参数写错时由 `argparse` 直接报错，退出码同为 `2`，但输出不是上述 JSON 结构。
+
+### 7.1 端到端性能诊断
+
+深度诊断与正常运行是两条隔离链路。正常作业保持：
+
+```bash
+export UDFJIT_DIAGNOSTICS=off
+```
+
+此时 Worker 绑定 Noop 诊断实现，不创建 Bundle，不读取 perf，不构造来源图，也不启动
+CinderX 结构化导出。正式性能 A/B 的 Profile 固定包含 `diagnostics=off`；summary/full
+运行的耗时只能用于定位，不能作为性能资格结论。
+
+`summary` 只记录编译和 Worker 边界的阶段计时。`full` 必须使用新的专属 Worker 进程和
+独立 Ray Runtime Env，并在 CinderX 初始化前设置后端开关：
+
+```bash
+export UDFJIT_DIAGNOSTICS=full
+export UDFJIT_DIAGNOSTIC_DIR=/secure/absolute/path
+export UDFJIT_DIAGNOSTIC_FILTER=artifact:<artifact-sha256或前缀>
+export UDFJIT_DIAGNOSTIC_SOURCE=ranges
+export UDFJIT_DIAGNOSTIC_PERF=record
+export UDFJIT_DIAGNOSTIC_SAMPLE_RATE=1
+export UDFJIT_DIAGNOSTIC_MAX_BYTES=67108864
+export PYTHONJITUDFDIAGNOSTICS=1
+```
+
+不得在已初始化 CinderX 的共享 Worker 中热切换这些变量。Full Worker 会把 Source Range、
+原始 Bytecode、Semantic Core/Region、生成 AST、生成 Bytecode、HIR、LIR、Machine
+Range 和统一 Provenance Map 写入权限为 `0700/0600` 的内容校验 Bundle。默认只保存
+源码范围和哈希；常量、模块名、函数名和机器符号不会以明文进入结构化报告。
+
+常用只读查询：
+
+```bash
+udfjitctl diagnostics validate <bundle>
+udfjitctl diagnostics trace <bundle> --id <node-id> --direction both
+udfjitctl diagnostics hotspots <bundle> --group-by source
+udfjitctl diagnostics hotspots <bundle> --group-by hir
+udfjitctl diagnostics hotspots <bundle> --group-by phase
+udfjitctl diagnostics diff <bundle-a> <bundle-b> --group-by source
+```
+
+`trace` 不要求 perf 产物，可独立定位任意 Source/Bytecode/Operation/Region/HIR/LIR/Machine
+ID。`hotspots` 把规范化 perf IP 先匹配 `[start,end)` 机器区间，再沿 Provenance Map
+反向投影；`exact` 表示唯一来源，`shared` 表示融合后有多个来源并按权重拆分，
+`unattributed` 表示样本没有合法机器区间或上层证据。结论必须同时查看 `coverage`，不能
+把未归因样本强行分摊。
+
+Bundle 只允许用上述命令只读解析，不能作为机器码或 Artifact 输入执行。清理前先确认
+Bundle 已完成上传/审计且没有分析进程持有；随后由部署侧按明确的单个 Bundle 路径执行
+受控删除，不对诊断根目录使用递归通配。`partial`/`incomplete` 仍应保留用于排查缺失
+阶段和崩溃原因。
 
 ---
 

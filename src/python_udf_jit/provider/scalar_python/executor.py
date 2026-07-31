@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import importlib
 from typing import Callable, Protocol
@@ -274,6 +275,33 @@ class ScalarProviderFactory(Protocol):
     ) -> ScalarProviderVariant: ...
 
 
+class CinderXDiagnosticObserver(Protocol):
+    def span(self, stage: str, identity: str = ""): ...
+
+    def provenance_sink(
+        self,
+        artifact: PortableUdfArtifact,
+        key: VariantKey,
+    ): ...
+
+    def prepare_compilation(
+        self,
+        compiled: CompiledScalarFunction,
+        key: VariantKey,
+    ) -> str: ...
+
+    def record_compilation(
+        self,
+        jit_module: object,
+        compiled: CompiledScalarFunction,
+        key: VariantKey,
+        compile_instance_id: str,
+    ) -> None: ...
+
+
+_NOOP_DIAGNOSTIC_SPAN = nullcontext()
+
+
 class CinderXScalarProviderFactory:
     """Production factory: exact helpers, force-compile, and HIR proof."""
 
@@ -282,9 +310,65 @@ class CinderXScalarProviderFactory:
         *,
         jit_module_name: str = "cinderx.jit",
         runtime_module_name: str = "cinderjit",
+        diagnostic_observer: CinderXDiagnosticObserver | None = None,
     ) -> None:
         self._jit_module_name = jit_module_name
         self._runtime_module_name = runtime_module_name
+        self._diagnostic_observer = diagnostic_observer
+
+    def _diagnostic_span(self, stage: str, identity: str):
+        if self._diagnostic_observer is None:
+            return _NOOP_DIAGNOSTIC_SPAN
+        try:
+            return self._diagnostic_observer.span(stage, identity)
+        except Exception:
+            return _NOOP_DIAGNOSTIC_SPAN
+
+    def _provenance_sink(
+        self,
+        artifact: PortableUdfArtifact,
+        key: VariantKey,
+    ):
+        if self._diagnostic_observer is None:
+            return None
+        try:
+            return self._diagnostic_observer.provenance_sink(artifact, key)
+        except Exception:
+            return None
+
+    def _prepare_diagnostics(
+        self,
+        compiled: CompiledScalarFunction,
+        key: VariantKey,
+    ) -> str:
+        if self._diagnostic_observer is None:
+            return ""
+        try:
+            return self._diagnostic_observer.prepare_compilation(
+                compiled,
+                key,
+            )
+        except Exception:
+            return ""
+
+    def _record_diagnostics(
+        self,
+        jit: object,
+        compiled: CompiledScalarFunction,
+        key: VariantKey,
+        compile_instance_id: str,
+    ) -> None:
+        if self._diagnostic_observer is None or not compile_instance_id:
+            return
+        try:
+            self._diagnostic_observer.record_compilation(
+                jit,
+                compiled,
+                key,
+                compile_instance_id,
+            )
+        except Exception:
+            pass
 
     def compile(
         self,
@@ -335,19 +419,28 @@ class CinderXScalarProviderFactory:
             registry.release(input_handle)
             raise
         try:
-            compiled = compile_semantic_scalar_region(
-                artifact.semantic_core_module,
-                artifact.semantic_region_graph,
-                input_spec=input_spec,
-                output_spec=output_spec,
-                hooks=hooks,
-                execution_mode="cinderx-jit",
-                argument_kind="backend_pair",
-                continuation_contract=(
-                    None
-                    if continuation is None
-                    else continuation.contract
-                ),
+            with self._diagnostic_span(
+                "scalar_lowering",
+                getattr(key, "sha256", ""),
+            ):
+                compiled = compile_semantic_scalar_region(
+                    artifact.semantic_core_module,
+                    artifact.semantic_region_graph,
+                    input_spec=input_spec,
+                    output_spec=output_spec,
+                    hooks=hooks,
+                    execution_mode="cinderx-jit",
+                    argument_kind="backend_pair",
+                    continuation_contract=(
+                        None
+                        if continuation is None
+                        else continuation.contract
+                    ),
+                    provenance_sink=self._provenance_sink(artifact, key),
+                )
+            compile_instance_id = self._prepare_diagnostics(
+                compiled,
+                key,
             )
             if continuation is not None and not bool(
                 runtime._udf_register_continuation_code(
@@ -357,13 +450,17 @@ class CinderXScalarProviderFactory:
                 raise RuntimeError(
                     "cinderx_continuation_registration_rejected"
                 )
-            if not bool(jit.force_compile(compiled.jit_function)):
-                raise RuntimeError("cinderx_force_compile_rejected")
-            if not bool(jit.is_jit_compiled(compiled.jit_function)):
-                raise RuntimeError("cinderx_compile_not_observed")
-            opcode_counts = jit.get_function_hir_opcode_counts(
-                compiled.jit_function
-            )
+            with self._diagnostic_span(
+                "cinderx_compile",
+                compile_instance_id,
+            ):
+                if not bool(jit.force_compile(compiled.jit_function)):
+                    raise RuntimeError("cinderx_force_compile_rejected")
+                if not bool(jit.is_jit_compiled(compiled.jit_function)):
+                    raise RuntimeError("cinderx_compile_not_observed")
+                opcode_counts = jit.get_function_hir_opcode_counts(
+                    compiled.jit_function
+                )
             input_hir = _HIR_TYPE_NAME[input_spec.scalar_type]
             output_hir = _HIR_TYPE_NAME[output_spec.scalar_type]
             required = {
@@ -389,6 +486,12 @@ class CinderXScalarProviderFactory:
                 raise RuntimeError(
                     "cinderx_data_intrinsic_not_observed"
                 )
+            self._record_diagnostics(
+                jit,
+                compiled,
+                key,
+                compile_instance_id,
+            )
             return ScalarProviderVariant(
                 key,
                 compiled,

@@ -9,6 +9,7 @@ from pathlib import Path
 from python_udf_jit.benchmarks.mainline import (
     EnvironmentFingerprint,
     MainlineProfile,
+    ProfileError,
     canonical_correctness_sha256,
     validate_profile_document,
 )
@@ -101,6 +102,34 @@ class MainlineProfileTests(unittest.TestCase):
         self.assertIn("correctness_sha256", schema["required"])
         self.assertIn("phase_timings", schema["required"])
         self.assertIn("hotspots", schema["required"])
+        self.assertIn("diagnostics", schema["required"])
+
+    def test_formal_performance_profile_requires_diagnostics_off(self) -> None:
+        with self.assertRaisesRegex(
+            ProfileError,
+            "diagnostics_must_be_off",
+        ):
+            MainlineProfile(
+                run_id="run-1",
+                environment=self._environment(),
+                correctness_sha256="c" * 64,
+                diagnostic_profile="full",
+            )
+
+        profile = MainlineProfile(
+            run_id="run-1",
+            environment=self._environment(),
+            correctness_sha256="c" * 64,
+        )
+        profile.record_phase("execute", 10)
+        document = profile.to_document()
+        self.assertEqual(document["diagnostics"], "off")
+        document["diagnostics"] = "summary"
+        with self.assertRaisesRegex(
+            ProfileError,
+            "diagnostics_must_be_off",
+        ):
+            validate_profile_document(document)
 
     def test_validator_rejects_environment_phase_and_performance_tampering(
         self,

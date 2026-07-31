@@ -22,6 +22,9 @@ from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.compiler.region import form_semantic_region_graph
 from python_udf_jit.compiler.reference import reference_resume_semantic
 from python_udf_jit.diagnostics.report import InMemoryRuntimeReport
+from python_udf_jit.diagnostics.config import (
+    OFF_DIAGNOSTIC_POLICY,
+)
 from python_udf_jit.governance.policy import PolicySnapshot
 from python_udf_jit.integration.daft_ray.carrier import (
     InlineArtifactHandle,
@@ -337,6 +340,40 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(attribution, ("task-live", ""))
         self.assertEqual(fake_ray.get_runtime_context.call_count, 2)
         self.assertEqual(runtime.get_task_id.call_count, 2)
+
+    def test_from_environment_freezes_diagnostics_once_at_worker_start(self):
+        environment = {
+            "UDFJIT_CLUSTER_EPOCH": "epoch-a",
+            "UDFJIT_RUN_ID": "run-a",
+            "UDFJIT_NODE_ID": "node-a",
+            "UDFJIT_ACTOR_WORKER_ID": "worker-a",
+            "UDFJIT_PARTITION_ID": "partition-a",
+            "UDFJIT_DIAGNOSTICS": "off",
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=True):
+            context = WorkerRuntimeContext.from_environment()
+
+        self.assertIs(
+            context.diagnostic_policy,
+            OFF_DIAGNOSTIC_POLICY,
+        )
+
+    def test_worker_rejects_carrier_diagnostic_policy_drift(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "worker_diagnostic_policy_hash_mismatch",
+        ):
+            WorkerScalarAdapter(
+                candidate_id="candidate-a",
+                original_callable=self.original,
+                carrier=dataclasses.replace(
+                    self.carrier,
+                    diagnostic_policy_sha256="b" * 64,
+                ),
+                logical_schema="{'value': 'float64'}",
+                context=self.context,
+            )
 
     def test_policy_hash_and_job_namespace_bind_worker_managers(self):
         drifted = PolicySnapshot.mainline(

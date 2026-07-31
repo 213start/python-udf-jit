@@ -322,6 +322,14 @@ class DiagnosticSession:
         if self._bundle_writer is None:
             return None
         try:
+            with self._lock:
+                degraded = (
+                    self._dropped > 0
+                    or self._failures > 0
+                    or any(profile.failed for profile in self._profiles)
+                )
+            if status is BundleStatus.COMPLETE and degraded:
+                status = BundleStatus.PARTIAL
             self._bundle_writer.add(
                 "reports/stages.json",
                 "application/json",

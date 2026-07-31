@@ -6,6 +6,10 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from python_udf_jit.diagnostics.config import (
+    DiagnosticPolicySnapshot,
+    OFF_DIAGNOSTIC_POLICY,
+)
 from python_udf_jit.governance.policy import (
     DEFAULT_MAINLINE_POLICY,
     PolicySnapshot,
@@ -177,6 +181,7 @@ class ProductionCarrierState:
     manifest_sha256: str
     handle: ArtifactHandle
     policy: PolicySnapshot
+    diagnostic_policy_sha256: str = OFF_DIAGNOSTIC_POLICY.sha256
 
     @classmethod
     def placeholder(
@@ -185,12 +190,17 @@ class ProductionCarrierState:
         manifest_sha256: str,
         *,
         policy: PolicySnapshot = DEFAULT_MAINLINE_POLICY,
+        diagnostic_policy: DiagnosticPolicySnapshot = OFF_DIAGNOSTIC_POLICY,
     ) -> "ProductionCarrierState":
         if type(candidate_id) is not str or not candidate_id:
             raise CarrierContractError("candidate_id must not be empty")
         _require_sha256(manifest_sha256, "manifest_sha256")
         if not isinstance(policy, PolicySnapshot):
             raise CarrierContractError("policy snapshot is required")
+        if not isinstance(diagnostic_policy, DiagnosticPolicySnapshot):
+            raise CarrierContractError(
+                "diagnostic policy snapshot is required"
+            )
         placeholder_payload = (
             "python-udf-jit:placeholder:"
             f"{candidate_id}:{manifest_sha256}:{policy.sha256}"
@@ -201,6 +211,7 @@ class ProductionCarrierState:
             manifest_sha256=manifest_sha256,
             handle=InlineArtifactHandle("placeholder", _sha256(placeholder_payload), 0),
             policy=policy,
+            diagnostic_policy_sha256=diagnostic_policy.sha256,
         )
 
     @property
@@ -269,6 +280,7 @@ class ProductionCarrierState:
             self.manifest_sha256,
             handle,
             self.policy,
+            self.diagnostic_policy_sha256,
         )
 
     @property
@@ -291,6 +303,7 @@ class ProductionCarrierState:
                 "size_bytes": self.handle.size_bytes,
             },
             "manifest_sha256": self.manifest_sha256,
+            "diagnostic_policy_sha256": self.diagnostic_policy_sha256,
             "policy": self.policy.document,
             "policy_sha256": self.policy.sha256,
             "schema_version": self.schema_version,
@@ -318,17 +331,20 @@ class ProductionCarrierState:
     def from_bytes(cls, payload: bytes) -> "ProductionCarrierState":
         try:
             document = json.loads(payload.decode("ascii"))
+            expected = {
+                "candidate_id",
+                "handle",
+                "manifest_sha256",
+                "policy",
+                "policy_sha256",
+                "schema_version",
+            }
             if (
                 type(document) is not dict
-                or set(document)
-                != {
-                    "candidate_id",
-                    "handle",
-                    "manifest_sha256",
-                    "policy",
-                    "policy_sha256",
-                    "schema_version",
-                }
+                or set(document) not in (
+                    expected,
+                    expected | {"diagnostic_policy_sha256"},
+                )
             ):
                 raise CarrierContractError(
                     "carrier envelope fields do not match the formal schema"
@@ -378,6 +394,10 @@ class ProductionCarrierState:
                 policy=PolicySnapshot.from_document(
                     document["policy"]
                 ),
+                diagnostic_policy_sha256=document.get(
+                    "diagnostic_policy_sha256",
+                    OFF_DIAGNOSTIC_POLICY.sha256,
+                ),
             )
             if state.policy.sha256 != document["policy_sha256"]:
                 raise CarrierContractError("carrier policy hash mismatch")
@@ -401,12 +421,17 @@ class ProductionCarrierState:
             or not self.candidate_id
             or type(self.manifest_sha256) is not str
             or not isinstance(self.policy, PolicySnapshot)
+            or type(self.diagnostic_policy_sha256) is not str
             or type(self.handle.kind) is not str
             or type(self.handle.content_sha256) is not str
             or type(self.handle.size_bytes) is not int
         ):
             raise CarrierContractError("unsupported or incomplete carrier state")
         _require_sha256(self.manifest_sha256, "manifest_sha256")
+        _require_sha256(
+            self.diagnostic_policy_sha256,
+            "diagnostic_policy_sha256",
+        )
         _require_sha256(self.handle.content_sha256, "handle.content_sha256")
         if self.handle.kind not in {
             "placeholder",

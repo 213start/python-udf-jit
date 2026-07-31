@@ -115,6 +115,47 @@ class _FakeCinderXJit(ModuleType):
         }
 
 
+class _Span:
+    def __init__(self, calls, stage):
+        self._calls = calls
+        self._stage = stage
+
+    def __enter__(self):
+        self._calls.append(("span_enter", self._stage))
+
+    def __exit__(self, *_args):
+        self._calls.append(("span_exit", self._stage))
+
+
+class _DiagnosticObserver:
+    def __init__(self, calls):
+        self.calls = calls
+        self.sink = object()
+
+    def span(self, stage, _identity=""):
+        return _Span(self.calls, stage)
+
+    def provenance_sink(self, _artifact, _key):
+        self.calls.append(("provenance_sink",))
+        return self.sink
+
+    def prepare_compilation(self, compiled, _key):
+        self.calls.append(("prepare_diagnostics",))
+        compiled.jit_function.__udfjit_generated_code_hash__ = (
+            compiled.code_hash
+        )
+        return "compile-test"
+
+    def record_compilation(
+        self,
+        _jit,
+        _compiled,
+        _key,
+        compile_instance_id,
+    ):
+        self.calls.append(("record_diagnostics", compile_instance_id))
+
+
 class ExecutorTest(unittest.TestCase):
     def test_guarded_setup_failure_stays_before_explicit_commit(self):
         registry = CapabilityRegistry(epoch="epoch-a")
@@ -330,6 +371,69 @@ class ExecutorTest(unittest.TestCase):
         self.assertLess(
             event_names.index("register_continuation"),
             event_names.index("force_compile"),
+        )
+
+    def test_factory_binds_diagnostics_before_force_compile_and_records_after(
+        self,
+    ):
+        runtime = _FakeCinderjit()
+        jit = _FakeCinderXJit(runtime.calls)
+        target = lambda _input, _output: None
+        compiled = SimpleNamespace(
+            code_hash="a" * 64,
+            jit_function=target,
+        )
+        scalar_spec = SimpleNamespace(
+            scalar_type="float64",
+            nullable=False,
+        )
+        artifact = SimpleNamespace(
+            input_access_specs=(scalar_spec,),
+            output_access_spec=scalar_spec,
+            semantic_core_module=object(),
+            semantic_region_graph=object(),
+        )
+        key = SimpleNamespace(
+            process=SimpleNamespace(cluster_epoch="epoch-a"),
+            sha256="b" * 64,
+        )
+        observer = _DiagnosticObserver(runtime.calls)
+        factory = CinderXScalarProviderFactory(
+            jit_module_name=jit.__name__,
+            runtime_module_name=runtime.__name__,
+            diagnostic_observer=observer,
+        )
+
+        with (
+            patch.dict(
+                sys.modules,
+                {jit.__name__: jit, runtime.__name__: runtime},
+            ),
+            patch(
+                "python_udf_jit.provider.scalar_python.executor."
+                "compile_semantic_scalar_region",
+                return_value=compiled,
+            ) as lower,
+        ):
+            variant = factory.compile(artifact, key)
+            variant.close()
+
+        self.assertIs(
+            lower.call_args.kwargs["provenance_sink"],
+            observer.sink,
+        )
+        events = [call[0] for call in runtime.calls]
+        self.assertLess(
+            events.index("prepare_diagnostics"),
+            events.index("force_compile"),
+        )
+        self.assertLess(
+            events.index("force_compile"),
+            events.index("record_diagnostics"),
+        )
+        self.assertEqual(
+            target.__udfjit_generated_code_hash__,
+            "a" * 64,
         )
 
 

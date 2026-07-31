@@ -117,6 +117,7 @@ class MainlineProfile:
         environment: EnvironmentFingerprint,
         correctness_sha256: str,
         functional_status: str = "pass",
+        diagnostic_profile: str = "off",
     ) -> None:
         self._run_id = _text(run_id, "run_id")
         if not isinstance(environment, EnvironmentFingerprint):
@@ -125,6 +126,8 @@ class MainlineProfile:
             raise ProfileError("correctness_sha256_invalid")
         if functional_status not in {"pass", "fail"}:
             raise ProfileError("functional_status_invalid")
+        if diagnostic_profile != "off":
+            raise ProfileError("diagnostics_must_be_off")
         self._environment = environment
         self._correctness_sha256 = correctness_sha256
         self._functional_status = functional_status
@@ -228,6 +231,7 @@ class MainlineProfile:
             "environment": self._environment.to_document(),
             "correctness_sha256": self._correctness_sha256,
             "functional_status": self._functional_status,
+            "diagnostics": "off",
             "phase_timings": phases,
             "hotspots": hotspots,
             "performance": dict(self._performance),
@@ -251,6 +255,7 @@ def validate_profile_document(document: object) -> None:
         "environment",
         "correctness_sha256",
         "functional_status",
+        "diagnostics",
         "phase_timings",
         "hotspots",
         "performance",
@@ -259,6 +264,8 @@ def validate_profile_document(document: object) -> None:
         raise ProfileError("profile_fields_invalid")
     if root["schema_version"] != 1 or root["profile"] != "mainline-production":
         raise ProfileError("profile_identity_invalid")
+    if root["diagnostics"] != "off":
+        raise ProfileError("diagnostics_must_be_off")
     _text(root["run_id"], "run_id")
     if (
         not isinstance(root["correctness_sha256"], str)
