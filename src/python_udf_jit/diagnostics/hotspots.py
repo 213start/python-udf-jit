@@ -456,6 +456,7 @@ def project_hotspots(
     }
     reverse = _reverse_adjacency(provenance)
     upstream_cache: dict[tuple[str, ProvenanceLayer], tuple[str, ...]] = {}
+    machine_symbol_cache: dict[str, str | None] = {}
     accumulators: dict[str, list[float | int]] = {}
     exact_weight = 0
     shared_weight = 0
@@ -468,15 +469,20 @@ def project_hotspots(
         elif group is HotspotGroupBy.SYMBOL:
             digest = None
             if machine_id is not None:
-                digest = dict(node_by_id[machine_id].attributes).get(
-                    "symbol_sha256"
-                )
-                if digest is not None:
-                    digest = _text(
-                        digest,
-                        _SHA256,
-                        "machine symbol hash",
+                if machine_id not in machine_symbol_cache:
+                    raw_digest = dict(
+                        node_by_id[machine_id].attributes
+                    ).get("symbol_sha256")
+                    machine_symbol_cache[machine_id] = (
+                        None
+                        if raw_digest is None
+                        else _text(
+                            raw_digest,
+                            _SHA256,
+                            "machine symbol hash",
+                        )
                     )
+                digest = machine_symbol_cache[machine_id]
             if digest is None:
                 digest = sample.symbol_sha256
             keys = () if digest is None else (digest,)

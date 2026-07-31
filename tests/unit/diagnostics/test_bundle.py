@@ -7,8 +7,11 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import python_udf_jit.diagnostics.bundle as bundle_module
 from python_udf_jit.diagnostics.bundle import (
+    ArtifactRef,
     BundleRejectCode,
     BundleRunContext,
     BundleStatus,
@@ -100,6 +103,58 @@ class DiagnosticBundleTests(unittest.TestCase):
         loaded = read_bundle(bundle_ref.path)
         self.assertIs(loaded.status, BundleStatus.PARTIAL)
         self.assertEqual(loaded.manifest["dropped_counts"]["budget_exhausted"], 1)
+
+    def test_incremental_manifest_size_matches_canonical_limit_shape(self) -> None:
+        writer = self._writer(max_bytes=1024 * 1024 * 1024)
+        checkpoints = {0, 1, 9, 99, 999, 4095}
+
+        with mock.patch.object(writer, "_write_new"):
+            for index in range(4096):
+                candidate = ArtifactRef(
+                    path=f"artifact-{index}.bin",
+                    media_type="application/octet-stream",
+                    layer="test",
+                    sha256=hashlib.sha256(b"").hexdigest(),
+                    byte_size=0,
+                )
+                if index in checkpoints:
+                    expected = bundle_module._canonical_json(
+                        writer._manifest_document(
+                            status=BundleStatus.INCOMPLETE,
+                            finalized_ns=99_999_999_999_999_999_999,
+                            unavailable_reason="budget_exhausted",
+                            artifacts=[*writer._artifacts, candidate],
+                        )
+                    )
+                    self.assertEqual(
+                        writer._budget_manifest_size(candidate),
+                        len(expected),
+                    )
+                self.assertIsNotNone(
+                    writer.add(
+                        candidate.path,
+                        candidate.media_type,
+                        b"",
+                        {"layer": candidate.layer},
+                    )
+                )
+
+        expected = bundle_module._canonical_json(
+            writer._manifest_document(
+                status=BundleStatus.INCOMPLETE,
+                finalized_ns=99_999_999_999_999_999_999,
+                unavailable_reason="budget_exhausted",
+            )
+        )
+        self.assertEqual(writer._budget_manifest_size(), len(expected))
+        self.assertIsNone(
+            writer.add(
+                "artifact-overflow.bin",
+                "application/octet-stream",
+                b"",
+                {"layer": "test"},
+            )
+        )
 
     def test_abort_publishes_incomplete_without_complete_marker(self) -> None:
         writer = self._writer()

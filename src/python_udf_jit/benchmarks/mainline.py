@@ -16,6 +16,8 @@ from typing import Any, Callable, Iterator, Mapping
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PHASE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_LEGACY_PROFILE_VERSION = 1
+_PROFILE_VERSION = 2
 
 
 class ProfileError(ValueError):
@@ -225,7 +227,7 @@ class MainlineProfile:
             )
         ]
         return {
-            "schema_version": 1,
+            "schema_version": _PROFILE_VERSION,
             "profile": "mainline-production",
             "run_id": self._run_id,
             "environment": self._environment.to_document(),
@@ -248,24 +250,30 @@ def validate_profile_document(document: object) -> None:
     """Validate the closed report shape without a runtime JSON-schema dependency."""
 
     root = _mapping(document, "profile")
-    expected = {
+    legacy_fields = {
         "schema_version",
         "profile",
         "run_id",
         "environment",
         "correctness_sha256",
         "functional_status",
-        "diagnostics",
         "phase_timings",
         "hotspots",
         "performance",
     }
+    profile_version = root.get("schema_version")
+    if profile_version == _LEGACY_PROFILE_VERSION:
+        expected = legacy_fields
+    elif profile_version == _PROFILE_VERSION:
+        expected = legacy_fields | {"diagnostics"}
+    else:
+        raise ProfileError("profile_identity_invalid")
+    if "diagnostics" in root and root["diagnostics"] != "off":
+        raise ProfileError("diagnostics_must_be_off")
     if set(root) != expected:
         raise ProfileError("profile_fields_invalid")
-    if root["schema_version"] != 1 or root["profile"] != "mainline-production":
+    if root["profile"] != "mainline-production":
         raise ProfileError("profile_identity_invalid")
-    if root["diagnostics"] != "off":
-        raise ProfileError("diagnostics_must_be_off")
     _text(root["run_id"], "run_id")
     if (
         not isinstance(root["correctness_sha256"], str)

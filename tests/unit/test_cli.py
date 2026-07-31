@@ -238,12 +238,36 @@ class CliTests(unittest.TestCase):
                     ]
                 )
 
+            legacy_profile = profile.to_document()
+            legacy_profile["schema_version"] = 1
+            del legacy_profile["diagnostics"]
+            profile_path.write_text(
+                json.dumps(legacy_profile),
+                encoding="ascii",
+            )
+            profile_path.chmod(0o600)
+            legacy_benchmark_output = io.StringIO()
+            with contextlib.redirect_stdout(legacy_benchmark_output):
+                legacy_benchmark_status = main(
+                    [
+                        "benchmark",
+                        "mainline",
+                        "--config",
+                        str(profile_path),
+                    ]
+                )
+
         compatibility = json.loads(compatibility_output.getvalue())
         benchmark = json.loads(benchmark_output.getvalue())
         self.assertEqual(compatibility_status, 0)
         self.assertEqual(compatibility["reason_code"], "compatible")
         self.assertEqual(benchmark_status, 0)
+        self.assertEqual(legacy_benchmark_status, 0)
         self.assertEqual(benchmark["reason_code"], "mainline_profile_valid")
+        self.assertEqual(
+            json.loads(legacy_benchmark_output.getvalue())["reason_code"],
+            "mainline_profile_valid",
+        )
         self.assertEqual(benchmark["conclusion_scope"], "directional_only")
         self.assertFalse(benchmark["blocks_functional_completion"])
         self.assertEqual(benchmark["speedup"], 0.5)

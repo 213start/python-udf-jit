@@ -198,6 +198,25 @@ class HotspotProjectionTest(unittest.TestCase):
             json.dumps(_profile().to_document()),
         )
 
+    def test_symbol_projection_preserves_repeated_machine_ip_attribution(self):
+        document = _profile().to_document()
+        repeated = dict(document["samples"][0])
+        repeated["sample_id"] = "sample-3"
+        repeated["timestamp_ns"] = 130
+        repeated["period"] = 7
+        document["samples"].append(repeated)
+
+        report = project_hotspots(
+            NormalizedPerfProfile.from_document(document),
+            _provenance(),
+            "symbol",
+        )
+
+        self.assertEqual(report.attributed_weight, 23)
+        self.assertEqual(report.entries[0].key, "a" * 64)
+        self.assertEqual(report.entries[0].weight, 23.0)
+        self.assertEqual(report.entries[0].sample_count, 3)
+
     def test_profile_rejects_cross_process_duplicate_and_invalid_samples(self):
         cases = []
         wrong_pid = _profile().to_document()

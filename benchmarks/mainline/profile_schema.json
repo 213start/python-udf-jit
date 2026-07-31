@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:python-udf-jit:mainline-profile:v1",
+  "$id": "urn:python-udf-jit:mainline-profile:v2",
   "title": "Python UDF JIT scalar mainline phase profile",
   "type": "object",
   "additionalProperties": false,
@@ -17,7 +17,7 @@
     "performance"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "profile": {"const": "mainline-production"},
     "run_id": {"type": "string", "minLength": 1},
     "environment": {

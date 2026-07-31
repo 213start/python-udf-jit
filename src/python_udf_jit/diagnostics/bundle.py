@@ -233,6 +233,7 @@ class BundleWriter:
             _fail(BundleRejectCode.IO_ERROR, type(error).__name__)
         self._artifacts: list[ArtifactRef] = []
         self._artifact_bytes = 0
+        self._artifact_manifest_bytes = 0
         self._budget_exhausted = 0
         self._writer_failures = 0
         self._created_ns = time.time_ns()
@@ -351,18 +352,30 @@ class BundleWriter:
             "unavailable_reason": unavailable_reason,
         }
 
-    def _fits_with(self, candidate: ArtifactRef) -> bool:
-        artifacts = [*self._artifacts, candidate]
-        manifest = _canonical_json(
+    def _budget_manifest_size(
+        self,
+        candidate: ArtifactRef | None = None,
+    ) -> int:
+        envelope = _canonical_json(
             self._manifest_document(
                 status=BundleStatus.INCOMPLETE,
                 finalized_ns=99_999_999_999_999_999_999,
                 unavailable_reason="budget_exhausted",
-                artifacts=artifacts,
+                artifacts=[],
             )
         )
+        size = len(envelope) + self._artifact_manifest_bytes
+        if candidate is not None:
+            size += len(_canonical_json(candidate.document))
+            if self._artifacts:
+                size += 1
+        return size
+
+    def _fits_with(self, candidate: ArtifactRef) -> bool:
         return (
-            self._artifact_bytes + candidate.byte_size + len(manifest)
+            self._artifact_bytes
+            + candidate.byte_size
+            + self._budget_manifest_size(candidate)
             <= self._policy.max_bytes
         )
 
@@ -417,6 +430,11 @@ class BundleWriter:
         parent = self._parent(relative)
         target = parent / relative.name
         self._write_new(target, encoded)
+        if self._artifacts:
+            self._artifact_manifest_bytes += 1
+        self._artifact_manifest_bytes += len(
+            _canonical_json(candidate.document)
+        )
         self._artifacts.append(candidate)
         self._artifact_bytes += len(encoded)
         return candidate
@@ -446,6 +464,11 @@ class BundleWriter:
             except OSError as error:
                 _fail(BundleRejectCode.IO_ERROR, type(error).__name__)
             self._artifact_bytes -= removed.byte_size
+            self._artifact_manifest_bytes -= len(
+                _canonical_json(removed.document)
+            )
+            if self._artifacts:
+                self._artifact_manifest_bytes -= 1
             self._budget_exhausted += 1
             if status is not BundleStatus.INCOMPLETE:
                 status = BundleStatus.PARTIAL

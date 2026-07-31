@@ -29,6 +29,7 @@ from python_udf_jit.diagnostics.config import (
     DiagnosticProfile,
     canonical_json_bytes,
 )
+from python_udf_jit.diagnostics.hotspots import NormalizedPerfProfile
 from python_udf_jit.diagnostics.provenance import (
     ProvenanceMap,
     UpperProvenanceRecorder,
@@ -94,15 +95,20 @@ class WorkerDiagnosticRuntime:
         run_id: str,
         runtime_mode: str,
         process_key: str,
+        process_id: int,
         user_function: FunctionType,
     ) -> None:
         if not policy.enabled:
             raise ValueError("worker_diagnostics_requires_enabled_policy")
+        if type(process_id) is not int or process_id <= 0:
+            raise ValueError("worker_diagnostic_process_id_invalid")
         writer = open_bundle(
             policy,
             BundleRunContext(run_id, runtime_mode, process_key),
         )
         self.policy = policy
+        self._run_id = run_id
+        self._process_id = process_id
         self._selector = policy.selector
         self._user_function = user_function
         self._session = open_diagnostic_session(
@@ -217,7 +223,7 @@ class WorkerDiagnosticRuntime:
         payload: object,
         *,
         layer: str,
-    ) -> None:
+    ) -> bool:
         encoded = (
             payload
             if isinstance(payload, (bytes, str))
@@ -233,6 +239,8 @@ class WorkerDiagnosticRuntime:
             is None
         ):
             self.mark_partial()
+            return False
+        return True
 
     def record_compilation(
         self,
@@ -434,30 +442,45 @@ class WorkerDiagnosticRuntime:
 
     def record_perf_profile(
         self,
-        profile,
+        profile: NormalizedPerfProfile,
         *,
         raw_perf_data: bytes | None = None,
-    ) -> None:
+    ) -> bool:
+        if (
+            self.policy.perf_mode is not DiagnosticPerfMode.RECORD
+            or not isinstance(profile, NormalizedPerfProfile)
+            or profile.run_id != self._run_id
+            or profile.process_id != self._process_id
+            or (
+                raw_perf_data is not None
+                and not isinstance(raw_perf_data, bytes)
+            )
+        ):
+            self.mark_partial()
+            return False
         try:
-            self._artifact(
+            samples_recorded = self._artifact(
                 "perf/samples.json",
                 "application/json",
                 profile.to_document(),
                 layer="perf",
             )
-            self._perf_recorded = True
+            self._perf_recorded = samples_recorded
+            raw_recorded = True
             if (
                 raw_perf_data is not None
                 and self.policy.perf_mode is DiagnosticPerfMode.RECORD
             ):
-                self._artifact(
+                raw_recorded = self._artifact(
                     "perf/perf.data",
                     "application/octet-stream",
                     raw_perf_data,
                     layer="perf",
                 )
+            return samples_recorded and raw_recorded
         except Exception:
             self.mark_partial()
+            return False
 
     def finalize(self):
         with self._lock:
@@ -495,6 +518,7 @@ def open_worker_diagnostic_runtime(
     run_id: str,
     runtime_mode: str,
     process_key: str,
+    process_id: int,
     candidate_id: str,
     artifact_sha256: str,
     user_function: FunctionType,
@@ -512,5 +536,6 @@ def open_worker_diagnostic_runtime(
         run_id=run_id,
         runtime_mode=runtime_mode,
         process_key=process_key,
+        process_id=process_id,
         user_function=user_function,
     )

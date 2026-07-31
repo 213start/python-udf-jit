@@ -103,6 +103,7 @@ class MainlineProfileTests(unittest.TestCase):
         self.assertIn("phase_timings", schema["required"])
         self.assertIn("hotspots", schema["required"])
         self.assertIn("diagnostics", schema["required"])
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
 
     def test_formal_performance_profile_requires_diagnostics_off(self) -> None:
         with self.assertRaisesRegex(
@@ -123,6 +124,7 @@ class MainlineProfileTests(unittest.TestCase):
         )
         profile.record_phase("execute", 10)
         document = profile.to_document()
+        self.assertEqual(document["schema_version"], 2)
         self.assertEqual(document["diagnostics"], "off")
         document["diagnostics"] = "summary"
         with self.assertRaisesRegex(
@@ -130,6 +132,19 @@ class MainlineProfileTests(unittest.TestCase):
             "diagnostics_must_be_off",
         ):
             validate_profile_document(document)
+
+    def test_validator_accepts_legacy_v1_profiles_as_diagnostics_off(self) -> None:
+        profile = MainlineProfile(
+            run_id="run-1",
+            environment=self._environment(),
+            correctness_sha256="c" * 64,
+        )
+        profile.record_phase("execute", 10)
+        legacy = profile.to_document()
+        legacy["schema_version"] = 1
+        del legacy["diagnostics"]
+
+        validate_profile_document(legacy)
 
     def test_validator_rejects_environment_phase_and_performance_tampering(
         self,

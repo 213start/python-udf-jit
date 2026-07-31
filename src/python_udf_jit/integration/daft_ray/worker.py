@@ -13,7 +13,7 @@ import time
 import types
 import weakref
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from python_udf_jit.compiler.abstract_interpreter import analyze_function
 from python_udf_jit.compiler.capture import FallbackIdentity
@@ -33,6 +33,7 @@ from python_udf_jit.diagnostics.report import (
     RuntimeEventSink,
 )
 from python_udf_jit.diagnostics.config import (
+    DiagnosticPerfMode,
     DiagnosticPolicySnapshot,
     DiagnosticProfile,
     DiagnosticRuntimeContext as DiagnosticBootstrapContext,
@@ -95,6 +96,9 @@ from python_udf_jit.runtime.variant_manager import (
     VariantManager,
     VariantNamespace,
 )
+
+if TYPE_CHECKING:
+    from python_udf_jit.diagnostics.hotspots import NormalizedPerfProfile
 
 
 _PROCESS_GENERATION = secrets.token_hex(16)
@@ -471,6 +475,24 @@ class WorkerRuntimeContext:
 
 
 @dataclass(frozen=True)
+class WorkerDiagnosticPerfEvidence:
+    """Normalized perf evidence captured by a dedicated Worker controller."""
+
+    process: WorkerProcessKey
+    profile: NormalizedPerfProfile
+    raw_perf_data: bytes | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.process, WorkerProcessKey):
+            raise ValueError("worker_diagnostic_perf_process_invalid")
+        if (
+            self.raw_perf_data is not None
+            and not isinstance(self.raw_perf_data, bytes)
+        ):
+            raise ValueError("worker_diagnostic_perf_raw_data_invalid")
+
+
+@dataclass(frozen=True)
 class RuntimeTarget:
     python_version: str
     cpython_cinderx_soabi: str
@@ -840,6 +862,9 @@ class WorkerScalarAdapter:
         provider_factory: ScalarProviderFactory | None = None,
         event_sink: RuntimeEventSink = DEFAULT_RUNTIME_REPORT,
         artifact_loader: ArtifactLoader = _PROCESS_ARTIFACT_LOADER,
+        diagnostic_perf_provider: (
+            Callable[[], WorkerDiagnosticPerfEvidence | None] | None
+        ) = None,
     ) -> None:
         if not candidate_id or not callable(original_callable):
             raise ValueError("invalid_worker_candidate")
@@ -869,6 +894,8 @@ class WorkerScalarAdapter:
         self.logical_schema = logical_schema
         self.context = context
         self._target_provider = target_provider
+        self._diagnostic_perf_provider = diagnostic_perf_provider
+        self._diagnostic_perf_recorded = False
         self._diagnostic_runtime = None
         if context.diagnostic_policy.enabled:
             from python_udf_jit.diagnostics.worker_runtime import (
@@ -883,6 +910,7 @@ class WorkerScalarAdapter:
                 run_id=context.run_id,
                 runtime_mode=context.policy.mode_ceiling,
                 process_key=process_key,
+                process_id=context.process.pid,
                 candidate_id=candidate_id,
                 artifact_sha256=carrier.handle.content_sha256,
                 user_function=_user_function(original_callable),
@@ -937,6 +965,41 @@ class WorkerScalarAdapter:
         self._key: VariantKey | None = None
         self._continuation_initialized = False
         self._continuation: InterpreterContinuation[object] | None = None
+
+    def _record_diagnostic_perf_evidence(
+        self,
+        evidence: WorkerDiagnosticPerfEvidence,
+    ) -> bool:
+        runtime = self._diagnostic_runtime
+        if (
+            runtime is None
+            or self.context.diagnostic_policy.perf_mode
+            is not DiagnosticPerfMode.RECORD
+            or self._diagnostic_perf_recorded
+        ):
+            return False
+        if (
+            not isinstance(evidence, WorkerDiagnosticPerfEvidence)
+            or evidence.process != self.context.process
+        ):
+            runtime.mark_partial()
+            return False
+        accepted = runtime.record_perf_profile(
+            evidence.profile,
+            raw_perf_data=evidence.raw_perf_data,
+        )
+        self._diagnostic_perf_recorded = accepted
+        return accepted
+
+    def record_diagnostic_perf_evidence(
+        self,
+        evidence: WorkerDiagnosticPerfEvidence,
+    ) -> bool:
+        """Ingest normalized evidence before this adapter is finalized."""
+
+        if self._closed:
+            return False
+        return self._record_diagnostic_perf_evidence(evidence)
 
     @property
     def owner_pid(self) -> int:
@@ -1365,6 +1428,19 @@ class WorkerScalarAdapter:
         if self._closed:
             return
         self._closed = True
+        if (
+            self._diagnostic_runtime is not None
+            and self.context.diagnostic_policy.perf_mode
+            is DiagnosticPerfMode.RECORD
+            and not self._diagnostic_perf_recorded
+            and self._diagnostic_perf_provider is not None
+        ):
+            try:
+                evidence = self._diagnostic_perf_provider()
+                if evidence is not None:
+                    self._record_diagnostic_perf_evidence(evidence)
+            except Exception:
+                self._diagnostic_runtime.mark_partial()
         if self._owns_variant_manager:
             self._variants.close()
         elif self._release_finalizer is not None:
