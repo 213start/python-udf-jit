@@ -5,7 +5,7 @@ import hashlib
 import marshal
 from dataclasses import dataclass
 from types import CodeType, FunctionType
-from typing import Callable, Literal
+from typing import Callable, Literal, Protocol
 
 from python_udf_jit.compiler.core_ir import (
     CoreNode,
@@ -53,6 +53,25 @@ StoreFunction = Callable[[object, object], object]
 StoreNullFunction = Callable[[object], None]
 ContinuationPayloadFunction = Callable[..., object]
 ArgumentKind = Literal["capability_pair", "backend_pair"]
+
+
+@dataclass(frozen=True)
+class ScalarLoweringSnapshot:
+    """Process-local diagnostic snapshot produced only for an explicit sink."""
+
+    semantic_hash: str
+    region_graph_hash: str
+    generated_code_hash: str
+    generated_code: CodeType
+    generated_ast_text: str
+    operation_lines: tuple[tuple[int, tuple[str, ...]], ...]
+
+
+class ScalarProvenanceSink(Protocol):
+    def record_scalar_lowering(
+        self,
+        snapshot: ScalarLoweringSnapshot,
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -285,6 +304,18 @@ def _function_module(body: list[ast.stmt]) -> ast.Module:
     return ast.fix_missing_locations(
         ast.Module(body=[function], type_ignores=[])
     )
+
+
+def _set_synthetic_origin(nodes: list[ast.stmt], line: int) -> None:
+    for root in nodes:
+        for node in ast.walk(root):
+            attributes = getattr(node, "_attributes", ())
+            if "lineno" not in attributes:
+                continue
+            node.lineno = line
+            node.col_offset = 0
+            node.end_lineno = line
+            node.end_col_offset = 1
 
 
 def _logical_type_for_scalar(scalar_type: str) -> LogicalType:
@@ -716,11 +747,20 @@ def _build_semantic_function_ast(
     input_nullable: bool,
     output_nullable: bool,
     continuation_contract: ContinuationContract | None,
+    operation_lines: list[tuple[int, tuple[str, ...]]] | None = None,
 ) -> ast.Module:
     operation_by_id = {
         operation.operation_id: operation
         for operation in module.operations
     }
+    operation_index = (
+        None
+        if operation_lines is None
+        else {
+            operation.operation_id: index
+            for index, operation in enumerate(module.operations)
+        }
+    )
     input_load = _load_expression()
     if input_nullable:
         input_body: list[ast.stmt] = [
@@ -774,13 +814,17 @@ def _build_semantic_function_ast(
     for block in module.blocks:
         block_body: list[ast.stmt] = []
         for operation_id in block.operation_ids:
-            block_body.extend(
-                _operation_statements(
-                    operation_by_id[operation_id],
-                    output_nullable=output_nullable,
-                    continuation_contract=continuation_contract,
-                )
+            statements = _operation_statements(
+                operation_by_id[operation_id],
+                output_nullable=output_nullable,
+                continuation_contract=continuation_contract,
             )
+            if operation_lines is not None:
+                assert operation_index is not None
+                line = operation_index[operation_id] + 2
+                _set_synthetic_origin(statements, line)
+                operation_lines.append((line, (operation_id,)))
+            block_body.extend(statements)
         branch = ast.If(
             test=ast.Compare(
                 left=ast.Name(id="_scalar_block", ctx=ast.Load()),
@@ -861,6 +905,9 @@ def _materialize_compiled(
     argument_kind: ArgumentKind,
     input_spec: AccessSpec,
     output_spec: AccessSpec,
+    provenance_sink: ScalarProvenanceSink | None = None,
+    region_graph_hash: str | None = None,
+    operation_lines: tuple[tuple[int, tuple[str, ...]], ...] | None = None,
 ) -> CompiledScalarFunction:
     if not isinstance(execution_mode, str) or not execution_mode:
         raise ValueError("execution mode must be a non-empty string")
@@ -900,7 +947,7 @@ def _materialize_compiled(
         + bytes([output_spec.nullable])
         + marshal.dumps(function.__code__)
     ).hexdigest()
-    return CompiledScalarFunction(
+    compiled = CompiledScalarFunction(
         semantic_hash,
         code_hash,
         execution_mode,
@@ -911,6 +958,19 @@ def _materialize_compiled(
         input_spec,
         output_spec,
     )
+    if provenance_sink is not None:
+        from python_udf_jit.diagnostics.provenance import generated_ast_text
+
+        snapshot = ScalarLoweringSnapshot(
+            semantic_hash,
+            region_graph_hash or "",
+            code_hash,
+            function.__code__,
+            generated_ast_text(generated),
+            operation_lines or (),
+        )
+        provenance_sink.record_scalar_lowering(snapshot)
+    return compiled
 
 
 def compile_scalar_region(
@@ -962,6 +1022,7 @@ def compile_semantic_scalar_region(
     execution_mode: str = "python-interpreter",
     argument_kind: ArgumentKind | None = None,
     continuation_contract: ContinuationContract | None = None,
+    provenance_sink: ScalarProvenanceSink | None = None,
 ) -> CompiledScalarFunction:
     """Materialize process-local code from the formal scalar region graph."""
 
@@ -979,14 +1040,19 @@ def compile_semantic_scalar_region(
         hooks=hooks,
         argument_kind=argument_kind,
     )
+    operation_lines: list[tuple[int, tuple[str, ...]]] | None = (
+        [] if provenance_sink is not None else None
+    )
+    generated = _build_semantic_function_ast(
+        module,
+        graph,
+        input_nullable=input_spec.nullable,
+        output_nullable=output_spec.nullable,
+        continuation_contract=continuation_contract,
+        operation_lines=operation_lines,
+    )
     return _materialize_compiled(
-        generated=_build_semantic_function_ast(
-            module,
-            graph,
-            input_nullable=input_spec.nullable,
-            output_nullable=output_spec.nullable,
-            continuation_contract=continuation_contract,
-        ),
+        generated=generated,
         semantic_hash=module.semantic_hash,
         execution_mode=execution_mode,
         hooks=resolved,
@@ -994,4 +1060,9 @@ def compile_semantic_scalar_region(
         argument_kind=resolved_kind,
         input_spec=input_spec,
         output_spec=output_spec,
+        provenance_sink=provenance_sink,
+        region_graph_hash=graph.semantic_hash,
+        operation_lines=(
+            None if operation_lines is None else tuple(operation_lines)
+        ),
     )

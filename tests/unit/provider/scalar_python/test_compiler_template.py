@@ -3,16 +3,26 @@ from __future__ import annotations
 import dis
 import math
 import unittest
+from unittest.mock import patch
 
 from python_udf_jit.compiler.capture import CaptureRequest, capture
+from python_udf_jit.compiler.bytecode_decoder import decode_code
 from python_udf_jit.compiler.core_ir import lower_capture
+from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.compiler.region import form_verified_region
+from python_udf_jit.diagnostics.provenance import UpperProvenanceRecorder
 from python_udf_jit.provider.scalar_python.capability import CapabilityRegistry
 from python_udf_jit.provider.scalar_python.compiler import (
     ScalarLoweringHooks,
+    compile_semantic_scalar_region,
     compile_scalar_region,
 )
 from python_udf_jit.provider.scalar_python.executor import ScalarExecutor
+from python_udf_jit.runtime.descriptors import (
+    scalar_input_spec,
+    scalar_output_spec,
+)
+from python_udf_jit.runtime.layout import FLOAT64_SCALAR_TYPE
 from python_udf_jit.runtime.layout import LocalScalarSlotBackend
 
 
@@ -30,6 +40,10 @@ def changed_constant(x):
 
 def changed_operator(x):
     return x * 2.0 - 3.0
+
+
+def diagnostic_secret_constant(x):
+    return x + 1234567.125
 
 
 class CompilerTemplateTest(unittest.TestCase):
@@ -148,6 +162,143 @@ class CompilerTemplateTest(unittest.TestCase):
         registry_b.release(input_b)
         registry_c.release(output_c)
         registry_c.release(input_c)
+
+    def test_explicit_provenance_sink_maps_generated_offsets_to_operations(self):
+        result = compile_semantic(capture(CaptureRequest(affine)))
+        self.assertTrue(result.accepted)
+        assert result.core_module is not None
+        assert result.region_graph is not None
+        recorder = UpperProvenanceRecorder(
+            decode_code(affine.__code__).source_map,
+            result.core_module,
+            result.region_graph,
+        )
+        registry = CapabilityRegistry(epoch="epoch-provenance")
+
+        compiled = compile_semantic_scalar_region(
+            result.core_module,
+            result.region_graph,
+            input_spec=scalar_input_spec(
+                FLOAT64_SCALAR_TYPE,
+                nullable=False,
+            ),
+            output_spec=scalar_output_spec(
+                FLOAT64_SCALAR_TYPE,
+                nullable=False,
+            ),
+            registry=registry,
+            provenance_sink=recorder,
+        )
+
+        generated_nodes = {
+            node.bytecode_offset: node
+            for node in recorder.provenance_map.nodes
+            if node.layer.value == "generated_bytecode"
+        }
+        lowered_operations = {
+            edge.from_node_id
+            for edge in recorder.provenance_map.edges
+            if edge.to_node_id in {
+                node.node_id for node in generated_nodes.values()
+            }
+            and edge.from_node_id.startswith("core:")
+        }
+        expected_operations = {
+            f"core:{result.core_module.semantic_hash}:{operation.operation_id}"
+            for operation in result.core_module.operations
+        }
+        source_mapped_operations = {
+            f"core:{result.core_module.semantic_hash}:{operation.operation_id}"
+            for operation in result.core_module.operations
+            if operation.source_offset is not None
+        }
+        self.assertEqual(lowered_operations, expected_operations)
+        self.assertEqual(
+            set(generated_nodes),
+            {
+                instruction.offset
+                for instruction in dis.get_instructions(
+                    compiled.code_object,
+                    show_caches=True,
+                )
+            },
+        )
+        for operation_id in expected_operations:
+            generated = {
+                node.node_id
+                for node in recorder.provenance_map.trace_downstream(
+                    operation_id
+                )
+                if node.layer.value == "generated_bytecode"
+            }
+            self.assertTrue(generated)
+            if operation_id in source_mapped_operations:
+                self.assertTrue(
+                    any(
+                        node.layer.value == "source"
+                        for generated_id in generated
+                        for node in recorder.provenance_map.trace_upstream(
+                            generated_id
+                        )
+                    )
+                )
+        self.assertIn("FunctionDef", recorder.generated_ast_text)
+        self.assertTrue(recorder.lowering_map["entries"])
+
+    def test_generated_ast_diagnostic_redacts_literal_bodies(self):
+        result = compile_semantic(
+            capture(CaptureRequest(diagnostic_secret_constant))
+        )
+        assert result.core_module is not None
+        assert result.region_graph is not None
+        recorder = UpperProvenanceRecorder(
+            decode_code(diagnostic_secret_constant.__code__).source_map,
+            result.core_module,
+            result.region_graph,
+        )
+
+        compile_semantic_scalar_region(
+            result.core_module,
+            result.region_graph,
+            input_spec=scalar_input_spec(
+                FLOAT64_SCALAR_TYPE,
+                nullable=False,
+            ),
+            output_spec=scalar_output_spec(
+                FLOAT64_SCALAR_TYPE,
+                nullable=False,
+            ),
+            registry=CapabilityRegistry(epoch="epoch-redacted-ast"),
+            provenance_sink=recorder,
+        )
+
+        self.assertNotIn("1234567.125", recorder.generated_ast_text)
+        self.assertIn("<redacted:float:", recorder.generated_ast_text)
+
+    def test_no_provenance_sink_does_not_construct_snapshot(self):
+        result = compile_semantic(capture(CaptureRequest(affine)))
+        assert result.core_module is not None
+        assert result.region_graph is not None
+        registry = CapabilityRegistry(epoch="epoch-no-provenance")
+
+        with patch(
+            "python_udf_jit.provider.scalar_python.compiler."
+            "ScalarLoweringSnapshot",
+            side_effect=AssertionError("diagnostic snapshot constructed"),
+        ):
+            compile_semantic_scalar_region(
+                result.core_module,
+                result.region_graph,
+                input_spec=scalar_input_spec(
+                    FLOAT64_SCALAR_TYPE,
+                    nullable=False,
+                ),
+                output_spec=scalar_output_spec(
+                    FLOAT64_SCALAR_TYPE,
+                    nullable=False,
+                ),
+                registry=registry,
+            )
 
 
 if __name__ == "__main__":
