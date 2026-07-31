@@ -1,7 +1,6 @@
 """Diagnostic sessions selected once outside execution hot paths."""
 from __future__ import annotations
 
-import json
 import math
 import re
 import threading
@@ -15,7 +14,10 @@ from python_udf_jit.diagnostics.bundle import (
     BundleStatus,
     BundleWriter,
 )
-from python_udf_jit.diagnostics.config import DiagnosticPolicySnapshot
+from python_udf_jit.diagnostics.config import (
+    DiagnosticPolicySnapshot,
+    canonical_json_bytes,
+)
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -239,13 +241,7 @@ class DiagnosticSession:
     ) -> bool:
         try:
             copied = [dict(document) for document in documents]
-            json.dumps(
-                copied,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                allow_nan=False,
-            )
+            canonical_json_bytes(copied)
             with self._lock:
                 if len(target) + len(copied) > _MAX_RECORDS:
                     self._dropped += len(copied)
@@ -307,13 +303,7 @@ class DiagnosticSession:
                 ],
                 "profiles": [profile.document for profile in self._profiles],
             }
-        return json.dumps(
-            document,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("ascii")
+        return canonical_json_bytes(document)
 
     def finalize(self, status: BundleStatus) -> BundleRef | None:
         if self._finalized:

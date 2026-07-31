@@ -12,6 +12,7 @@ import dis
 import hashlib
 import json
 import marshal
+from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from types import CodeType
@@ -308,10 +309,10 @@ class ProvenanceMap:
             )
             adjacency.setdefault(source, set()).add(target)
         seen = {node_id}
-        pending = list(sorted(adjacency.get(node_id, ())))
+        pending = deque(sorted(adjacency.get(node_id, ())))
         result: list[ProvenanceNode] = []
         while pending:
-            current = pending.pop(0)
+            current = pending.popleft()
             if current in seen:
                 continue
             seen.add(current)

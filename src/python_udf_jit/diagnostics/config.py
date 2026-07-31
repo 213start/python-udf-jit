@@ -230,7 +230,9 @@ def _policy_document(
     }
 
 
-def _canonical_json(document: object) -> bytes:
+def canonical_json_bytes(document: object) -> bytes:
+    """Encode a diagnostics document with the canonical wire format."""
+
     return json.dumps(
         document,
         sort_keys=True,
@@ -312,7 +314,7 @@ def resolve_diagnostic_policy(
         max_bytes=max_bytes,
         requires_dedicated_worker=requires_dedicated_worker,
     )
-    digest = hashlib.sha256(_canonical_json(document)).hexdigest()
+    digest = hashlib.sha256(canonical_json_bytes(document)).hexdigest()
     return DiagnosticPolicySnapshot(
         profile=profile,
         output_root=output_root,

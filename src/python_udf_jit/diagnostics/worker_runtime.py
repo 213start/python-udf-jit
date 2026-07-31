@@ -7,7 +7,6 @@ bundle, provenance recorder, clock, or CinderX diagnostic observer.
 from __future__ import annotations
 
 import hashlib
-import json
 import threading
 from dataclasses import dataclass
 from types import FunctionType
@@ -28,6 +27,7 @@ from python_udf_jit.diagnostics.config import (
     DiagnosticPerfMode,
     DiagnosticPolicySnapshot,
     DiagnosticProfile,
+    canonical_json_bytes,
 )
 from python_udf_jit.diagnostics.provenance import (
     ProvenanceMap,
@@ -36,16 +36,6 @@ from python_udf_jit.diagnostics.provenance import (
 )
 from python_udf_jit.diagnostics.session import open_diagnostic_session
 from python_udf_jit.protocol.artifact import PortableUdfArtifact
-
-
-def _canonical_json(document: object) -> bytes:
-    return json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("ascii")
 
 
 def _hash_text(value: str) -> str:
@@ -231,7 +221,7 @@ class WorkerDiagnosticRuntime:
         encoded = (
             payload
             if isinstance(payload, (bytes, str))
-            else _canonical_json(payload)
+            else canonical_json_bytes(payload)
         )
         if (
             self._session.record_artifact(

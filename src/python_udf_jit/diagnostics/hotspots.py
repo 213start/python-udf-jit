@@ -203,8 +203,9 @@ class NormalizedPerfProfile:
             _nonnegative(value["lost_samples"], "lost samples"),
             tuple(PerfSample.from_document(item) for item in raw_samples),
         )
-        sample_ids = tuple(sample.sample_id for sample in result.samples)
-        if len(sample_ids) != len(set(sample_ids)):
+        if len(result.samples) != len(
+            {sample.sample_id for sample in result.samples}
+        ):
             raise ValueError("duplicate perf sample id")
         if any(
             sample.pid != result.process_id
@@ -555,7 +556,7 @@ def diff_hotspot_reports(
     baseline_entries = {entry.key: entry for entry in baseline.entries}
     candidate_entries = {entry.key: entry for entry in candidate.entries}
     entries = []
-    for key in sorted(set(baseline_entries) | set(candidate_entries)):
+    for key in set(baseline_entries) | set(candidate_entries):
         before = baseline_entries.get(key)
         after = candidate_entries.get(key)
         before_weight = 0.0 if before is None else before.weight
