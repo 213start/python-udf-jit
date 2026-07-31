@@ -1,0 +1,767 @@
+diff --git a/cinderx/Jit/codegen/annotations.cpp b/cinderx/Jit/codegen/annotations.cpp
+index 9094c45..181837d 100644
+--- a/cinderx/Jit/codegen/annotations.cpp
++++ b/cinderx/Jit/codegen/annotations.cpp
+@@ -5,12 +5,54 @@
+ #include "cinderx/Jit/disassembler.h"
+ #include "cinderx/Jit/hir/printer.h"
+ 
++#include <algorithm>
+ #include <map>
+ #include <sstream>
++#include <tuple>
+ #include <utility>
+ 
+ namespace jit::codegen {
+ 
++std::vector<ResolvedAnnotation> Annotations::resolve(
++    void* entry,
++    const asmjit::CodeHolder& code) const {
++  JIT_CHECK(code.hasBaseAddress(), "code not generated!");
++  std::vector<ResolvedAnnotation> result;
++  auto base = reinterpret_cast<uintptr_t>(entry);
++  for (const Annotation& annotation : annotations_) {
++    uintptr_t start = base + code.labelOffsetFromBase(annotation.begin);
++    uintptr_t end = base + code.labelOffsetFromBase(annotation.end);
++    if (start >= end) {
++      continue;
++    }
++    forEachSection([&](CodeSection section) {
++      auto text = code.sectionByName(codeSectionName(section));
++      if (text == nullptr) {
++        return;
++      }
++      uintptr_t section_start = base + text->offset();
++      uintptr_t section_end = section_start + text->realSize();
++      if (start >= section_start && end <= section_end) {
++        result.push_back(ResolvedAnnotation{
++            start,
++            end,
++            section,
++            annotation.instr,
++            annotation.instr == nullptr,
++        });
++      }
++    });
++  }
++  std::sort(
++      result.begin(),
++      result.end(),
++      [](const ResolvedAnnotation& left, const ResolvedAnnotation& right) {
++        return std::tie(left.start, left.end) <
++            std::tie(right.start, right.end);
++      });
++  return result;
++}
++
+ std::string Annotations::disassembleSection(
+     void* entry,
+     const asmjit::CodeHolder& code,
+@@ -77,8 +119,11 @@ std::string Annotations::disassembleSection(
+       if (new_annot == nullptr) {
+         annot_str = "--unassigned--";
+       } else {
+-        auto new_hir = new_annot->instr;
+-        auto prev_hir = prev_annot ? prev_annot->instr : nullptr;
++        auto new_hir =
++            new_annot->instr == nullptr ? nullptr : new_annot->instr->origin();
++        auto prev_hir = prev_annot == nullptr || prev_annot->instr == nullptr
++            ? nullptr
++            : prev_annot->instr->origin();
+         if (new_hir != nullptr && new_hir != prev_hir) {
+           annot_str =
+               hir::HIRPrinter().setFullSnapshots(true).ToString(*new_hir);
+diff --git a/cinderx/Jit/codegen/annotations.h b/cinderx/Jit/codegen/annotations.h
+index 70d494d..7152095 100644
+--- a/cinderx/Jit/codegen/annotations.h
++++ b/cinderx/Jit/codegen/annotations.h
+@@ -8,6 +8,7 @@
+ 
+ #include <asmjit/asmjit.h>
+ 
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+@@ -21,7 +22,10 @@ namespace codegen {
+ // An annotation for a region of assembly code, containing the HIR instruction
+ // the region came from and/or a text description of its contents.
+ struct Annotation {
+-  Annotation(const hir::Instr* instr, asmjit::Label begin, asmjit::Label end)
++  Annotation(
++      const lir::Instruction* instr,
++      asmjit::Label begin,
++      asmjit::Label end)
+       : instr(instr), begin(begin), end(end) {
+     JIT_DCHECK(instr != nullptr, "instr can't be null");
+   }
+@@ -31,12 +35,20 @@ struct Annotation {
+     JIT_DCHECK(!this->str.empty(), "str can't be empty");
+   }
+ 
+-  const hir::Instr* const instr = nullptr;
++  const lir::Instruction* const instr = nullptr;
+   std::string const str;
+   asmjit::Label const begin;
+   asmjit::Label const end;
+ };
+ 
++struct ResolvedAnnotation {
++  uintptr_t start;
++  uintptr_t end;
++  CodeSection section;
++  const lir::Instruction* instr;
++  bool synthetic;
++};
++
+ class Annotations {
+  public:
+   // If any code has been emitted since start_cursor, add an annotation region
+@@ -44,7 +56,7 @@ class Annotations {
+   // description.
+   template <typename T>
+   void add(T&& item, arch::Builder* as, asmjit::BaseNode* start_cursor) {
+-    if (!getConfig().log.dump_asm) {
++    if (!getConfig().log.dump_asm && !getConfig().udf_jit_diagnostics) {
+       return;
+     }
+     auto end_cursor = as->cursor();
+@@ -63,6 +75,10 @@ class Annotations {
+   // Return an annotated disassembly of the given code.
+   std::string disassemble(void* entry, const asmjit::CodeHolder& code);
+ 
++  std::vector<ResolvedAnnotation> resolve(
++      void* entry,
++      const asmjit::CodeHolder& code) const;
++
+  private:
+   // Annotations mapping Label ranges to either an LIR instruction or a string
+   // description.
+@@ -71,8 +87,8 @@ class Annotations {
+   static const std::string& canonicalize(const std::string& str) {
+     return str;
+   }
+-  static const hir::Instr* canonicalize(const lir::Instruction* instr) {
+-    return instr->origin();
++  static const lir::Instruction* canonicalize(const lir::Instruction* instr) {
++    return instr;
+   }
+ 
+   std::string disassembleSection(
+diff --git a/cinderx/Jit/codegen/gen_asm.cpp b/cinderx/Jit/codegen/gen_asm.cpp
+index fa4caac..d85445e 100644
+--- a/cinderx/Jit/codegen/gen_asm.cpp
++++ b/cinderx/Jit/codegen/gen_asm.cpp
+@@ -1857,6 +1857,7 @@ void NativeGenerator::generateCode(
+ #ifndef WIN32
+   perf::registerFunction(code_sections, func->fullname, prefix);
+ #endif
++  captureUdfJitDiagnostics(codeholder);
+ }
+ 
+ #ifdef __ASM_DEBUG
+@@ -1869,6 +1870,68 @@ void NativeGenerator::generateAssemblyBody(const asmjit::CodeHolder& code) {
+   emitLIRBlocks(&env_, lir_func_.get(), &code, &metadata_);
+ }
+ 
++void NativeGenerator::captureUdfJitDiagnostics(const asmjit::CodeHolder& code) {
++  if (!getConfig().udf_jit_diagnostics) {
++    return;
++  }
++  auto diagnostics = std::make_unique<UdfJitCompilationDiagnostics>();
++  std::unordered_map<const hir::Instr*, uint64_t> hir_ids;
++  uint64_t next_hir_id = 0;
++  for (const hir::BasicBlock& block : GetFunction()->cfg.blocks) {
++    for (const hir::Instr& instr : block) {
++      uint64_t id = next_hir_id++;
++      hir_ids.emplace(&instr, id);
++      int bytecode_offset = instr.bytecodeOffset().value();
++      diagnostics->hir_nodes.push_back(UdfJitHirNode{
++          id,
++          std::string{instr.opname()},
++          bytecode_offset < 0 ? std::nullopt
++                              : std::optional<int>{bytecode_offset},
++          bytecode_offset < 0 ? "hir_without_bytecode_offset" : "",
++      });
++    }
++  }
++
++  for (const lir::BasicBlock* block : lir_func_->basicblocks()) {
++    for (const std::unique_ptr<lir::Instruction>& instr :
++         block->instructions()) {
++      auto origin = hir_ids.find(instr->origin());
++      diagnostics->lir_nodes.push_back(UdfJitLirNode{
++          instr->id(),
++          std::string{instr->opname()},
++          origin == hir_ids.end() ? std::nullopt
++                                  : std::optional<uint64_t>{origin->second},
++          origin == hir_ids.end() ? "lir_without_hir_origin" : "",
++      });
++    }
++  }
++
++  uint64_t next_range_id = 0;
++  for (const ResolvedAnnotation& range :
++       env_.annotations.resolve(code_start_, code)) {
++    std::optional<int> lir_id;
++    std::optional<uint64_t> hir_id;
++    if (range.instr != nullptr) {
++      lir_id = range.instr->id();
++      auto origin = hir_ids.find(range.instr->origin());
++      if (origin != hir_ids.end()) {
++        hir_id = origin->second;
++      }
++    }
++    diagnostics->machine_ranges.push_back(UdfJitMachineRange{
++        next_range_id++,
++        range.start,
++        range.end,
++        range.section == CodeSection::kHot ? "hot" : "cold",
++        GetFunction()->fullname,
++        lir_id,
++        hir_id,
++        range.synthetic ? "codegen_synthetic" : "",
++    });
++  }
++  udf_jit_diagnostics_ = std::move(diagnostics);
++}
++
+ // calcMaxInlineDepth must work with nullptr HIR functions because it's valid
+ // to call NativeGenerator with only LIR (e.g., from a test). In the case of an
+ // LIR-only function, there is no HIR inlining.
+diff --git a/cinderx/Jit/codegen/gen_asm.h b/cinderx/Jit/codegen/gen_asm.h
+index 8e42786..adc173b 100644
+--- a/cinderx/Jit/codegen/gen_asm.h
++++ b/cinderx/Jit/codegen/gen_asm.h
+@@ -11,6 +11,7 @@
+ #include "cinderx/Jit/codegen/environ.h"
+ #include "cinderx/Jit/hir/hir.h"
+ #include "cinderx/Jit/lir/function.h"
++#include "cinderx/Jit/udf_jit_diagnostics.h"
+ 
+ #include <asmjit/asmjit.h>
+ 
+@@ -74,6 +75,10 @@ class NativeGenerator {
+     return env_.code_rt;
+   }
+ 
++  UdfJitCompilationDiagnosticsPtr takeUdfJitDiagnostics() {
++    return std::move(udf_jit_diagnostics_);
++  }
++
+   bool isGen() const {
+     return func_->code->co_flags & kCoFlagsAnyGenerator;
+   }
+@@ -152,9 +157,11 @@ class NativeGenerator {
+   friend class BackendTest;
+ 
+   void generateAssemblyBody(const asmjit::CodeHolder& code);
++  void captureUdfJitDiagnostics(const asmjit::CodeHolder& code);
+ 
+   std::unique_ptr<lir::Function> lir_func_;
+   Environ env_;
++  UdfJitCompilationDiagnosticsPtr udf_jit_diagnostics_;
+ };
+ 
+ // Factory class for creating instances of NativeGenerator that reuse the same
+diff --git a/cinderx/Jit/compiled_function.h b/cinderx/Jit/compiled_function.h
+index edf35fa..25e7f90 100644
+--- a/cinderx/Jit/compiled_function.h
++++ b/cinderx/Jit/compiled_function.h
+@@ -72,6 +72,7 @@ bool isJitCompiled(const PyFunctionObject* func);
+ #include "cinderx/Jit/code_patcher.h"
+ #include "cinderx/Jit/code_runtime.h"
+ #include "cinderx/Jit/hir/function.h"
++#include "cinderx/Jit/udf_jit_diagnostics.h"
+ #include "cinderx/Jit/hir/hir.h"
+ 
+ #include <chrono>
+@@ -102,6 +103,7 @@ struct CompiledFunctionData {
+   // Whether the compilation produced OSR entry stubs.
+   bool osr_aware{false};
+   bool has_osr_entries{false};
++  UdfJitCompilationDiagnosticsPtr udf_jit_diagnostics;
+ 
+   CompiledFunctionData() = default;
+ };
+@@ -201,6 +203,10 @@ class CompiledFunction {
+     return data_.hir_opcode_counts;
+   }
+ 
++  const UdfJitCompilationDiagnostics* udfJitDiagnostics() const {
++    return data_.udf_jit_diagnostics.get();
++  }
++
+   // Associate a function with this CompiledFunction. The function will be
+   // tracked and deopted if the CompiledFunction is cleared.
+   void addFunction(BorrowedRef<PyFunctionObject> func);
+diff --git a/cinderx/Jit/compiler.cpp b/cinderx/Jit/compiler.cpp
+index 62caec6..306b5c5 100644
+--- a/cinderx/Jit/compiler.cpp
++++ b/cinderx/Jit/compiler.cpp
+@@ -308,6 +308,7 @@ std::optional<CompiledFunctionData> Compiler::Compile(
+   compiled_data.osr_aware = compile_osr_entries;
+   compiled_data.has_osr_entries = code_runtime->hasOSREntries();
+   compiled_data.compile_time = compile_time;
++  compiled_data.udf_jit_diagnostics = ngen->takeUdfJitDiagnostics();
+   compiled_data.code_patchers = std::move(irfunc->code_patchers);
+   if (getConfig().log.debug) {
+     irfunc->setCompilationPhaseTimer(nullptr);
+diff --git a/cinderx/Jit/config.h b/cinderx/Jit/config.h
+index 994ec39..a62853b 100644
+--- a/cinderx/Jit/config.h
++++ b/cinderx/Jit/config.h
+@@ -145,6 +145,9 @@ struct Config {
+   bool multiple_code_sections{false};
+   bool multithreaded_compile_test{false};
+   bool use_huge_pages{true};
++  // Retain value-free HIR/LIR/machine provenance for dedicated diagnostic
++  // workers.  This is startup-only and remains false in normal workers.
++  bool udf_jit_diagnostics{false};
+   // Use huge pages for cold code sections as well. Only applicable when
+   // multiple_code_sections is enabled. Defaults to false (regular pages).
+   bool cold_code_huge_pages{false};
+diff --git a/cinderx/Jit/pyjit.cpp b/cinderx/Jit/pyjit.cpp
+index f7aed9f..9b49320 100644
+--- a/cinderx/Jit/pyjit.cpp
++++ b/cinderx/Jit/pyjit.cpp
+@@ -921,6 +921,13 @@ FlagProcessor initFlagProcessor() {
+           "Log the final compiled code, annotated with HIR instructions")
+       .withDebugMessageOverride("Dump asm of JITed functions");
+ 
++  flag_processor.addOption(
++      "jit-udf-diagnostics",
++      "PYTHONJITUDFDIAGNOSTICS",
++      getMutableConfig().udf_jit_diagnostics,
++      "Retain structured UDF HIR/LIR/machine provenance in dedicated "
++      "diagnostic workers");
++
+   flag_processor.addOption(
+       "jit-enable-inline-cache-stats-collection",
+       "PYTHONJITCOLLECTINLINECACHESTATS",
+@@ -2842,6 +2849,278 @@ PyObject* get_function_hir_opcode_counts(PyObject* /* self */, PyObject* arg) {
+   return dict.release();
+ }
+ 
++namespace {
++
++bool setDiagnosticField(
++    BorrowedRef<> dictionary,
++    const char* name,
++    Ref<> value) {
++  return value != nullptr && PyDict_SetItemString(dictionary, name, value) == 0;
++}
++
++Ref<> diagnosticText(std::string_view value) {
++  return Ref<>::steal(PyUnicode_FromStringAndSize(value.data(), value.size()));
++}
++
++Ref<> diagnosticOptionalText(const std::string& value) {
++  return value.empty() ? Ref<>::create(Py_None) : diagnosticText(value);
++}
++
++Ref<> diagnosticOptionalInteger(const std::optional<int>& value) {
++  return value.has_value() ? Ref<>::steal(PyLong_FromLong(*value))
++                           : Ref<>::create(Py_None);
++}
++
++template <typename Value>
++bool appendDiagnostic(BorrowedRef<> list, Value&& value) {
++  Ref<> item = std::forward<Value>(value);
++  return item != nullptr && PyList_Append(list, item) == 0;
++}
++
++Ref<> buildUdfJitHirNodes(const UdfJitCompilationDiagnostics& diagnostics) {
++  Ref<> result = Ref<>::steal(PyList_New(0));
++  if (result == nullptr) {
++    return nullptr;
++  }
++  for (const UdfJitHirNode& node : diagnostics.hir_nodes) {
++    Ref<> record = Ref<>::steal(PyDict_New());
++    std::string id = std::to_string(node.id);
++    if (record == nullptr ||
++        !setDiagnosticField(record, "hir_id", diagnosticText(id)) ||
++        !setDiagnosticField(record, "opcode", diagnosticText(node.opcode)) ||
++        !setDiagnosticField(
++            record,
++            "bytecode_offset",
++            diagnosticOptionalInteger(node.bytecode_offset)) ||
++        !setDiagnosticField(
++            record,
++            "synthetic_kind",
++            diagnosticOptionalText(node.synthetic_kind)) ||
++        !appendDiagnostic(result, std::move(record))) {
++      return nullptr;
++    }
++  }
++  return result;
++}
++
++Ref<> buildUdfJitLirNodes(const UdfJitCompilationDiagnostics& diagnostics) {
++  Ref<> result = Ref<>::steal(PyList_New(0));
++  if (result == nullptr) {
++    return nullptr;
++  }
++  for (const UdfJitLirNode& node : diagnostics.lir_nodes) {
++    Ref<> origins = Ref<>::steal(PyList_New(0));
++    if (origins == nullptr) {
++      return nullptr;
++    }
++    if (node.hir_id.has_value()) {
++      std::string id = std::to_string(*node.hir_id);
++      if (!appendDiagnostic(origins, diagnosticText(id))) {
++        return nullptr;
++      }
++    }
++    Ref<> record = Ref<>::steal(PyDict_New());
++    std::string id = std::to_string(node.id);
++    if (record == nullptr ||
++        !setDiagnosticField(record, "lir_id", diagnosticText(id)) ||
++        !setDiagnosticField(record, "opcode", diagnosticText(node.opcode)) ||
++        !setDiagnosticField(record, "hir_ids", std::move(origins)) ||
++        !setDiagnosticField(
++            record,
++            "synthetic_kind",
++            diagnosticOptionalText(node.synthetic_kind)) ||
++        !appendDiagnostic(result, std::move(record))) {
++      return nullptr;
++    }
++  }
++  return result;
++}
++
++Ref<> buildUdfJitMachineRanges(
++    const UdfJitCompilationDiagnostics& diagnostics) {
++  Ref<> result = Ref<>::steal(PyList_New(0));
++  if (result == nullptr) {
++    return nullptr;
++  }
++  for (const UdfJitMachineRange& range : diagnostics.machine_ranges) {
++    Ref<> lir_origins = Ref<>::steal(PyList_New(0));
++    Ref<> hir_origins = Ref<>::steal(PyList_New(0));
++    if (lir_origins == nullptr || hir_origins == nullptr) {
++      return nullptr;
++    }
++    if (range.lir_id.has_value()) {
++      if (!appendDiagnostic(
++              lir_origins, diagnosticText(std::to_string(*range.lir_id)))) {
++        return nullptr;
++      }
++    }
++    if (range.hir_id.has_value()) {
++      if (!appendDiagnostic(
++              hir_origins, diagnosticText(std::to_string(*range.hir_id)))) {
++        return nullptr;
++      }
++    }
++    Ref<> record = Ref<>::steal(PyDict_New());
++    if (record == nullptr ||
++        !setDiagnosticField(
++            record, "range_id", diagnosticText(std::to_string(range.id))) ||
++        !setDiagnosticField(
++            record,
++            "start",
++            Ref<>::steal(PyLong_FromUnsignedLongLong(range.start))) ||
++        !setDiagnosticField(
++            record,
++            "end",
++            Ref<>::steal(PyLong_FromUnsignedLongLong(range.end))) ||
++        !setDiagnosticField(record, "section", diagnosticText(range.section)) ||
++        !setDiagnosticField(record, "symbol", diagnosticText(range.symbol)) ||
++        !setDiagnosticField(record, "lir_ids", std::move(lir_origins)) ||
++        !setDiagnosticField(record, "hir_ids", std::move(hir_origins)) ||
++        !setDiagnosticField(
++            record,
++            "synthetic_kind",
++            diagnosticOptionalText(range.synthetic_kind)) ||
++        !appendDiagnostic(result, std::move(record))) {
++      return nullptr;
++    }
++  }
++  return result;
++}
++
++} // namespace
++
++PyObject* get_udfjit_compilation_diagnostics(
++    PyObject* /* self */,
++    PyObject* args) {
++  PyObject* raw_func;
++  PyObject* raw_compile_instance_id;
++  if (!PyArg_ParseTuple(
++          args,
++          "OO:get_udfjit_compilation_diagnostics",
++          &raw_func,
++          &raw_compile_instance_id)) {
++    return nullptr;
++  }
++  BorrowedRef<PyFunctionObject> func =
++      get_func_arg("get_udfjit_compilation_diagnostics", raw_func);
++  if (func == nullptr) {
++    return nullptr;
++  }
++  if (!PyUnicode_Check(raw_compile_instance_id)) {
++    PyErr_SetString(PyExc_TypeError, "compile_instance_id must be a string");
++    return nullptr;
++  }
++  if (!getConfig().udf_jit_diagnostics) {
++    PyErr_SetString(
++        PyExc_RuntimeError,
++        "UDF JIT diagnostics are disabled; set "
++        "PYTHONJITUDFDIAGNOSTICS before JIT initialization");
++    return nullptr;
++  }
++  Ref<> generated_code_hash = Ref<>::steal(
++      PyObject_GetAttrString(raw_func, "__udfjit_generated_code_hash__"));
++  if (generated_code_hash == nullptr) {
++    return nullptr;
++  }
++  if (!PyUnicode_Check(generated_code_hash)) {
++    PyErr_SetString(
++        PyExc_TypeError, "__udfjit_generated_code_hash__ must be a string");
++    return nullptr;
++  }
++
++  Ref<> pass_timings = Ref<>::steal(PyList_New(0));
++  Ref<> result = Ref<>::steal(PyDict_New());
++  if (pass_timings == nullptr || result == nullptr) {
++    return nullptr;
++  }
++  CompiledFunction* compiled_func =
++      jitCtx() == nullptr ? nullptr : jitCtx()->lookupFunc(func);
++  const UdfJitCompilationDiagnostics* diagnostics =
++      compiled_func == nullptr ? nullptr : compiled_func->udfJitDiagnostics();
++  const bool available = compiled_func != nullptr && diagnostics != nullptr;
++
++  Ref<> hir_nodes = available ? buildUdfJitHirNodes(*diagnostics)
++                              : Ref<>::steal(PyList_New(0));
++  Ref<> lir_nodes = available ? buildUdfJitLirNodes(*diagnostics)
++                              : Ref<>::steal(PyList_New(0));
++  Ref<> machine_ranges = available ? buildUdfJitMachineRanges(*diagnostics)
++                                   : Ref<>::steal(PyList_New(0));
++  Ref<> deopt_metadata = Ref<>::steal(PyList_New(0));
++  if (hir_nodes == nullptr || lir_nodes == nullptr ||
++      machine_ranges == nullptr || deopt_metadata == nullptr) {
++    return nullptr;
++  }
++  if (available) {
++    Ref<> timing = Ref<>::steal(PyDict_New());
++    if (timing == nullptr ||
++        !setDiagnosticField(timing, "name", diagnosticText("overall")) ||
++        !setDiagnosticField(
++            timing, "ordinal", Ref<>::steal(PyLong_FromLong(0))) ||
++        !setDiagnosticField(
++            timing,
++            "duration_ns",
++            Ref<>::steal(
++                PyLong_FromLongLong(compiled_func->compileTime().count()))) ||
++        !appendDiagnostic(pass_timings, std::move(timing))) {
++      return nullptr;
++    }
++  }
++
++  if (!setDiagnosticField(
++          result, "schema_version", Ref<>::steal(PyLong_FromLong(1))) ||
++      !setDiagnosticField(
++          result,
++          "status",
++          diagnosticText(available ? "available" : "not_compiled")) ||
++      PyDict_SetItemString(
++          result, "compile_instance_id", raw_compile_instance_id) < 0 ||
++      PyDict_SetItemString(result, "generated_code_hash", generated_code_hash) <
++          0 ||
++      !setDiagnosticField(
++          result,
++          "jit_compiled",
++          Ref<>::create(available ? Py_True : Py_False)) ||
++      !setDiagnosticField(
++          result, "unavailable_reason", Ref<>::create(Py_None)) ||
++      !setDiagnosticField(
++          result,
++          "jit_gate_reason",
++          available ? Ref<>::create(Py_None)
++                    : diagnosticText("not_jit_compiled")) ||
++      !setDiagnosticField(
++          result,
++          "code_start",
++          available ? Ref<>::steal(PyLong_FromUnsignedLongLong(
++                          reinterpret_cast<uintptr_t>(
++                              compiled_func->codeBuffer().data())))
++                    : Ref<>::create(Py_None)) ||
++      !setDiagnosticField(
++          result,
++          "code_size",
++          Ref<>::steal(
++              PyLong_FromSize_t(available ? compiled_func->codeSize() : 0))) ||
++      !setDiagnosticField(
++          result,
++          "stack_size",
++          Ref<>::steal(
++              PyLong_FromLong(available ? compiled_func->stackSize() : 0))) ||
++      !setDiagnosticField(
++          result,
++          "spill_stack_size",
++          Ref<>::steal(PyLong_FromLong(
++              available ? compiled_func->spillStackSize() : 0))) ||
++      !setDiagnosticField(result, "pass_timings", std::move(pass_timings)) ||
++      !setDiagnosticField(result, "hir_nodes", std::move(hir_nodes)) ||
++      !setDiagnosticField(result, "lir_nodes", std::move(lir_nodes)) ||
++      !setDiagnosticField(
++          result, "machine_ranges", std::move(machine_ranges)) ||
++      !setDiagnosticField(
++          result, "deopt_metadata", std::move(deopt_metadata))) {
++    return nullptr;
++  }
++  return result.release();
++}
++
+ PyObject* mlock_profiler_dependencies(PyObject* /* self */, PyObject*) {
+   if (jitCtx() == nullptr) {
+     Py_RETURN_NONE;
+@@ -3727,6 +4006,11 @@ PyMethodDef jit_methods[] = {
+      PyDoc_STR(
+          "Return a map from HIR opcode name to the count of that opcode in the "
+          "JIT-compiled version of this function.")},
++    {"get_udfjit_compilation_diagnostics",
++     get_udfjit_compilation_diagnostics,
++     METH_VARARGS,
++     PyDoc_STR("Return value-free structured UDF HIR/LIR/machine provenance. "
++               "Requires PYTHONJITUDFDIAGNOSTICS at startup.")},
+     {"mlock_profiler_dependencies",
+      mlock_profiler_dependencies,
+      METH_NOARGS,
+diff --git a/cinderx/Jit/udf_jit_diagnostics.h b/cinderx/Jit/udf_jit_diagnostics.h
+new file mode 100644
+index 0000000..52b88dc
+--- /dev/null
++++ b/cinderx/Jit/udf_jit_diagnostics.h
+@@ -0,0 +1,49 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++
++#pragma once
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace jit {
++
++// Value-free structural records retained only when
++// PYTHONJITUDFDIAGNOSTICS is enabled before JIT initialization.
++struct UdfJitHirNode {
++  uint64_t id;
++  std::string opcode;
++  std::optional<int> bytecode_offset;
++  std::string synthetic_kind;
++};
++
++struct UdfJitLirNode {
++  int id;
++  std::string opcode;
++  std::optional<uint64_t> hir_id;
++  std::string synthetic_kind;
++};
++
++struct UdfJitMachineRange {
++  uint64_t id;
++  uintptr_t start;
++  uintptr_t end;
++  std::string section;
++  std::string symbol;
++  std::optional<int> lir_id;
++  std::optional<uint64_t> hir_id;
++  std::string synthetic_kind;
++};
++
++struct UdfJitCompilationDiagnostics {
++  std::vector<UdfJitHirNode> hir_nodes;
++  std::vector<UdfJitLirNode> lir_nodes;
++  std::vector<UdfJitMachineRange> machine_ranges;
++};
++
++using UdfJitCompilationDiagnosticsPtr =
++    std::unique_ptr<UdfJitCompilationDiagnostics>;
++
++} // namespace jit
+diff --git a/cinderx/PythonLib/cinderx/jit.py b/cinderx/PythonLib/cinderx/jit.py
+index 6c919e3..3d0d185 100644
+--- a/cinderx/PythonLib/cinderx/jit.py
++++ b/cinderx/PythonLib/cinderx/jit.py
+@@ -43,6 +43,7 @@ try:
+         get_compiled_stack_size,
+         get_function_compilation_time,
+         get_function_hir_opcode_counts,
++        get_udfjit_compilation_diagnostics,
+         get_inlined_functions_stats,
+         get_jit_list,
+         get_num_inlined_functions,
+@@ -159,6 +160,12 @@ except ImportError:
+     def get_function_hir_opcode_counts(func: FuncAny) -> dict[str, int] | None:
+         return {}
+ 
++    def get_udfjit_compilation_diagnostics(
++        func: FuncAny,
++        compile_instance_id: str,
++    ) -> dict[str, object]:
++        raise RuntimeError("Cinder JIT structured diagnostics are unavailable")
++
+     def get_inlined_functions_stats(func: FuncAny) -> dict[str, object]:
+         return {}
+ 
+diff --git a/cinderx/PythonLib/test_cinderx/test_udf_jit_diagnostics.py b/cinderx/PythonLib/test_cinderx/test_udf_jit_diagnostics.py
+new file mode 100644
+index 0000000..d5f2076
+--- /dev/null
++++ b/cinderx/PythonLib/test_cinderx/test_udf_jit_diagnostics.py
+@@ -0,0 +1,49 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++
++import os
++import unittest
++
++import cinderx.jit as jit
++
++
++class UdfJitDiagnosticsTest(unittest.TestCase):
++    @unittest.skipUnless(
++        os.getenv("PYTHONJITUDFDIAGNOSTICS"),
++        "requires a dedicated diagnostics worker",
++    )
++    def test_structured_origin_and_machine_ranges(self):
++        def target(value):
++            return value + 1
++
++        target.__udfjit_generated_code_hash__ = "a" * 64
++        self.assertTrue(jit.force_compile(target))
++
++        result = jit.get_udfjit_compilation_diagnostics(
++            target,
++            "cinderx-test-1",
++        )
++
++        self.assertEqual(result["schema_version"], 1)
++        self.assertEqual(result["status"], "available")
++        self.assertEqual(result["compile_instance_id"], "cinderx-test-1")
++        self.assertEqual(result["generated_code_hash"], "a" * 64)
++        self.assertTrue(result["hir_nodes"])
++        self.assertTrue(result["lir_nodes"])
++        self.assertTrue(result["machine_ranges"])
++        code_start = result["code_start"]
++        code_end = code_start + result["code_size"]
++        previous_end = code_start
++        for machine_range in result["machine_ranges"]:
++            self.assertGreaterEqual(machine_range["start"], previous_end)
++            self.assertLessEqual(machine_range["end"], code_end)
++            self.assertLess(machine_range["start"], machine_range["end"])
++            self.assertTrue(
++                machine_range["lir_ids"]
++                or machine_range["hir_ids"]
++                or machine_range["synthetic_kind"]
++            )
++            previous_end = machine_range["end"]
++
++
++if __name__ == "__main__":
++    unittest.main()

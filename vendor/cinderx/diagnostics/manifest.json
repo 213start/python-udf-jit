@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "base_upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
+  "base_candidate_patch_series_sha256": "8dfc2d5b772fafb010dd1813b3e21e0f16f130ef3f29d1daeeba7c2396e447bb",
+  "patches": [
+    {
+      "path": "patches/0001-structured-origin-export.patch",
+      "sha256": "438f4e89a223a14deecef46f025a37effc282f0b6ad6bd8ff959cd6c53bf34a1",
+      "changed_file_count": 11
+    }
+  ],
+  "patch_series_sha256": "438f4e89a223a14deecef46f025a37effc282f0b6ad6bd8ff959cd6c53bf34a1",
+  "changed_file_count": 11,
+  "diagnostic_abi": {
+    "version": 1,
+    "startup_environment": "PYTHONJITUDFDIAGNOSTICS",
+    "python_api": "cinderx.jit.get_udfjit_compilation_diagnostics",
+    "python_api_arguments": [
+      "function",
+      "compile_instance_id"
+    ],
+    "normal_candidate_overlay_unchanged": true,
+    "retention_scope": "dedicated_diagnostic_worker_only",
+    "literal_values_exported": false,
+    "symbol_redaction_owner": "python_udf_jit.diagnostics.cinderx_bridge"
+  }
+}

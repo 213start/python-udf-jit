@@ -16,6 +16,10 @@
 seccomp 拒绝请求 W+X 权限的 `mmap`、`mprotect` 和 `pkey_mprotect`，因此
 第三方库也不能重新引入可写且可执行的映射。
 
+RFC-013 的结构化 HIR/LIR/机器区间导出位于 `diagnostics/`，作为 dedicated
+diagnostic worker 的额外 overlay 单独锁定。它不属于本生产候选补丁系列，
+不得应用到 `diagnostics=off` 的正式性能或生产镜像。
+
 构建输出、虚拟环境、IDE 状态、仅用于 CI 的文件、生成的 egg 元数据和文档
 不参与运行时源码树身份计算；具体排除项、续体 ABI 及应用补丁前后的源码树
 摘要均记录在清单中。

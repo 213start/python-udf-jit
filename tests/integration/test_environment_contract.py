@@ -241,6 +241,58 @@ class EnvironmentContractTests(unittest.TestCase):
             },
         )
 
+    def test_cinderx_diagnostics_overlay_is_separate_and_hash_locked(
+        self,
+    ) -> None:
+        root = ROOT / "vendor/cinderx/diagnostics"
+        manifest = json.loads(
+            (root / "manifest.json").read_text(encoding="utf-8")
+        )
+        patches = manifest["patches"]
+        series = hashlib.sha256()
+        all_changed = set()
+
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertTrue(
+            manifest["diagnostic_abi"]["normal_candidate_overlay_unchanged"]
+        )
+        self.assertEqual(
+            manifest["diagnostic_abi"]["startup_environment"],
+            "PYTHONJITUDFDIAGNOSTICS",
+        )
+        for entry in patches:
+            patch = (root / entry["path"]).read_bytes()
+            series.update(patch)
+            changed = [
+                line.split(" b/", 1)[1]
+                for line in patch.decode("utf-8").splitlines()
+                if line.startswith("diff --git a/")
+            ]
+            self.assertEqual(
+                hashlib.sha256(patch).hexdigest(),
+                entry["sha256"],
+            )
+            self.assertEqual(len(changed), entry["changed_file_count"])
+            self.assertEqual(len(set(changed)), len(changed))
+            self.assertTrue(
+                all(path.startswith("cinderx/") for path in changed)
+            )
+            all_changed.update(changed)
+        self.assertEqual(
+            series.hexdigest(),
+            manifest["patch_series_sha256"],
+        )
+        self.assertEqual(len(all_changed), manifest["changed_file_count"])
+        patch_text = (
+            root / "patches/0001-structured-origin-export.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PYTHONJITUDFDIAGNOSTICS", patch_text)
+        self.assertIn(
+            "get_udfjit_compilation_diagnostics",
+            patch_text,
+        )
+        self.assertIn("UdfJitMachineRange", patch_text)
+
     def test_compose_network_plan_does_not_overlap_blue_98_routes(self) -> None:
         report = validate_network_plan(
             requested_subnets={

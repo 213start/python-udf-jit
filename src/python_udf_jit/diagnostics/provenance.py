@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     )
 
 
-PROVENANCE_MAP_VERSION = 1
+PROVENANCE_MAP_VERSION = 2
 READABLE_ARTIFACT_VERSION = 1
 _MAX_NODES = 262_144
 _MAX_EDGES = 1_048_576
@@ -48,6 +48,9 @@ class ProvenanceLayer(StrEnum):
     CORE_OPERATION = "core_operation"
     REGION = "region"
     GENERATED_BYTECODE = "generated_bytecode"
+    HIR = "hir"
+    LIR = "lir"
+    MACHINE = "machine"
 
 
 class ProvenanceRelation(StrEnum):
@@ -65,6 +68,9 @@ _LAYER_PREFIX = {
     ProvenanceLayer.CORE_OPERATION: "core:",
     ProvenanceLayer.REGION: "region:",
     ProvenanceLayer.GENERATED_BYTECODE: "genbc:",
+    ProvenanceLayer.HIR: "hir:",
+    ProvenanceLayer.LIR: "lir:",
+    ProvenanceLayer.MACHINE: "machine:",
 }
 
 
@@ -116,9 +122,13 @@ class ProvenanceNode:
     source_position: SourcePosition | None = None
     bytecode_offset: int | None = None
     attributes: tuple[tuple[str, str], ...] = ()
+    address_start: int | None = None
+    address_end: int | None = None
 
     def to_document(self) -> dict[str, object]:
         return {
+            "address_end": self.address_end,
+            "address_start": self.address_start,
             "attributes": [list(item) for item in self.attributes],
             "bytecode_offset": self.bytecode_offset,
             "kind": self.kind,
@@ -134,6 +144,8 @@ class ProvenanceNode:
     @classmethod
     def from_document(cls, document: object) -> "ProvenanceNode":
         expected = {
+            "address_end",
+            "address_start",
             "attributes",
             "bytecode_offset",
             "kind",
@@ -161,6 +173,8 @@ class ProvenanceNode:
             ),
             document["bytecode_offset"],  # type: ignore[arg-type]
             tuple((item[0], item[1]) for item in attributes),
+            document["address_start"],  # type: ignore[arg-type]
+            document["address_end"],  # type: ignore[arg-type]
         )
 
 
@@ -346,6 +360,15 @@ def verify_provenance_map(provenance: ProvenanceMap) -> None:
                 raise ValueError("invalid provenance bytecode offset")
         elif node.bytecode_offset is not None:
             raise ValueError("non-bytecode provenance has an offset")
+        if node.layer is ProvenanceLayer.MACHINE:
+            if (
+                type(node.address_start) is not int
+                or type(node.address_end) is not int
+                or not 0 <= node.address_start < node.address_end < 1 << 64
+            ):
+                raise ValueError("invalid provenance machine range")
+        elif node.address_start is not None or node.address_end is not None:
+            raise ValueError("non-machine provenance has an address range")
         for key, value in node.attributes:
             _require_text(key, "attribute key")
             _require_text(value, "attribute value")
