@@ -20,6 +20,7 @@ RFC-005 和 RFC-006 只完成标量槽位与标量 CinderX 路径。向量、Arr
 | [RFC-010](RFC-010-columnar-execution.md) | 后续 | 列式执行 | 未实现、关闭 |
 | [RFC-011](RFC-011-sparse-batch-side-exit.md) | 后续 | 稀疏批次侧退出 | 未实现、关闭 |
 | [RFC-012](RFC-012-equivalent-semantic-rewrite.md) | 后续 | 等价语义回填 | 未实现、关闭 |
+| [RFC-013](RFC-013-end-to-end-performance-diagnostics.md) | 主线横切 | 端到端性能诊断与热点回溯 | Draft，未实现 |
 
 ## 2. 标量主线证据
 
@@ -51,6 +52,7 @@ flowchart LR
     R5 --> R6["RFC-006<br/>标量 JIT"]
     R6 --> R7["RFC-007<br/>守卫式执行"]
     R7 --> R8["RFC-008<br/>运行治理"]
+    R8 --> R13["RFC-013<br/>端到端性能诊断"]
 
     R3 -. "后续" .-> R12["RFC-012<br/>等价语义回填"]
     R5 -. "后续" .-> R9["RFC-009<br/>混合执行提供器"]
@@ -72,6 +74,7 @@ flowchart LR
 | `ScalarExecutable` / `InterpreterContinuation` | RFC-006 | RFC-007 | 提供 CinderX JIT 与 CPython 解释续体入口 |
 | `RuntimeVariant` | RFC-007 | RFC-008 | 承载守卫、多版本、缓存、侧退出和执行计数 |
 | `PolicySnapshot` / `GovernanceEvent` | RFC-008 | 适配器、编译器、工作节点 | 冻结模式、预算、权限和无业务值诊断 |
+| `DiagnosticPolicySnapshot` / `ProvenanceMap` / `DiagnosticBundle` | RFC-013 | 编译器、CinderX Bridge、Worker、诊断 CLI | 隔离诊断运行并连接源码、中间 IR、机器码和热点样本 |
 
 所有跨进程数据结构使用封闭字段和精确版本。当前制品格式 1.0 是首个正式格式；穿刺期对象、未知字段、其他版本和未来版本一律拒绝，不提供兼容或迁移路径。
 
