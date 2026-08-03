@@ -1,0 +1,116 @@
+{
+  "schema_version": "1.0",
+  "created_at": "2026-08-02",
+  "workload": "pipeline_text_fineweb_full_min",
+  "udfjit_revision": "90a60c66dcca1ecc9297b97adb6bf8e8eed2a52f",
+  "workload_revision": "56d3b6856895427a0519cbaa437d55443fcb578b",
+  "diagnostics": {
+    "mode": "offline_qualification",
+    "diagnostics_switch": "full",
+    "bundle_id": "diagnostic-fineweb-l0-20260802-03-13124b3b3373426d",
+    "manifest_sha256": "13124b3b3373426d492bd83ea1bb559bd6f6cf76c61146c75bc891681139f763",
+    "validation_status": "valid",
+    "bundle_status": "partial",
+    "artifact_count": 31,
+    "executed_content": false,
+    "is_timing_evidence": false,
+    "partial_reason": "Twelve Python string/bool stages were not admitted, so semantic IR, CinderX HIR/LIR, and machine-code artifacts do not exist. Document dedup is a Daft dataflow operation, not a Python UDF.",
+    "deployment_caveat": "The remote pipeline image contains an older UDF JIT revision and cannot emit the current full diagnostic bundle. This bundle is an offline qualification artifact; the fixed-source real-pipeline A/B was run separately with diagnostics disabled."
+  },
+  "admission_summary": {
+    "pipeline_stages": 13,
+    "python_stages": 12,
+    "dataflow_stages": 1,
+    "admitted_python_stages": 0,
+    "scalar_cinderx_regions": 0,
+    "primary_gate": {
+      "file": "src/python_udf_jit/integration/daft_ray/registry.py",
+      "condition": "capture is attempted only when the logical schema contains float64",
+      "fineweb_shapes": [
+        "string -> string",
+        "string -> bool"
+      ]
+    },
+    "secondary_gate": "Daft mapper/filter wrappers close over the operator function, so extending only the schema gate would still leave closure and signature rejections."
+  },
+  "forced_probe_results": [
+    {
+      "stages": [
+        "clean_html_mapper",
+        "clean_links_mapper",
+        "clean_email_mapper",
+        "clean_copyright_mapper",
+        "whitespace_normalization_mapper"
+      ],
+      "result": "unsupported_dependency"
+    },
+    {
+      "stages": [
+        "fix_unicode_mapper",
+        "punctuation_normalization_mapper"
+      ],
+      "result": "capture_verification_error",
+      "detail": "CaptureVerificationError escapes try_capture instead of becoming a structured rejection."
+    },
+    {
+      "stages": [
+        "text_length_filter",
+        "alphanumeric_filter",
+        "language_id_score_filter"
+      ],
+      "result": "closure_dependency"
+    },
+    {
+      "stages": [
+        "perplexity_filter",
+        "text_chunk_mapper"
+      ],
+      "result": "unsupported_signature"
+    },
+    {
+      "stage": "document_dedup",
+      "result": "not_a_python_udf",
+      "detail": "Daft distinct/dataflow operation"
+    }
+  ],
+  "typed_leaf_results": {
+    "functions": [
+      "dj_text_length_ok",
+      "dj_alphanumeric_ok",
+      "dj_language_ok",
+      "dj_perplexity_ok"
+    ],
+    "result": "unsupported_signature",
+    "reason": "String input and multi-argument or keyword-only signatures are outside the current bool/int/float scalar ABI."
+  },
+  "diagnostic_defects": [
+    {
+      "severity": "P1",
+      "component": "compiler.capture.try_capture",
+      "finding": "try_capture catches CaptureRejected but not CaptureVerificationError; the Daft registry's broad exception handler then silently drops verification failures.",
+      "required_fix": "Normalize verification failures to structured rejection artifacts before adding string support."
+    },
+    {
+      "severity": "P1",
+      "component": "driver admission diagnostics",
+      "finding": "Candidates rejected by schema admission do not naturally emit a complete source-to-rejection bundle.",
+      "required_fix": "Emit source identity, original bytecode, rejection reason, and downstream unavailable_reason at the driver gate under diagnostics=full."
+    }
+  ],
+  "model_coverage": {
+    "diagnostic_function_basis": "Stand-in functions matching the historical VOLC_REAL_TEXT_OPS=0 UDF JIT experiment, plus static signature probes for official model-backed functions.",
+    "real_ab_runtime": "Official fastText and SentencePiece/KenLM paths were enabled.",
+    "conclusion_scope": "The no-hit conclusion applies to both paths because the schema and callable signatures remain string/bool, but current source-to-machine artifacts for the real model-backed runtime are not available."
+  },
+  "evidence_status": {
+    "E1": "trend_only",
+    "E2": "closed_for_candidate_selection",
+    "E3": "not_applicable_no_jit_hit",
+    "E4": "not_applicable_no_jit_hit",
+    "E5": "not_applicable_no_jit_hit",
+    "E6": "closed_at_admission_and_framework_layers",
+    "E7": "candidate_selected",
+    "E8": "trend_closed_with_output_schema_caveat",
+    "E9": "hold_for_stable_output_schema"
+  }
+}

@@ -1,0 +1,9 @@
+# FineWeb backend-diagnostic allowlist. Diagnostic use only.
+runner.pipeline_builder:_make_mapper_udf.<locals>.udf
+runner.pipeline_builder:_make_filter_udf.<locals>.udf
+ops.text_ops:make_alphanumeric_filter.<locals>._filter
+ops.datajuicer_cpu_text_ops:dj_alphanumeric_ok
+ops.datajuicer_cpu_text_ops:dj_alphanumeric_ok.<locals>.<genexpr>
+ops.text_ops:make_language_id_score_filter.<locals>._filter
+ops.datajuicer_cpu_text_ops:dj_language_id_score
+ops.datajuicer_cpu_text_ops:dj_language_id_score.<locals>.<lambda>

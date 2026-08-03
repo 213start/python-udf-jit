@@ -1,0 +1,133 @@
+{
+  "affinity": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "baseline": {
+    "documents": [
+      {
+        "elapsed_seconds": 6.942690650001168,
+        "error": null,
+        "output_chars": 44009,
+        "output_sha256": "a1e0fc4e319dd29a5a1e15a8e536df7bdd3ce41dc323ad60da1df5f9760a8ac1",
+        "sample_id": "pmc_pdf_hash4_0000"
+      },
+      {
+        "elapsed_seconds": 14.009203319903463,
+        "error": null,
+        "output_chars": 73544,
+        "output_sha256": "cb20d634f0e66bef505e98682c61f3a6225fcbb07af6fda12509a531780ab113",
+        "sample_id": "pmc_pdf_hash4_0001"
+      },
+      {
+        "elapsed_seconds": 16.317098119994625,
+        "error": null,
+        "output_chars": 113646,
+        "output_sha256": "8efeb4ef61bc71d76f067a49fd44e9bb8416d476480dfee63e18e238f94d7ea0",
+        "sample_id": "pmc_pdf_hash4_0002"
+      },
+      {
+        "elapsed_seconds": 16.910485769971274,
+        "error": null,
+        "output_chars": 66188,
+        "output_sha256": "6f8cdf99c6e8d4523ee047c9b899c70a8d1b0422b3730e729eec06d6c5c5293d",
+        "sample_id": "pmc_pdf_hash4_0003"
+      }
+    ],
+    "elapsed_seconds": 54.18040407996159,
+    "name": "A_parse_plus_table",
+    "system_cpu_seconds": 0.152397,
+    "user_cpu_seconds": 53.911031
+  },
+  "candidate": {
+    "documents": [
+      {
+        "elapsed_seconds": 3.4863243399886414,
+        "error": null,
+        "output_chars": 44009,
+        "output_sha256": "a1e0fc4e319dd29a5a1e15a8e536df7bdd3ce41dc323ad60da1df5f9760a8ac1",
+        "sample_id": "pmc_pdf_hash4_0000"
+      },
+      {
+        "elapsed_seconds": 6.984890730003826,
+        "error": null,
+        "output_chars": 73544,
+        "output_sha256": "cb20d634f0e66bef505e98682c61f3a6225fcbb07af6fda12509a531780ab113",
+        "sample_id": "pmc_pdf_hash4_0001"
+      },
+      {
+        "elapsed_seconds": 8.407245749956928,
+        "error": null,
+        "output_chars": 113646,
+        "output_sha256": "8efeb4ef61bc71d76f067a49fd44e9bb8416d476480dfee63e18e238f94d7ea0",
+        "sample_id": "pmc_pdf_hash4_0002"
+      },
+      {
+        "elapsed_seconds": 8.611429590033367,
+        "error": null,
+        "output_chars": 66188,
+        "output_sha256": "6f8cdf99c6e8d4523ee047c9b899c70a8d1b0422b3730e729eec06d6c5c5293d",
+        "sample_id": "pmc_pdf_hash4_0003"
+      }
+    ],
+    "elapsed_seconds": 27.490841199993156,
+    "name": "B_table_only",
+    "system_cpu_seconds": 0.03592300000000001,
+    "user_cpu_seconds": 27.401386000000002
+  },
+  "caveats": [
+    "A and B ran once in order, so no confidence interval is available.",
+    "B may benefit from filesystem page cache populated by A.",
+    "This measures the parse+table subchain, not full-pipeline E2E including OCR."
+  ],
+  "correctness": {
+    "errors_absent": true,
+    "outputs_equal": true
+  },
+  "formal_benchmark": false,
+  "formal_benchmark_reason": "single A->B piercing run; no repeated samples or confidence interval",
+  "inputs": [
+    {
+      "bytes": 775593,
+      "input_sha256": "f68cbfe48991ba97a0f107aae70d1823ebde820c7e239ef1cbede44e6a4d4a53",
+      "manifest_path": "fixture://pmc_pdf_hash4/PMC13369622.1.pdf",
+      "resolved_path": "fixture://pmc_pdf_hash4/PMC13369622.1.pdf",
+      "sample_id": "pmc_pdf_hash4_0000"
+    },
+    {
+      "bytes": 970649,
+      "input_sha256": "38448bc910aad610266905d06f2d8084646285b3b33fb9fec61a416adfa8d14e",
+      "manifest_path": "fixture://pmc_pdf_hash4/PMC13368994.1.pdf",
+      "resolved_path": "fixture://pmc_pdf_hash4/PMC13368994.1.pdf",
+      "sample_id": "pmc_pdf_hash4_0001"
+    },
+    {
+      "bytes": 855786,
+      "input_sha256": "52a496b6a2b60fef8b4038f06a61b762cc07fce3503e1a3f7d9e34d78d71987f",
+      "manifest_path": "fixture://pmc_pdf_hash4/PMC13357840.1.pdf",
+      "resolved_path": "fixture://pmc_pdf_hash4/PMC13357840.1.pdf",
+      "sample_id": "pmc_pdf_hash4_0002"
+    },
+    {
+      "bytes": 4144288,
+      "input_sha256": "b2f563a5bcf7f912846d320a87e92eb6d818167ea29b2d9479b0890c3ef1e4b0",
+      "manifest_path": "fixture://pmc_pdf_hash4/PMC13358054.1.pdf",
+      "resolved_path": "fixture://pmc_pdf_hash4/PMC13358054.1.pdf",
+      "sample_id": "pmc_pdf_hash4_0003"
+    }
+  ],
+  "kind": "pdf_stage_elision_minimal_ab",
+  "manifest": "fixture://pmc_pdf_hash4/manifest.jsonl",
+  "performance": {
+    "subchain_speedup": 1.970852899182113,
+    "subchain_time_reduction_fraction": 0.4926054600954788,
+    "subchain_time_reduction_percent": 49.26054600954788
+  },
+  "platform": "Linux-6.6.0-132.0.0.111.oe2403sp3.aarch64-aarch64-with-glibc2.36",
+  "python": "3.10.20 | packaged by conda-forge | (main, Jun 11 2026, 03:25:23) [GCC 14.3.0]",
+  "schema_version": 1,
+  "source_revision": "56d3b6856895427a0519cbaa437d55443fcb578b",
+  "udfjit_diagnostics": "off"
+}

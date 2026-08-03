@@ -1,0 +1,71 @@
+{
+  "all_outputs_equal": false,
+  "contract_notes": {
+    "current": "parse returns the original path; table reopens the PDF, emits page text, and appends extracted table rows.",
+    "data_juicer": "TextFormatter.extract_txt_from_pdf removes table regions and trailing page numbers, then emits cached text.",
+    "ocr": "Not executed here; static source shows its recognized text is discarded and the original path is returned."
+  },
+  "data_juicer_version": "1.5.2",
+  "documents": [
+    {
+      "current_pipeline": {
+        "final_table_chars": 44009,
+        "final_table_sha256": "a1e0fc4e319dd29a5a1e15a8e536df7bdd3ce41dc323ad60da1df5f9760a8ac1",
+        "parse_returns_original_path": true
+      },
+      "data_juicer_1_5_2": {
+        "chars": 33644,
+        "sha256": "51e81f9f037963b0505402c8c984e7d180f2a40d69fbe35c14d09c8de0226c50"
+      },
+      "outputs_equal": false,
+      "page_count": 7,
+      "sample_id": "pmc_pdf_hash4_0000"
+    },
+    {
+      "current_pipeline": {
+        "final_table_chars": 73544,
+        "final_table_sha256": "cb20d634f0e66bef505e98682c61f3a6225fcbb07af6fda12509a531780ab113",
+        "parse_returns_original_path": true
+      },
+      "data_juicer_1_5_2": {
+        "chars": 69703,
+        "sha256": "9001d4d8dfb150b86c230519e18fdb5d5df9b608aa0696651cfe341fa714805f"
+      },
+      "outputs_equal": false,
+      "page_count": 13,
+      "sample_id": "pmc_pdf_hash4_0001"
+    },
+    {
+      "current_pipeline": {
+        "final_table_chars": 113646,
+        "final_table_sha256": "8efeb4ef61bc71d76f067a49fd44e9bb8416d476480dfee63e18e238f94d7ea0",
+        "parse_returns_original_path": true
+      },
+      "data_juicer_1_5_2": {
+        "chars": 75372,
+        "sha256": "3e6826ee4be10f5317e0d25e74b2ec6a388c954d74ba0d79077b9ece7a77d5ed"
+      },
+      "outputs_equal": false,
+      "page_count": 17,
+      "sample_id": "pmc_pdf_hash4_0002"
+    },
+    {
+      "current_pipeline": {
+        "final_table_chars": 66188,
+        "final_table_sha256": "6f8cdf99c6e8d4523ee047c9b899c70a8d1b0422b3730e729eec06d6c5c5293d",
+        "parse_returns_original_path": true
+      },
+      "data_juicer_1_5_2": {
+        "chars": 62495,
+        "sha256": "592d4902adab56307d9299a4d62d69525756ea716fed3536dc240cf8102b247b"
+      },
+      "outputs_equal": false,
+      "page_count": 15,
+      "sample_id": "pmc_pdf_hash4_0003"
+    }
+  ],
+  "manifest": "fixture://pmc_pdf_hash4/manifest.jsonl",
+  "schema_version": 1,
+  "source_revision": "56d3b6856895427a0519cbaa437d55443fcb578b",
+  "udfjit_diagnostics": "off"
+}

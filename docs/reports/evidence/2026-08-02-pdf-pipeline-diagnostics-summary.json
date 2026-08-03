@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-02",
+  "udfjit_revision": "90a60c66dcca1ecc9297b97adb6bf8e8eed2a52f",
+  "workload": "pipeline_pdf_full_min",
+  "workload_revision": "56d3b6856895427a0519cbaa437d55443fcb578b",
+  "diagnostics_mode": "full",
+  "logical_schema": "Utf8",
+  "bundle_validation": "complete/valid",
+  "functions": [
+    {
+      "function": "dj_pdf_parse_real",
+      "bundle_id": "diagnostic-pdf-candidate-1-30539b1bdf51a42f",
+      "first_line": 49,
+      "code_sha256": "47c4570117ee4d4482a5f147112850ec1af53d25cbfc00b6153dc57f1ec4cda6",
+      "module_sha256": "5e26312f8a66537ada56db73f656627b8aae6b82ed432acf4b401073e8ba2d0c"
+    },
+    {
+      "function": "dj_pdf_ocr_real",
+      "bundle_id": "diagnostic-pdf-candidate-2-04f02ed3d3face37",
+      "first_line": 68,
+      "code_sha256": "4b5b52f21dd0d22312a01c6291df3e08f78030f6f8aa2f48b9b3736256cc5b26",
+      "module_sha256": "5e26312f8a66537ada56db73f656627b8aae6b82ed432acf4b401073e8ba2d0c"
+    },
+    {
+      "function": "dj_pdf_table_real",
+      "bundle_id": "diagnostic-pdf-candidate-3-8318e366b0062400",
+      "first_line": 110,
+      "code_sha256": "5bffbcca61fb8e30ac54fe6c09e001c0608d8562b26f97bd146072dc6cf7b7f1",
+      "module_sha256": "5e26312f8a66537ada56db73f656627b8aae6b82ed432acf4b401073e8ba2d0c"
+    },
+    {
+      "function": "dj_sentence_split",
+      "bundle_id": "diagnostic-pdf-candidate-4-83c59bc1eb6b830e",
+      "first_line": 62,
+      "code_sha256": "769fe6bc9be3364dd0bc46eb986311fa1481153e43ae514bc531688b1a875cf3",
+      "module_sha256": "5d73bd6033d13d14bace1d829b55d3f1e58ea97e149406541a773f1f30a7be39"
+    },
+    {
+      "function": "dj_bge_vectorize_vec",
+      "bundle_id": "diagnostic-pdf-candidate-5-0030d34863b85ce5",
+      "first_line": 188,
+      "code_sha256": "ed7c7718c879dd666d0dab7e360f79f371fc3f8b3896d2d4cdd0e671421bdd24",
+      "module_sha256": "4ef882c2b1bb0260f024605ad9661233e587d4b645a1f6eb8ecf2ddb37ab2643"
+    }
+  ],
+  "common_capture_result": {
+    "adapter_admitted": false,
+    "adapter_reason_code": "logical_schema_not_float64",
+    "capture_supported": false,
+    "capture_reject_code": "unsupported_signature"
+  },
+  "common_chain_status": [
+    {"layer": "source", "status": "available"},
+    {"layer": "original_bytecode", "status": "available"},
+    {"layer": "capture", "status": "rejected", "reason_code": "unsupported_signature"},
+    {"layer": "semantic_ir", "status": "unavailable", "reason_code": "capture_rejected"},
+    {"layer": "cinderx_hir_lir_machine", "status": "unavailable", "reason_code": "capture_rejected"}
+  ],
+  "is_formal_performance_evidence": false,
+  "performance_evidence_reason": "Diagnostic bundles establish admission and lowering availability only; timing runs must use diagnostics=off."
+}

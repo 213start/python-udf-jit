@@ -1,0 +1,109 @@
+{
+  "schema_version": "1.0",
+  "created_at": "2026-08-02",
+  "workload": "pipeline_text_fineweb_full_min",
+  "experiment": "mapper_fusion_10k_single_ab",
+  "classification": "trend_only",
+  "environment": {
+    "host": "aarch64-lab-host",
+    "container": "volc-operator-sim-bench",
+    "image": "volc-operator-sim-bench:56d3b685-aarch64",
+    "source_revision": "56d3b6856895427a0519cbaa437d55443fcb578b",
+    "python": "3.10.20",
+    "daft": "0.7.2",
+    "ray": "2.55.1",
+    "data_juicer": "1.5.2",
+    "cpu_affinity": "4-7",
+    "numa_policy": "cpunode0_membind0",
+    "ray_cpus": 4,
+    "thread_limits": {
+      "OMP_NUM_THREADS": 1,
+      "OPENBLAS_NUM_THREADS": 1,
+      "MKL_NUM_THREADS": 1,
+      "NUMEXPR_NUM_THREADS": 1,
+      "VECLIB_MAXIMUM_THREADS": 1
+    },
+    "diagnostics": {
+      "UDFJIT_DIAGNOSTICS": "off",
+      "PYTHONJITUDFDIAGNOSTICS": "0"
+    },
+    "real_text_operators": true,
+    "cache_mode": "warm",
+    "ray_lifecycle": "restart_per_sample",
+    "perf_lock": {
+      "status": "warn",
+      "violations": [],
+      "warnings": [
+        "CPU governor could not be established",
+        "turbo state could not be established",
+        "16 GiB swap was present"
+      ]
+    }
+  },
+  "input": {
+    "rows": 10000,
+    "fragments": 4,
+    "manifest": "fixture://fineweb_edu_vectorize_10k_p4/manifest.json",
+    "fingerprint_sha256": "7475aaa2659f66ee4ca085c6178173db37f95c9f22d02e7b9c340bf71012d8ca",
+    "provenance_caveat": "The frozen fixture manifest identifies pipeline_text_vectorize_full_min@v0 as its source task; FineWeb reuses the same text fixture as an alias."
+  },
+  "task": {
+    "original_task_sha256": "3bc3c4943d02a6495afe567b1a3b4ac19a0cb8574f546df3454fd2a97d96c7d9",
+    "ab_task_sha256": "afa0cda3138c187e6b084f1626f4eba8d56ff5a77b0810291499113c7845aff2",
+    "runner_script_sha256": "22997e281148552f28825b2ea5505685233c96e244796d5d491fab4508391623",
+    "only_ab_difference": "fuse_mappers=false -> true",
+    "operator_order_equal": true
+  },
+  "baseline": {
+    "fuse_mappers": false,
+    "implementation": "stand-in",
+    "wall_seconds": 67.0223651699489,
+    "input_rows": 10000,
+    "output_rows": 9992,
+    "physical_execution_groups": 13,
+    "result_json": "artifact://fineweb-fusion-ab-20260802/baseline/result.json",
+    "log": "artifact://fineweb-fusion-ab-20260802/baseline/run.log"
+  },
+  "candidate": {
+    "fuse_mappers": true,
+    "implementation": "stand-in-fused",
+    "wall_seconds": 64.69678172993008,
+    "input_rows": 10000,
+    "output_rows": 9992,
+    "physical_execution_groups": 7,
+    "result_json": "artifact://fineweb-fusion-ab-20260802/candidate/result.json",
+    "log": "artifact://fineweb-fusion-ab-20260802/candidate/run.log"
+  },
+  "performance": {
+    "absolute_seconds_saved": 2.325583440018818,
+    "speedup": 1.0359458906275543,
+    "wall_time_reduction_percent": 3.4698617903468842,
+    "samples_per_arm": 1,
+    "confidence_interval": null,
+    "interpretation": "A directionally positive single A-to-B result; not a formal performance claim."
+  },
+  "correctness": {
+    "fixture": "canonical FineWeb 32-row fixture",
+    "baseline_output_rows": 6,
+    "candidate_output_rows": 6,
+    "baseline_multiset_sha256": "204fc6e602b3397a20253442c2da64789c5cd73ddef2d5dcbe14216b8e678ac0",
+    "candidate_multiset_sha256": "204fc6e602b3397a20253442c2da64789c5cd73ddef2d5dcbe14216b8e678ac0",
+    "baseline_ordered_sha256": "f761a61c82a590883ac7879997045a3ebabcd56a5676f462052d87fa76cf1b6e",
+    "candidate_ordered_sha256": "f761a61c82a590883ac7879997045a3ebabcd56a5676f462052d87fa76cf1b6e",
+    "dtype_equal": true,
+    "value_and_order_equal": true,
+    "exact_output_column_name_equal": false,
+    "baseline_output_column": "_text_chunk_mapper_12_out",
+    "candidate_output_column": "_text_chunk_mapper_6_out",
+    "artifact": "artifact://fineweb-fusion-ab-20260802/correctness/result.json",
+    "log": "artifact://fineweb-fusion-ab-20260802/correctness/run.log",
+    "verdict": "Values, ordering, row count, and String dtype match after normalizing the internal output-column name. Promotion is blocked until the public output name is made stable or explicitly aliased."
+  },
+  "model_load_observation": {
+    "baseline_sentencepiece_load_messages": 8,
+    "baseline_kenlm_load_messages": 8,
+    "candidate_sentencepiece_load_messages": 8,
+    "candidate_kenlm_load_messages": 8,
+    "interpretation": "Counts are equal across A/B and do not explain the fusion delta. They identify model lifetime/reuse as a separate optimization candidate."
+  }
+}

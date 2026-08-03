@@ -1,0 +1,166 @@
+{
+  "schema_version": "1.0",
+  "created_at": "2026-08-03",
+  "workload": "pipeline_text_fineweb_full_min",
+  "classification": "diagnostic_and_backend_intrinsic_trend",
+  "source": {
+    "udfjit_revision": "90a60c66dcca1ecc9297b97adb6bf8e8eed2a52f",
+    "udfjit_overlay_sha256": "a17057f989c2d46d7cc2094f5af8d6f11fcb87ce81914f01ba2a84f3c246d7b9",
+    "workload_revision": "56d3b6856895427a0519cbaa437d55443fcb578b",
+    "diagnostic_task_sha256": "773e7c8b723b2b3fe4630d98479b8c498535ac971cc797485d098df721eeb323"
+  },
+  "environment": {
+    "host": "aarch64-lab-host",
+    "arch": "aarch64",
+    "python": "3.14.3",
+    "daft": "0.7.2",
+    "ray": "2.55.0",
+    "cinderx_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
+    "image": "python-udf-jit:u13-20260729-071503-eb97ee8a",
+    "image_revision": "eb97ee8a806f676cda8e1c9f78e6dedb5b501aca",
+    "cpu_affinity": "diagnostics=4-7,timing=4",
+    "real_text_operators": false,
+    "model_caveat": "The Python 3.14 CinderX image does not contain the official fastText or SentencePiece/KenLM dependencies. Source-to-rejection and backend shape evidence is from the stand-in path; model-backed stage conclusions remain separate."
+  },
+  "stable_artifact_root": "artifact://fineweb-backend-diagnostics-20260803",
+  "driver_diagnostics": {
+    "mode": "full",
+    "timing_scope": "diagnostic_only",
+    "pipeline_status": "ok",
+    "input_transport": "The canonical 32 JSONL rows were loaded through synthetic_text because this image has no lance package; operator order, parameters, implementations, and row values were unchanged.",
+    "input_rows": 32,
+    "output_rows": 6,
+    "pipeline_stages": 13,
+    "python_candidates": 12,
+    "dataflow_candidates": 1,
+    "bundle_count": 12,
+    "validated_bundles": 12,
+    "bundle_status_counts": {
+      "partial": 12
+    },
+    "artifacts_per_bundle": 11,
+    "total_manifest_artifacts": 132,
+    "reason_counts": {
+      "logical_schema_not_float64": 12
+    },
+    "code_sha256": "dd18d22d600a4fbc609d0f2a3bed85397c0792fbbdb7d8542b34068188ca4d8b",
+    "selector": "udf:dd18d22d600a4fbc",
+    "available_layers": [
+      "source",
+      "original_bytecode",
+      "candidate_signature",
+      "capture_rejection",
+      "provenance"
+    ],
+    "unavailable_layers": {
+      "capture": "logical_schema_not_float64",
+      "semantic": "capture_rejected",
+      "hir": "capture_rejected",
+      "lir": "capture_rejected",
+      "machine": "capture_rejected"
+    },
+    "validation_command": "python3 -m python_udf_jit.cli diagnostics validate <bundle>",
+    "raw_bundle_root": "artifact://fineweb-backend-diagnostics-20260803/driver-bundles"
+  },
+  "cinderx_backend_diagnostics": {
+    "timing_scope": "diagnostic_only",
+    "udfjit_mode": "off",
+    "udfjit_diagnostics": "off",
+    "jit_list_sha256": "1c89603bbc25398269fe0658acf073f2d6173f5dd49d1b5509c146597b42c01e",
+    "pipeline_status": "ok",
+    "evidence": [
+      {
+        "function": "runner.pipeline_builder:_make_filter_udf.<locals>.udf",
+        "final_hir": "LoadCellItem(fn) followed by VectorCall<1>; the frozen closure target is not devirtualized or inlined",
+        "machine_code_size_bytes": 632
+      },
+      {
+        "function": "ops.datajuicer_cpu_text_ops:dj_alphanumeric_ok",
+        "final_hir": "MakeFunction(genexpr), GetIter, CallMethod, VectorCall(sum), boxed TrueDivide, boxed Compare",
+        "machine_code_size_bytes": 1304
+      },
+      {
+        "function": "ops.datajuicer_cpu_text_ops:dj_alphanumeric_ok.<locals>.<genexpr>",
+        "final_hir": "InvokeIterNext, LoadMethodCached(isalnum), CallMethod, IsTruthy, YieldValue",
+        "compile_attempts": 32,
+        "successful_compiles": 0,
+        "lir_codegen_failures": 32,
+        "failure": "std::get: wrong index for variant",
+        "negative_compile_cache_observed": false
+      },
+      {
+        "function": "ops.datajuicer_cpu_text_ops:dj_language_id_score",
+        "final_hir": "Per-call dict/cell allocation, six regex findall list allocations, StoreSubscr, lambda creation, and max VectorCall remain",
+        "machine_code_size_bytes": 5872
+      }
+    ],
+    "raw_log": "artifact://fineweb-backend-diagnostics-20260803/cinderx-expanded/fineweb.jit.log"
+  },
+  "backend_intrinsic_ab": {
+    "timing_diagnostics": {
+      "UDFJIT_DIAGNOSTICS": "off",
+      "PYTHONJITUDFDIAGNOSTICS": "unset",
+      "cinderx_hir_lir_asm_dump": false
+    },
+    "input": {
+      "rows": 10000,
+      "bytes": 47880452,
+      "characters": 47307528,
+      "sha256": "7475aaa2659f66ee4ca085c6178173db37f95c9f22d02e7b9c340bf71012d8ca",
+      "min_ratio": 0.2,
+      "max_rows": 10000,
+      "max_input_bytes": 67108864
+    },
+    "probe": {
+      "c_source_sha256": "73dd434a9d67e75e6c921fffd31b8a98f0547c0db2bac58d6749f5162bb4d87e",
+      "python_harness_sha256": "2b59ad75020156ab222b9517b250f2f81cb076b218e54ce4014d0396eef78e02",
+      "extension_sha256": "f98894f6d8de04e287b818e1b0439a299eefa5b94b9e923615f2133d4e339ce8",
+      "raw_log_sha256": "2d17a664852a8c52cdc1f4b4c14a3d37a5556a3ad77b560b8cb87d1b2678b9d7",
+      "samples_per_arm": 2,
+      "order": "A then B for each stage",
+      "classification": "trend_only"
+    },
+    "correctness": {
+      "full_input_equal": true,
+      "unicode_edge_equal": true,
+      "alphanumeric_result_sha256": "684ad25fdc2bbb80cbc910dd1bde6d5499ccf860ca6ee44704b77ec445271353",
+      "punctuation_result_sha256": "f75ea3e3306bc9751cbaa14b7ab1f677bffd35a2aafece5e715772e38e3d640d",
+      "whitespace_result_sha256": "5735637416f2a2ece04db4ae8f9fb6004359d1ce5b18b03baa9773880ef8f784"
+    },
+    "operations": {
+      "alphanumeric": {
+        "historical_e2e_share": 0.1219,
+        "baseline_median_seconds": 3.8810771600000002,
+        "candidate_median_seconds": 0.38710579,
+        "stage_speedup": 10.025882485508678
+      },
+      "punctuation": {
+        "historical_e2e_share": 0.0984,
+        "baseline_median_seconds": 1.15409853,
+        "candidate_median_seconds": 0.08737625,
+        "stage_speedup": 13.20837790589548
+      },
+      "whitespace": {
+        "historical_e2e_share": 0.0629,
+        "baseline_median_seconds": 3.07853827,
+        "candidate_median_seconds": 0.191618535,
+        "stage_speedup": 16.065973315159727
+      }
+    },
+    "projection": {
+      "covered_historical_e2e_share": 0.2832,
+      "projected_e2e_time_reduction_fraction": 0.25967654545374036,
+      "projected_e2e_speedup": 1.3507609327505297,
+      "caveat": "Amdahl projection from historical stage shares, not a full-pipeline timing result. Production promotion requires the official Data-Juicer semantic contract, a real model-backed full-pipeline A/B, and repeated samples."
+    },
+    "raw_log": "artifact://fineweb-backend-diagnostics-20260803/alnum-probe/run.log"
+  },
+  "priority": [
+    "P0: fix generator HIR-to-LIR lowering and cache failed compilation",
+    "P0: add UDF JIT string/bool admission and a guarded Unicode-view ABI",
+    "P0: lower verified alphanumeric, punctuation, and whitespace shapes to CinderX text-scan intrinsics",
+    "P0: devirtualize frozen wrapper closure targets before CinderX inlining",
+    "P1: validate official Data-Juicer semantics and run a real full-pipeline AB",
+    "P2: operator reordering or mapper fusion"
+  ]
+}
