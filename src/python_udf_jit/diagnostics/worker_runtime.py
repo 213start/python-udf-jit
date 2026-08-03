@@ -6,13 +6,20 @@ bundle, provenance recorder, clock, or CinderX diagnostic observer.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
+import json
+import marshal
 import threading
 from dataclasses import dataclass
 from types import FunctionType
 
 from python_udf_jit.compiler.abstract_interpreter import analyze_function
-from python_udf_jit.compiler.identity import capture_identities
+from python_udf_jit.compiler.identity import (
+    capture_identities,
+    code_identity_from_code,
+)
 from python_udf_jit.diagnostics.bundle import (
     BundleRunContext,
     BundleStatus,
@@ -27,13 +34,16 @@ from python_udf_jit.diagnostics.config import (
     DiagnosticPerfMode,
     DiagnosticPolicySnapshot,
     DiagnosticProfile,
+    DiagnosticSourcePolicy,
     canonical_json_bytes,
 )
 from python_udf_jit.diagnostics.hotspots import NormalizedPerfProfile
 from python_udf_jit.diagnostics.provenance import (
-    ProvenanceMap,
     UpperProvenanceRecorder,
     build_bytecode_artifacts,
+    build_original_provenance,
+    generated_ast_text,
+    program_source_map_document,
 )
 from python_udf_jit.diagnostics.session import open_diagnostic_session
 from python_udf_jit.protocol.artifact import PortableUdfArtifact
@@ -41,6 +51,41 @@ from python_udf_jit.protocol.artifact import PortableUdfArtifact
 
 def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _redacted_typed_module_document(module) -> dict[str, object]:
+    document = module.to_document()
+    for operation in document["operations"]:
+        literal = operation["literal"]
+        if literal is None:
+            continue
+        operation["literal"] = {
+            "kind": literal["kind"],
+            "sha256": hashlib.sha256(
+                literal["encoded_value"].encode("utf-8")
+            ).hexdigest(),
+        }
+    return document
+
+
+def _redacted_generated_artifacts(source: str) -> tuple[str, str]:
+    module = ast.parse(source)
+
+    class _RedactConstants(ast.NodeTransformer):
+        def visit_Constant(self, node: ast.Constant) -> ast.Name:
+            try:
+                encoded = marshal.dumps(node.value)
+            except (TypeError, ValueError):
+                encoded = type(node.value).__qualname__.encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            replacement = ast.Name(
+                id=f"_redacted_literal_{digest}",
+                ctx=ast.Load(),
+            )
+            return ast.copy_location(replacement, node)
+
+    redacted = ast.fix_missing_locations(_RedactConstants().visit(module))
+    return ast.unparse(redacted) + "\n", generated_ast_text(module)
 
 
 def _selector_matches(
@@ -116,6 +161,8 @@ class WorkerDiagnosticRuntime:
             bundle_writer=writer,
         )
         self._states: dict[str, _CompilationState] = {}
+        self._typed_regions_recording: set[str] = set()
+        self._typed_regions_recorded: set[str] = set()
         self._analysis = None
         self._partial = False
         self._selected = policy.selector.startswith(
@@ -216,6 +263,35 @@ class WorkerDiagnosticRuntime:
             return ""
         return compile_instance_id
 
+    def prepare_typed_compilation(
+        self,
+        function: FunctionType,
+        generated_code_hash: str,
+    ) -> str:
+        """Bind a typed generated function before CinderX compiles it."""
+
+        if (
+            not self._selected
+            or self.policy.profile is not DiagnosticProfile.FULL
+        ):
+            return ""
+        if (
+            not isinstance(function, FunctionType)
+            or len(generated_code_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in generated_code_hash
+            )
+        ):
+            raise ValueError("typed_diagnostic_identity_invalid")
+        compile_instance_id = f"typed-{generated_code_hash[:24]}"
+        setattr(
+            function,
+            "__udfjit_generated_code_hash__",
+            generated_code_hash,
+        )
+        return compile_instance_id
+
     def _artifact(
         self,
         path: str,
@@ -241,6 +317,473 @@ class WorkerDiagnosticRuntime:
             self.mark_partial()
             return False
         return True
+
+    def record_typed_region_decision(self, request, decision) -> None:
+        """Record the v2 typed path without coupling the normal Worker path.
+
+        This method lives in the lazily imported full-diagnostics module.  The
+        typed compiler only sees a structural sink protocol, so diagnostics=off
+        neither imports this module nor builds any of these documents.
+        """
+
+        if (
+            not self._selected
+            or self.policy.profile is not DiagnosticProfile.FULL
+            or decision.status.value not in {"compiled", "unsupported"}
+        ):
+            return
+        module = request.region
+        try:
+            analysis = decision.worker_analysis
+        except Exception:
+            self.mark_partial()
+            return
+        if analysis is None:
+            self.mark_partial()
+            return
+        with self._lock:
+            if (
+                module.semantic_hash in self._typed_regions_recorded
+                or module.semantic_hash in self._typed_regions_recording
+            ):
+                return
+            self._typed_regions_recording.add(module.semantic_hash)
+        try:
+            original_hash = code_identity_from_code(
+                self._user_function.__code__
+            ).sha256
+            original = build_bytecode_artifacts(
+                self._user_function.__code__,
+                code_hash=original_hash,
+            )
+            original_provenance = build_original_provenance(
+                self._user_function.__code__,
+                code_hash=original_hash,
+            )
+            analysis_documents = analysis.to_documents()
+            module_document = (
+                module.to_document()
+                if self.policy.source_policy is DiagnosticSourcePolicy.TEXT
+                else _redacted_typed_module_document(module)
+            )
+            decision_document: dict[str, object] = {
+                "driver_analysis_hint_matched": (
+                    decision.driver_analysis_hint_matched
+                ),
+                "reason_code": decision.reason_code,
+                "runtime": {
+                    "call_count": request.runtime.call_count,
+                    "deopt_count": request.runtime.deopt_count,
+                },
+                "schema_version": 1,
+                "status": decision.status.value,
+            }
+            artifacts: list[tuple[str, str, object, str]] = [
+                (
+                    "typed/source-ranges.json",
+                    "application/json",
+                    program_source_map_document(original_provenance),
+                    "source",
+                ),
+                (
+                    "typed/bytecode-original.json",
+                    "application/json",
+                    original.json_document,
+                    "bytecode",
+                ),
+                (
+                    "typed/bytecode-original.dis",
+                    "text/plain",
+                    original.disassembly,
+                    "bytecode",
+                ),
+                (
+                    "typed/semantic-v2.json",
+                    "application/json",
+                    module_document,
+                    "typed_semantic",
+                ),
+                (
+                    "typed/semantic-v2.txt",
+                    "text/plain",
+                    json.dumps(
+                        module_document,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    "typed_semantic",
+                ),
+                (
+                    "typed/behavior-profile.json",
+                    "application/json",
+                    analysis_documents["behavior-profile"],
+                    "behavior",
+                ),
+                (
+                    "typed/type-evidence.json",
+                    "application/json",
+                    analysis_documents["type-evidence"],
+                    "types",
+                ),
+                (
+                    "typed/pattern-analysis.json",
+                    "application/json",
+                    analysis_documents["pattern-analysis"],
+                    "patterns",
+                ),
+                (
+                    "typed/decision.json",
+                    "application/json",
+                    decision_document,
+                    "decision",
+                ),
+            ]
+            chain = {
+                "behavior": "available",
+                "cinderx_hir": "unavailable",
+                "cinderx_lir": "unavailable",
+                "generated_bytecode": "unavailable",
+                "generic_lowering": "unavailable",
+                "machine": "unavailable",
+                "original_bytecode": "available",
+                "pattern_analysis": "available",
+                "physical_lowering": "unavailable",
+                "schema_version": 1,
+                "source_ranges": "available",
+                "typed_semantic": "available",
+                "type_evidence": "available",
+            }
+            variant = decision.variant
+            if variant is not None:
+                lowering = variant.lowering
+                backend = variant.backend
+                generic_map = dict(lowering.operation_lines)
+                physical = backend.physical_lowering
+                physical_map = (
+                    {} if physical is None else dict(physical.operation_lines)
+                )
+                generated = build_bytecode_artifacts(
+                    variant.jit_function.__code__,
+                    code_hash=variant.code_hash,
+                )
+                offsets_by_line: dict[int, list[int]] = {}
+                for instruction in generated.json_document["instructions"]:
+                    position = instruction["position"]
+                    line = position["line"]
+                    if type(line) is int:
+                        offsets_by_line.setdefault(line, []).append(
+                            instruction["offset"]
+                        )
+                original_offsets_by_line: dict[int, list[int]] = {}
+                for instruction in original.json_document["instructions"]:
+                    position = instruction["position"]
+                    line = position["line"]
+                    if type(line) is int:
+                        original_offsets_by_line.setdefault(line, []).append(
+                            instruction["offset"]
+                        )
+                provenance_entries: list[dict[str, object]] = []
+                for operation in module.operations:
+                    generic_line = generic_map[operation.operation_id]
+                    physical_line = physical_map.get(operation.operation_id)
+                    if physical is not None and physical_line is None:
+                        raise ValueError(
+                            "typed_physical_provenance_incomplete"
+                        )
+                    generated_line = (
+                        generic_line
+                        if physical is None
+                        else physical_line
+                    )
+                    provenance_entries.append(
+                        {
+                            "generated_bytecode_offsets": list(
+                                offsets_by_line.get(generated_line, ())
+                            ),
+                            "generated_line": generated_line,
+                            "generic_line": generic_line,
+                            "hir_ids": [],
+                            "lir_ids": [],
+                            "machine_range_ids": [],
+                            "operation_id": operation.operation_id,
+                            "original_bytecode_offsets": list(
+                                original_offsets_by_line.get(
+                                    operation.source_offset,
+                                    (),
+                                )
+                            ),
+                            "physical_line": physical_line,
+                            "source_offset": operation.source_offset,
+                        }
+                    )
+                provenance = {
+                    "entries": provenance_entries,
+                    "generated_code_hash": variant.code_hash,
+                    "module_hash": module.semantic_hash,
+                    "schema_version": 1,
+                }
+                if self.policy.source_policy is DiagnosticSourcePolicy.TEXT:
+                    generic_source = lowering.generated_source
+                    generic_ast = lowering.generated_ast_text
+                else:
+                    generic_source, generic_ast = (
+                        _redacted_generated_artifacts(
+                            lowering.generated_source
+                        )
+                    )
+                artifacts.extend(
+                    (
+                        (
+                            "typed/specialization-plan.json",
+                            "application/json",
+                            lowering.plan.to_document(),
+                            "lowering",
+                        ),
+                        (
+                            "typed/generic-lowering.py",
+                            "text/x-python",
+                            generic_source,
+                            "lowering",
+                        ),
+                        (
+                            "typed/generic-lowering.ast",
+                            "text/plain",
+                            generic_ast,
+                            "lowering",
+                        ),
+                        (
+                            "typed/backend.json",
+                            "application/json",
+                            {
+                                "execution_mode": backend.execution_mode,
+                                "hir_opcode_counts": [
+                                    list(value)
+                                    for value in backend.hir_opcode_counts
+                                ],
+                                "jit_compiled": backend.jit_compiled,
+                                "schema_version": 1,
+                            },
+                            "backend",
+                        ),
+                        (
+                            "typed/generated-bytecode.json",
+                            "application/json",
+                            generated.json_document,
+                            "bytecode",
+                        ),
+                        (
+                            "typed/generated-bytecode.dis",
+                            "text/plain",
+                            generated.disassembly,
+                            "bytecode",
+                        ),
+                    )
+                )
+                chain["generic_lowering"] = "available"
+                chain["generated_bytecode"] = "available"
+                if dict(backend.hir_opcode_counts).get(
+                    "UnicodeCountProperty",
+                    0,
+                ):
+                    chain["cinderx_hir"] = "available_summary"
+                compile_instance_id = (
+                    f"typed-{variant.code_hash[:24]}"
+                    if getattr(
+                        variant.jit_function,
+                        "__udfjit_generated_code_hash__",
+                        None,
+                    )
+                    == variant.code_hash
+                    else ""
+                )
+                if compile_instance_id:
+                    from cinderx import jit as jit_module
+
+                    diagnostics = collect_cinderx_compilation_diagnostics(
+                        jit_module,
+                        variant.jit_function,
+                        compile_instance_id=compile_instance_id,
+                        generated_code_hash=variant.code_hash,
+                    )
+                    cinderx = build_cinderx_artifacts(diagnostics)
+                    artifacts.extend(
+                        (
+                            (
+                                "typed/cinderx/hir.final.json",
+                                "application/json",
+                                cinderx.hir_json,
+                                "hir",
+                            ),
+                            (
+                                "typed/cinderx/hir.final.txt",
+                                "text/plain",
+                                cinderx.hir_text,
+                                "hir",
+                            ),
+                            (
+                                "typed/cinderx/lir-origin.json",
+                                "application/json",
+                                cinderx.lir_json,
+                                "lir",
+                            ),
+                            (
+                                "typed/cinderx/lir.txt",
+                                "text/plain",
+                                cinderx.lir_text,
+                                "lir",
+                            ),
+                            (
+                                "typed/cinderx/machine-ranges.json",
+                                "application/json",
+                                cinderx.machine_ranges_json,
+                                "machine",
+                            ),
+                            (
+                                "typed/cinderx/machine-ranges.txt",
+                                "text/plain",
+                                cinderx.machine_ranges_text,
+                                "machine",
+                            ),
+                            (
+                                "typed/cinderx/compile-stats.json",
+                                "application/json",
+                                cinderx.compile_stats_json,
+                                "cinderx",
+                            ),
+                        )
+                    )
+                    if diagnostics.status.value == "available":
+                        hir_by_offset: dict[int, list[str]] = {}
+                        for node in diagnostics.hir_nodes:
+                            if node.bytecode_offset is not None:
+                                hir_by_offset.setdefault(
+                                    node.bytecode_offset,
+                                    [],
+                                ).append(node.hir_id)
+                        lir_by_hir: dict[str, set[str]] = {}
+                        for node in diagnostics.lir_nodes:
+                            for hir_id in node.hir_ids:
+                                lir_by_hir.setdefault(hir_id, set()).add(
+                                    node.lir_id
+                                )
+                        ranges_by_hir: dict[str, set[str]] = {}
+                        ranges_by_lir: dict[str, set[str]] = {}
+                        for item in diagnostics.machine_ranges:
+                            for hir_id in item.hir_ids:
+                                ranges_by_hir.setdefault(hir_id, set()).add(
+                                    item.range_id
+                                )
+                            for lir_id in item.lir_ids:
+                                ranges_by_lir.setdefault(lir_id, set()).add(
+                                    item.range_id
+                                )
+                        for entry in provenance_entries:
+                            offsets = entry["generated_bytecode_offsets"]
+                            hir_ids = sorted(
+                                {
+                                    hir_id
+                                    for offset in offsets
+                                    for hir_id in hir_by_offset.get(offset, ())
+                                },
+                                key=int,
+                            )
+                            lir_ids = sorted(
+                                {
+                                    lir_id
+                                    for hir_id in hir_ids
+                                    for lir_id in lir_by_hir.get(hir_id, ())
+                                },
+                                key=int,
+                            )
+                            range_ids = sorted(
+                                {
+                                    range_id
+                                    for hir_id in hir_ids
+                                    for range_id in ranges_by_hir.get(hir_id, ())
+                                }
+                                | {
+                                    range_id
+                                    for lir_id in lir_ids
+                                    for range_id in ranges_by_lir.get(lir_id, ())
+                                },
+                                key=int,
+                            )
+                            entry["hir_ids"] = hir_ids
+                            entry["lir_ids"] = lir_ids
+                            entry["machine_range_ids"] = range_ids
+                        chain["cinderx_hir"] = "available"
+                        chain["cinderx_lir"] = "available"
+                        chain["machine"] = "available"
+                if physical is not None:
+                    if self.policy.source_policy is DiagnosticSourcePolicy.TEXT:
+                        physical_source = physical.generated_source
+                        physical_ast = physical.generated_ast_text
+                    else:
+                        physical_source, physical_ast = (
+                            _redacted_generated_artifacts(
+                                physical.generated_source
+                            )
+                        )
+                    artifacts.extend(
+                        (
+                            (
+                                "typed/physical-lowering.json",
+                                "application/json",
+                                physical.to_document(),
+                                "physical",
+                            ),
+                            (
+                                "typed/physical-lowering.py",
+                                "text/x-python",
+                                physical_source,
+                                "physical",
+                            ),
+                            (
+                                "typed/physical-lowering.ast",
+                                "text/plain",
+                                physical_ast,
+                                "physical",
+                            ),
+                        )
+                    )
+                    chain["physical_lowering"] = "available"
+                artifacts.append(
+                    (
+                        "typed/operation-provenance.json",
+                        "application/json",
+                        provenance,
+                        "provenance",
+                    )
+                )
+            artifacts.append(
+                (
+                    "typed/chain-status.json",
+                    "application/json",
+                    chain,
+                    "reports",
+                )
+            )
+            emitted = True
+            for path, media_type, payload, layer in artifacts:
+                emitted = (
+                    self._artifact(
+                        path,
+                        media_type,
+                        payload,
+                        layer=layer,
+                    )
+                    and emitted
+                )
+            if emitted:
+                with self._lock:
+                    self._typed_regions_recorded.add(module.semantic_hash)
+        except Exception:
+            self.mark_partial()
+        finally:
+            with self._lock:
+                self._typed_regions_recording.discard(module.semantic_hash)
 
     def record_compilation(
         self,
@@ -283,7 +826,7 @@ class WorkerDiagnosticRuntime:
                 ),
                 "schema_version": 1,
             }
-            artifacts = (
+            artifacts = [
                 ("source/identity.json", "application/json", identity, "source"),
                 (
                     "source/ranges.json",
@@ -421,14 +964,45 @@ class WorkerDiagnosticRuntime:
                     },
                     "provenance",
                 ),
-            )
+            ]
+            if self.policy.source_policy is DiagnosticSourcePolicy.TEXT:
+                try:
+                    source_text = inspect.getsource(self._user_function)
+                except (OSError, TypeError):
+                    self.mark_partial()
+                    artifacts.insert(
+                        2,
+                        (
+                            "source/text-status.json",
+                            "application/json",
+                            {
+                                "schema_version": 1,
+                                "status": "unavailable",
+                                "unavailable_reason": (
+                                    "source_text_unavailable"
+                                ),
+                            },
+                            "source",
+                        ),
+                    )
+                else:
+                    artifacts.insert(
+                        2,
+                        (
+                            "source/source.py",
+                            "text/x-python",
+                            source_text,
+                            "source",
+                        ),
+                    )
             for path, media_type, payload, layer in artifacts:
-                self._artifact(
+                if not self._artifact(
                     path,
                     media_type,
                     payload,
                     layer=layer,
-                )
+                ):
+                    self.mark_partial()
             for timing in diagnostics.pass_timings:
                 self._session.record_metric(
                     f"cinderx_pass_{timing.ordinal}",
@@ -499,17 +1073,6 @@ class WorkerDiagnosticRuntime:
                 else BundleStatus.COMPLETE
             )
         return self._session.finalize(status)
-
-
-def program_source_map_document(
-    provenance: ProvenanceMap,
-) -> dict[str, object]:
-    source_nodes = [
-        node.to_document()
-        for node in provenance.nodes
-        if node.layer.value == "source"
-    ]
-    return {"format_version": 1, "ranges": source_nodes}
 
 
 def open_worker_diagnostic_runtime(

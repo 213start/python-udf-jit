@@ -329,10 +329,40 @@ export UDFJIT_DIAGNOSTIC_MAX_BYTES=67108864
 export PYTHONJITUDFDIAGNOSTICS=1
 ```
 
+`artifact:` 适合已经进入 Worker、已有 Artifact 身份的候选。若候选可能在 Driver admission 或
+Capture 阶段被拒绝，应先用 `udf:<code-sha256前缀>`；也可以用精确的
+`candidate:<candidate-id>`。Driver 前置拒绝尚未产生 artifact/region 身份，所以此时使用
+`artifact:` 或 `region:` 不会匹配，不能据此判断“没有候选”。
+
 不得在已初始化 CinderX 的共享 Worker 中热切换这些变量。Full Worker 会把 Source Range、
 原始 Bytecode、Semantic Core/Region、生成 AST、生成 Bytecode、HIR、LIR、Machine
 Range 和统一 Provenance Map 写入权限为 `0700/0600` 的内容校验 Bundle。默认只保存
-源码范围和哈希；常量、模块名、函数名和机器符号不会以明文进入结构化报告。
+源码范围和哈希；只有显式设置 `UDFJIT_DIAGNOSTIC_SOURCE=text` 时，Driver/Worker 才会写入
+`source/source.py`。常量、模块名、函数名和机器符号不会以明文进入结构化报告。
+
+通用 typed-loop 路径在同一 Bundle 的 `typed/` 下额外保存 Behavior Profile、Type Evidence、
+Pattern Analysis、Semantic IR v2、特化计划、通用 Lowering、物理 Lowering 和两级 Bytecode。
+`typed/operation-provenance.json` 把每个通用语义操作依次关联到绝对 Source Line、原始/生成
+Bytecode offset、通用/物理源码行、HIR ID、LIR ID 和 Machine Range ID；
+`typed/chain-status.json` 明确标记每层是
+`available`、摘要可用还是不可用。Behavior、Type 和 Pattern 是三个独立维度：行为分类不定义
+程序语义，类型证据不能替代控制/数据流证明，Pattern 也不包含 pipeline、算子或 UDF 名称。
+
+full 模式还会记录未到达 Worker 的 Driver rejection。此类 Bundle 的预期状态是 `partial`：
+source、original bytecode、candidate signature、rejection 和前缀 provenance 可用；后续 semantic、
+HIR、LIR、machine 必须带明确 `unavailable_reason`。`partial` 不等于校验失败，仍应运行
+`diagnostics validate`。Capture verification failure 也会成为结构化 rejection，不应只出现在日志中。
+若拒绝发生在 semantic/artifact 阶段，Bundle 还会保留已经成功生成的 `capture/capture.json` 和
+`capture/cfg.json`，不得把已存在的上游证据误报为 unavailable。
+
+诊断写盘不会改变 UDF 的业务结果或异常语义。必需产物写入或 Bundle finalize 失败时，Driver
+尽可能发布 `incomplete` Bundle，同时递增 registry 的 `diagnostic_failure_count` 并发出
+`diagnostics/recording_failed` 决策事件；调用方必须把非零失败计数或 `incomplete` 视为证据链不完整，
+不能据此宣称某层已经验证。源码明文被授权但无法读取时也按同一规则处理。
+
+显式 summary/full 的配置或 bootstrap 错误会直接失败，避免用户以为已完成诊断却实际静默退化。
+`off` 模式仍保持正常运行的 fail-open 边界，不导入 Driver/Worker Bundle runtime，不给 typed
+backend 绑定诊断 sink，也不创建诊断目录。
 
 常用只读查询：
 

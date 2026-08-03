@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from python_udf_jit.diagnostics import events
+from python_udf_jit.diagnostics.config import (
+    DiagnosticRuntimeContext,
+    OFF_DIAGNOSTIC_POLICY,
+    resolve_diagnostic_policy,
+)
 from python_udf_jit.diagnostics.events import DecisionEvent
 from python_udf_jit.integration.daft_ray.compatibility import (
     DAFT_V0_7_2_TARGET,
@@ -236,6 +241,18 @@ def install_default_daft_hooks(daft_module: Any) -> HookResult:
     if manifest_sha256 is None:
         _emit_fail_open("manifest_missing")
         return HookResult(HookStatus.ERROR, "manifest_missing")
+    if os.environ.get("UDFJIT_DIAGNOSTICS", "off") == "off":
+        diagnostic_policy = OFF_DIAGNOSTIC_POLICY
+    else:
+        diagnostic_policy = resolve_diagnostic_policy(
+            os.environ,
+            DiagnosticRuntimeContext(
+                dedicated_worker=(
+                    os.environ.get("PYTHONJITUDFDIAGNOSTICS") == "1"
+                ),
+                workspace_root=Path.cwd(),
+            ),
+        )
     try:
         flotilla_module = importlib.import_module(
             "daft.runners.flotilla"
@@ -259,6 +276,13 @@ def install_default_daft_hooks(daft_module: Any) -> HookResult:
                     "UDFJIT_JOB_NAMESPACE",
                     "default-ray-job",
                 ),
+                diagnostic_policy=diagnostic_policy,
+                diagnostic_run_id=os.environ.get(
+                    "UDFJIT_RUN_ID",
+                    "driver-diagnostic",
+                ),
+                diagnostic_runtime_mode=mode,
+                diagnostic_process_key=f"driver-{os.getpid()}",
             )
         return install_daft_control_hooks(
             daft_module=daft_module,

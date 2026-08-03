@@ -120,6 +120,17 @@ class DiagnosticPolicyTests(unittest.TestCase):
                 policy = resolve_diagnostic_policy(environment, self._context())
                 self.assertEqual(policy.sample_rate, float(value))
 
+    def test_selector_requires_a_supported_kind_and_value(self) -> None:
+        for selector in ("unknown:value", "artifact", "candidate:"):
+            with self.subTest(selector=selector):
+                environment = self._environment()
+                environment["UDFJIT_DIAGNOSTIC_FILTER"] = selector
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "filter_invalid",
+                ):
+                    resolve_diagnostic_policy(environment, self._context())
+
     def test_full_requires_dedicated_worker_and_supports_perf(self) -> None:
         environment = self._environment("full")
         environment["UDFJIT_DIAGNOSTIC_PERF"] = "record"

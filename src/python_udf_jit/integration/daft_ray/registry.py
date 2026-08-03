@@ -13,6 +13,7 @@ from python_udf_jit.compiler.abstract_interpreter import CapturedProgram
 from python_udf_jit.compiler.capture import (
     CaptureIR,
     CaptureRejectCode,
+    CaptureRejected,
     CaptureRequest,
     capture_program_request,
     fallback_identity_for_program,
@@ -21,6 +22,11 @@ from python_udf_jit.compiler.capture import (
 from python_udf_jit.compiler.capture_cache import CaptureCache
 from python_udf_jit.compiler.pipeline import compile_semantic
 from python_udf_jit.diagnostics import events
+from python_udf_jit.diagnostics.config import (
+    DiagnosticPolicySnapshot,
+    DiagnosticProfile,
+    OFF_DIAGNOSTIC_POLICY,
+)
 from python_udf_jit.diagnostics.events import DecisionEvent
 from python_udf_jit.governance.policy import (
     DEFAULT_MAINLINE_POLICY,
@@ -102,6 +108,10 @@ class CandidateRegistry:
         ttl_seconds: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
         policy: PolicySnapshot = DEFAULT_MAINLINE_POLICY,
+        diagnostic_policy: DiagnosticPolicySnapshot = OFF_DIAGNOSTIC_POLICY,
+        diagnostic_run_id: str = "driver-diagnostic",
+        diagnostic_runtime_mode: str = "observe",
+        diagnostic_process_key: str = "driver",
     ):
         if max_candidates <= 0:
             raise ValueError("max_candidates must be positive")
@@ -111,12 +121,27 @@ class CandidateRegistry:
             raise ValueError("ttl_seconds must be positive")
         if not isinstance(policy, PolicySnapshot):
             raise ValueError("policy snapshot is required")
+        if not isinstance(diagnostic_policy, DiagnosticPolicySnapshot):
+            raise ValueError("diagnostic policy snapshot is required")
         self._manifest_sha256 = manifest_sha256
         self._max_candidates = max_candidates
         self._job_namespace = job_namespace
         self._ttl_seconds = float(ttl_seconds)
         self._clock = clock
         self._policy = policy
+        self._diagnostic_policy = diagnostic_policy
+        self._driver_diagnostics = None
+        if diagnostic_policy.profile is DiagnosticProfile.FULL:
+            from python_udf_jit.diagnostics.driver_runtime import (
+                DriverDiagnosticRecorder,
+            )
+
+            self._driver_diagnostics = DriverDiagnosticRecorder(
+                diagnostic_policy,
+                run_id=diagnostic_run_id,
+                runtime_mode=diagnostic_runtime_mode,
+                process_key=diagnostic_process_key,
+            )
         self._capture_cache = CaptureCache(
             capacity=max_candidates,
             ttl_seconds=ttl_seconds,
@@ -227,6 +252,7 @@ class CandidateRegistry:
                     candidate_id,
                     self._manifest_sha256,
                     policy=self._policy,
+                    diagnostic_policy=self._diagnostic_policy,
                 ),
             )
             record = CandidateRecord(
@@ -379,13 +405,21 @@ class CandidateRegistry:
             return 0
         logical_schema = canonicalize_schema(dataframe.schema())
         finalized = 0
+        record_driver_diagnostics = self._driver_diagnostics is not None
         for record in records:
+            diagnostic_rejection: tuple[str, str, str] | None = None
             with self._lock:
                 if record.finalized:
                     continue
                 artifact_bytes: bytes | None = None
                 semantic_source: CaptureIR | CapturedProgram | None = None
                 fallback_identity = None
+                if record_driver_diagnostics:
+                    diagnostic_rejection = (
+                        "adapter",
+                        "logical_schema_not_float64",
+                        "",
+                    )
                 if "float64" in logical_schema.lower():
                     try:
                         request = CaptureRequest(
@@ -411,22 +445,52 @@ class CandidateRegistry:
                             fallback_identity = (
                                 record.capture_ir.fallback_identity
                             )
-                        elif captured.reject_code in {
-                            CaptureRejectCode.OPAQUE_CALL,
-                            CaptureRejectCode.GLOBAL_DEPENDENCY,
-                        }:
-                            program = capture_program_request(request)
-                            semantic_source = program
-                            fallback_identity = (
-                                fallback_identity_for_program(
-                                    record.capture_callable,
-                                    program,
+                            diagnostic_rejection = None
+                        else:
+                            if record_driver_diagnostics:
+                                reject_code = (
+                                    captured.reject_code.value
+                                    if captured.reject_code is not None
+                                    else "capture_rejected"
                                 )
-                            )
-                    except Exception:
+                                diagnostic_rejection = (
+                                    "capture",
+                                    reject_code,
+                                    captured.reject_detail,
+                                )
+                            if captured.reject_code in {
+                                CaptureRejectCode.OPAQUE_CALL,
+                                CaptureRejectCode.GLOBAL_DEPENDENCY,
+                            }:
+                                program = capture_program_request(request)
+                                semantic_source = program
+                                fallback_identity = (
+                                    fallback_identity_for_program(
+                                        record.capture_callable,
+                                        program,
+                                    )
+                                )
+                                diagnostic_rejection = None
+                    except CaptureRejected as error:
                         record.capture_ir = None
                         semantic_source = None
                         fallback_identity = None
+                        if record_driver_diagnostics:
+                            diagnostic_rejection = (
+                                "capture",
+                                error.code.value,
+                                error.detail,
+                            )
+                    except Exception as error:
+                        record.capture_ir = None
+                        semantic_source = None
+                        fallback_identity = None
+                        if record_driver_diagnostics:
+                            diagnostic_rejection = (
+                                "capture",
+                                "capture_internal_error",
+                                type(error).__name__,
+                            )
                 if semantic_source is not None and fallback_identity is not None:
                     try:
                         semantic = compile_semantic(semantic_source)
@@ -470,24 +534,58 @@ class CandidateRegistry:
                                 or graph_break_scalar
                             )
                         ):
-                            raise ValueError(
-                                "semantic_pipeline_not_scalar_eligible"
+                            if record_driver_diagnostics:
+                                if (
+                                    semantic.accepted
+                                    and semantic.core_module is not None
+                                    and semantic.region_graph is not None
+                                ):
+                                    reason_code = (
+                                        "semantic_pipeline_not_scalar_eligible"
+                                    )
+                                else:
+                                    reason_code = (
+                                        semantic.reason_code
+                                        or "semantic_pipeline_rejected"
+                                    )
+                                diagnostic_rejection = (
+                                    "semantic",
+                                    reason_code,
+                                    "",
+                                )
+                        else:
+                            record.semantic_core_hash = (
+                                semantic.core_module.semantic_hash
                             )
-                        record.semantic_core_hash = (
-                            semantic.core_module.semantic_hash
-                        )
-                        record.semantic_region_hash = (
-                            semantic.region_graph.semantic_hash
-                        )
-                        artifact_bytes = encode_artifact(
-                            build_artifact(
-                                semantic.core_module,
-                                semantic.region_graph,
-                                fallback_identity,
+                            record.semantic_region_hash = (
+                                semantic.region_graph.semantic_hash
                             )
-                        )
-                    except Exception:
+                            try:
+                                artifact_bytes = encode_artifact(
+                                    build_artifact(
+                                        semantic.core_module,
+                                        semantic.region_graph,
+                                        fallback_identity,
+                                    )
+                                )
+                            except Exception as error:
+                                artifact_bytes = None
+                                if record_driver_diagnostics:
+                                    diagnostic_rejection = (
+                                        "artifact",
+                                        "artifact_encoding_failed",
+                                        type(error).__name__,
+                                    )
+                            else:
+                                diagnostic_rejection = None
+                    except Exception as error:
                         artifact_bytes = None
+                        if record_driver_diagnostics:
+                            diagnostic_rejection = (
+                                "semantic",
+                                "semantic_pipeline_failed",
+                                type(error).__name__,
+                            )
                 if not record.wrapper.finalize(
                     logical_schema, context, artifact_bytes
                 ):
@@ -495,6 +593,28 @@ class CandidateRegistry:
                 record.finalized = True
                 self.finalization_count += 1
                 finalized += 1
+            if (
+                self._driver_diagnostics is not None
+                and diagnostic_rejection is not None
+            ):
+                from python_udf_jit.diagnostics.driver_runtime import (
+                    DriverRejection,
+                )
+
+                stage, reason_code, reason_detail = diagnostic_rejection
+                self._driver_diagnostics.record_rejection(
+                    candidate_id=record.candidate_id,
+                    callable_object=record.capture_callable,
+                    original_callable=record.wrapper.original_callable,
+                    logical_schema=logical_schema,
+                    usage_context=context,
+                    rejection=DriverRejection(
+                        stage,
+                        reason_code,
+                        reason_detail,
+                    ),
+                    captured_program=semantic_source,
+                )
             events.try_emit(
                 DecisionEvent(
                     stage="adapter",
@@ -504,6 +624,11 @@ class CandidateRegistry:
                 )
             )
         return finalized
+
+    @property
+    def diagnostic_failure_count(self) -> int:
+        recorder = self._driver_diagnostics
+        return 0 if recorder is None else recorder.failure_count
 
     def _assert_open(self) -> None:
         if self._closed:

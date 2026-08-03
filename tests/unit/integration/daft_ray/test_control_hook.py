@@ -19,6 +19,7 @@ from python_udf_jit.integration.daft_ray.compatibility import (
     target_for_objects,
 )
 from python_udf_jit.integration.daft_ray.control import (
+    HookResult,
     HookStatus,
     install_daft_control_hooks,
     install_default_daft_hooks,
@@ -247,6 +248,133 @@ class ControlHookTest(unittest.TestCase):
         )
         import_module.assert_called_once_with(
             "daft.runners.flotilla"
+        )
+
+    def test_default_install_off_diagnostics_skips_policy_resolution(self):
+        registry = object()
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "UDFJIT_MODE": "auto",
+                    "UDFJIT_MANIFEST_SHA256": MANIFEST_SHA256,
+                    "UDFJIT_DIAGNOSTICS": "off",
+                },
+                clear=True,
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control.Path.cwd",
+                side_effect=AssertionError("normal path resolved cwd"),
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control."
+                "resolve_diagnostic_policy",
+                side_effect=AssertionError("normal path parsed diagnostics"),
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control."
+                "install_daft_objectref_bridge",
+                return_value=SimpleNamespace(installed=True, reason="installed"),
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control.CandidateRegistry",
+                return_value=registry,
+            ) as registry_class,
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control."
+                "install_daft_control_hooks",
+                return_value=HookResult(
+                    HookStatus.INSTALLED,
+                    "compatible_hooks_installed",
+                ),
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control._DEFAULT_REGISTRY",
+                None,
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control."
+                "importlib.import_module",
+                side_effect=(
+                    SimpleNamespace(),
+                    SimpleNamespace(Func=FakeFunc),
+                    SimpleNamespace(DataFrame=FakeDataFrame),
+                    SimpleNamespace(Expression=FakeExpression),
+                ),
+            ),
+        ):
+            result = install_default_daft_hooks(
+                SimpleNamespace(__version__="0.7.2")
+            )
+
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        _, keyword_arguments = registry_class.call_args
+        self.assertFalse(keyword_arguments["diagnostic_policy"].enabled)
+
+    def test_default_install_freezes_diagnostic_policy_into_registry(self):
+        registry = object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {
+                "UDFJIT_MODE": "auto",
+                "UDFJIT_MANIFEST_SHA256": MANIFEST_SHA256,
+                "UDFJIT_RUN_ID": "run-a",
+                "UDFJIT_DIAGNOSTICS": "summary",
+                "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
+                "UDFJIT_DIAGNOSTIC_FILTER": "candidate:candidate-a",
+                "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                "UDFJIT_DIAGNOSTIC_PERF": "off",
+                "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                "UDFJIT_DIAGNOSTIC_MAX_BYTES": "1048576",
+            }
+            with (
+                mock.patch.dict("os.environ", environment, clear=False),
+                mock.patch(
+                    "python_udf_jit.integration.daft_ray.control."
+                    "install_daft_objectref_bridge",
+                    return_value=SimpleNamespace(
+                        installed=True,
+                        reason="installed",
+                    ),
+                ),
+                mock.patch(
+                    "python_udf_jit.integration.daft_ray.control.CandidateRegistry",
+                    return_value=registry,
+                ) as registry_class,
+                mock.patch(
+                    "python_udf_jit.integration.daft_ray.control."
+                    "install_daft_control_hooks",
+                    return_value=HookResult(
+                        HookStatus.INSTALLED,
+                        "compatible_hooks_installed",
+                    ),
+                ),
+                mock.patch(
+                    "python_udf_jit.integration.daft_ray.control._DEFAULT_REGISTRY",
+                    None,
+                ),
+                mock.patch(
+                    "python_udf_jit.integration.daft_ray.control."
+                    "importlib.import_module",
+                    side_effect=(
+                        SimpleNamespace(),
+                        SimpleNamespace(Func=FakeFunc),
+                        SimpleNamespace(DataFrame=FakeDataFrame),
+                        SimpleNamespace(Expression=FakeExpression),
+                    ),
+                ),
+            ):
+                result = install_default_daft_hooks(
+                    SimpleNamespace(__version__="0.7.2")
+                )
+
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        _, keyword_arguments = registry_class.call_args
+        self.assertTrue(keyword_arguments["diagnostic_policy"].enabled)
+        self.assertEqual(keyword_arguments["diagnostic_run_id"], "run-a")
+        self.assertEqual(keyword_arguments["diagnostic_runtime_mode"], "auto")
+        self.assertTrue(
+            keyword_arguments["diagnostic_process_key"].startswith("driver-")
         )
 
     def test_fingerprint_mismatch_fails_open_without_patching(self):
@@ -717,6 +845,45 @@ class PostImportHookTest(unittest.TestCase):
 
         self.assertEqual(imported.INITIALIZED, "ready")
         self.assertEqual(observations, ["ready"])
+
+    def test_explicit_diagnostics_do_not_swallow_bootstrap_failure(self):
+        module_name = "udfjit_fake_daft_diagnostic_failure"
+        callback_calls = []
+
+        def fail_diagnostic_bootstrap(_module):
+            callback_calls.append("called")
+            raise RuntimeError("diagnostic-bootstrap-failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, f"{module_name}.py").write_text(
+                "INITIALIZED = 'ready'\n",
+                encoding="utf-8",
+            )
+            sys.path.insert(0, directory)
+            hook = None
+            try:
+                with mock.patch.dict(
+                    "os.environ",
+                    {"UDFJIT_DIAGNOSTICS": "full"},
+                    clear=False,
+                ):
+                    hook = install_post_import_hook(
+                        module_name,
+                        fail_diagnostic_bootstrap,
+                    )
+                    for _ in range(2):
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "diagnostic-bootstrap-failed",
+                        ):
+                            importlib.import_module(module_name)
+            finally:
+                sys.path.remove(directory)
+                sys.modules.pop(module_name, None)
+                if hook is not None:
+                    hook.uninstall()
+
+        self.assertEqual(callback_calls, ["called", "called"])
 
 
 if __name__ == "__main__":

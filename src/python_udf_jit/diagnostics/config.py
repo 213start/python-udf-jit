@@ -182,6 +182,13 @@ def _parse_selector(raw: object) -> str:
         or "\\" in raw
     ):
         _fail(DiagnosticConfigurationIssue.FILTER_INVALID)
+    kind, separator, value = raw.partition(":")
+    if (
+        not separator
+        or not value
+        or kind not in {"artifact", "candidate", "region", "udf"}
+    ):
+        _fail(DiagnosticConfigurationIssue.FILTER_INVALID)
     return raw
 
 

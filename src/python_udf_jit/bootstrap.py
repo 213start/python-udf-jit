@@ -47,13 +47,16 @@ class PostImportHook(importlib.abc.MetaPathFinder):
         return spec
 
     def complete(self, module: ModuleType) -> None:
-        self.uninstall()
         try:
             self._callback(module)
         except Exception:
+            if os.environ.get("UDFJIT_DIAGNOSTICS", "off") != "off":
+                raise
             # Bootstrap is fail-open by contract. The adapter emits details once it
             # is importable; a bootstrap failure must not fail `import daft`.
-            pass
+            self.uninstall()
+        else:
+            self.uninstall()
 
     def uninstall(self) -> None:
         with _POST_IMPORT_LOCK:
@@ -96,6 +99,13 @@ def bootstrap_from_environment() -> PostImportHook | None:
             install_default_daft_hooks,
         )
 
-        install_default_daft_hooks(module)
+        result = install_default_daft_hooks(module)
+        if (
+            os.environ.get("UDFJIT_DIAGNOSTICS", "off") != "off"
+            and result.status.value not in {"installed", "already_installed"}
+        ):
+            raise RuntimeError(
+                f"diagnostic_bootstrap_failed:{result.reason}"
+            )
 
     return install_post_import_hook("daft", install)

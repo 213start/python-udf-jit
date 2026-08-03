@@ -26,6 +26,7 @@ from python_udf_jit.compiler.region import (
 from python_udf_jit.compiler.source_map import (
     SourceMap,
     SourcePosition,
+    decode_source_map,
     verify_source_map,
 )
 from python_udf_jit.compiler.verifier import verify_semantic_module
@@ -470,6 +471,90 @@ def build_bytecode_artifacts(
         },
         "\n".join(lines) + "\n",
     )
+
+
+def build_original_provenance(
+    code: CodeType,
+    *,
+    code_hash: str,
+) -> ProvenanceMap:
+    """Build the traceable Source -> original-bytecode prefix for rejection bundles."""
+
+    if type(code) is not CodeType:
+        raise TypeError("original provenance requires a code object")
+    _require_text(code_hash, "code hash")
+    instructions = tuple(dis.get_instructions(code, show_caches=True))
+    source_map = decode_source_map(
+        code,
+        (instruction.offset for instruction in instructions),
+    )
+    position_by_offset = {
+        entry.bytecode_offset: entry.position
+        for entry in source_map.entries
+    }
+    nodes: list[ProvenanceNode] = []
+    edges: list[ProvenanceEdge] = []
+    source_ids: set[str] = set()
+    for instruction in instructions:
+        bytecode_id = f"pybc:{code_hash}:{instruction.offset}"
+        nodes.append(
+            ProvenanceNode(
+                bytecode_id,
+                ProvenanceLayer.ORIGINAL_BYTECODE,
+                "instruction",
+                bytecode_offset=instruction.offset,
+                attributes=(("opname", instruction.opname),),
+            )
+        )
+        position = position_by_offset[instruction.offset]
+        if (
+            position.line is None
+            or position.end_line is None
+            or position.line < 1
+            or position.end_line < 1
+        ):
+            continue
+        source_id = f"source:{code_hash}:{_position_key(position)}"
+        if source_id not in source_ids:
+            source_ids.add(source_id)
+            nodes.append(
+                ProvenanceNode(
+                    source_id,
+                    ProvenanceLayer.SOURCE,
+                    "source_range",
+                    source_position=position,
+                )
+            )
+        edges.append(
+            ProvenanceEdge(
+                source_id,
+                bytecode_id,
+                ProvenanceRelation.DERIVED,
+            )
+        )
+    provenance = ProvenanceMap(
+        PROVENANCE_MAP_VERSION,
+        tuple(nodes),
+        tuple(edges),
+    )
+    verify_provenance_map(provenance)
+    return provenance
+
+
+def program_source_map_document(
+    provenance: ProvenanceMap,
+) -> dict[str, object]:
+    """Return the shared readable source-range view of a provenance map."""
+
+    verify_provenance_map(provenance)
+    return {
+        "format_version": 1,
+        "ranges": [
+            node.to_document()
+            for node in provenance.nodes
+            if node.layer is ProvenanceLayer.SOURCE
+        ],
+    }
 
 
 def build_semantic_artifacts(

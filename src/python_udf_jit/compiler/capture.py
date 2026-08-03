@@ -24,6 +24,9 @@ from python_udf_jit.compiler.capture_cache import (
     CaptureCacheKey,
 )
 from python_udf_jit.compiler.cfg import CfgBuildError, CfgRejectCode
+from python_udf_jit.compiler.capture_verifier import (
+    CaptureVerificationError,
+)
 from python_udf_jit.compiler.identity import (
     IdentityError,
     capture_identities,
@@ -52,6 +55,7 @@ class CaptureRejectCode(StrEnum):
     INVALID_EXCEPTION_TABLE = "invalid_exception_table"
     INVALID_LOCATION_TABLE = "invalid_location_table"
     UNSUPPORTED_DEPENDENCY = "unsupported_dependency"
+    CAPTURE_VERIFICATION = "capture_verification_failed"
 
 
 class CaptureRejected(ValueError):
@@ -363,3 +367,12 @@ def try_capture(request: CaptureRequest) -> CaptureResult:
         return CaptureResult(True, capture(request))
     except CaptureRejected as error:
         return CaptureResult(False, reject_code=error.code, reject_detail=error.detail)
+    except CaptureVerificationError as error:
+        detail = error.code.value
+        if error.detail:
+            detail = f"{detail}:{error.detail}"
+        return CaptureResult(
+            False,
+            reject_code=CaptureRejectCode.CAPTURE_VERIFICATION,
+            reject_detail=detail,
+        )

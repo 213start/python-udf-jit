@@ -4,6 +4,7 @@ import functools
 import platform
 import sys
 import unittest
+from unittest import mock
 
 from python_udf_jit.compiler.capture import (
     CaptureRejectCode,
@@ -12,6 +13,10 @@ from python_udf_jit.compiler.capture import (
     capture,
     capture_frontend,
     try_capture,
+)
+from python_udf_jit.compiler.capture_verifier import (
+    CaptureVerificationError,
+    CaptureVerificationRejectCode,
 )
 
 
@@ -109,6 +114,26 @@ class CaptureTest(unittest.TestCase):
                 result = try_capture(CaptureRequest(function))
                 self.assertFalse(result.supported)
                 self.assertEqual(result.reject_code, expected_code)
+
+    def test_verification_failure_is_a_structured_capture_rejection(self):
+        with mock.patch(
+            "python_udf_jit.compiler.capture.capture",
+            side_effect=CaptureVerificationError(
+                CaptureVerificationRejectCode.OPERATION_MISMATCH,
+                "python_region:46",
+            ),
+        ):
+            result = try_capture(CaptureRequest(affine))
+
+        self.assertFalse(result.supported)
+        self.assertEqual(
+            result.reject_code,
+            CaptureRejectCode.CAPTURE_VERIFICATION,
+        )
+        self.assertEqual(
+            result.reject_detail,
+            "capture_operation_mismatch:python_region:46",
+        )
 
     def test_rejects_non_float64_schema_before_inspecting_callable(self):
         class HostileCallable:
