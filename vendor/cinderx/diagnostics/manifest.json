@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "base_upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
-  "base_candidate_patch_series_sha256": "8dfc2d5b772fafb010dd1813b3e21e0f16f130ef3f29d1daeeba7c2396e447bb",
+  "base_candidate_patch_series_sha256": "4445776e936e146260ef6ba19bdc6dcdc50d1f76b4f78e37d506acd9d63ec2d5",
   "patches": [
     {
       "path": "patches/0001-structured-origin-export.patch",

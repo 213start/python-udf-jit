@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
   "baseline_runtime_tree_sha256": "d29b9cb3512f7cca22d9fefece56484f705c4049e724ec6e99f04153477ff5de",
-  "candidate_runtime_tree_sha256": "8cbecdcd5966277efa2758b0bddf4b2d2b9159dfab7624b8283d60c0229db2d8",
+  "candidate_runtime_tree_sha256": "621bce6a1323bcfbbee185eec57305a892ddd03e6231b97f47749d659300eae3",
   "patches": [
     {
       "path": "0001-runtime-candidate.patch",
@@ -23,10 +23,15 @@
       "path": "0004-wx-dual-mapping.patch",
       "sha256": "69fbf01a2240f792c237a3780549a55bb47e2a5e9fcb4923bbecbbbd24653ecb",
       "changed_file_count": 6
+    },
+    {
+      "path": "0005-generic-typed-loop-specialization.patch",
+      "sha256": "0ecedf7b544fab7d41faf50491eede95b3106492e86cd4f4b3e04d70e81225de",
+      "changed_file_count": 16
     }
   ],
-  "patch_series_sha256": "8dfc2d5b772fafb010dd1813b3e21e0f16f130ef3f29d1daeeba7c2396e447bb",
-  "changed_file_count": 37,
+  "patch_series_sha256": "4445776e936e146260ef6ba19bdc6dcdc50d1f76b4f78e37d506acd9d63ec2d5",
+  "changed_file_count": 41,
   "continuation_abi": {
     "version": 1,
     "resume_id_prefix": "v1:",

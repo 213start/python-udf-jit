@@ -16,6 +16,12 @@
 seccomp 拒绝请求 W+X 权限的 `mmap`、`mprotect` 和 `pkey_mprotect`，因此
 第三方库也不能重新引入可写且可执行的映射。
 
+第五个补丁在 CinderX 中增加与业务无关的 `UnicodeCountProperty` 类型化
+HIR：前端只在确认“精确字符串 + 通用迭代循环 + 整数计数归约 + Unicode
+字符属性”这一行为/类型组合后才选择它。LIR 将该操作降低为一次运行时调用，
+运行时直接遍历 Unicode 存储；属性编号覆盖 alnum、alpha、decimal、digit、
+numeric 和 space，不包含 pipeline、算子或 UDF 名称。
+
 RFC-013 的结构化 HIR/LIR/机器区间导出位于 `diagnostics/`，作为 dedicated
 diagnostic worker 的额外 overlay 单独锁定。它不属于本生产候选补丁系列，
 不得应用到 `diagnostics=off` 的正式性能或生产镜像。
@@ -31,8 +37,12 @@ patch --batch -p1 < 0001-runtime-candidate.patch
 patch --batch -p1 < 0002-primitive-data-intrinsics.patch
 patch --batch -p1 < 0003-continuation-deopt.patch
 patch --batch -p1 < 0004-wx-dual-mapping.patch
+patch --batch -p1 < 0005-generic-typed-loop-specialization.patch
 ```
 
 正式验收逐个校验补丁 SHA-256，并按清单顺序拼接补丁原始字节后计算补丁系列
 SHA-256。规范化源码树摘要、补丁系列摘要会同时写入候选镜像标签和 CinderX
 测试证据；任何源码树、补丁顺序或补丁内容不一致的 wheel 和镜像都会被拒绝。
+源码树摘要先按 UTF-8 相对路径排序，再为每个未排除文件生成
+`<文件 SHA-256><两个空格><相对路径>\n`，最后对这些记录的原始拼接字节计算
+SHA-256；清单中的 `excluded_paths` 定义排除项。

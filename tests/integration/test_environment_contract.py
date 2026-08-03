@@ -141,6 +141,7 @@ class EnvironmentContractTests(unittest.TestCase):
                 "0002-primitive-data-intrinsics.patch",
                 "0003-continuation-deopt.patch",
                 "0004-wx-dual-mapping.patch",
+                "0005-generic-typed-loop-specialization.patch",
             ],
         )
         for entry in patches:

@@ -1,0 +1,621 @@
+diff --git a/cinderx/Jit/hir/hir.cpp b/cinderx/Jit/hir/hir.cpp
+index 2908c53..5c9cd4d 100644
+--- a/cinderx/Jit/hir/hir.cpp
++++ b/cinderx/Jit/hir/hir.cpp
+@@ -427,6 +427,7 @@ bool Instr::isReplayable() const {
+     case Opcode::kUpdatePrevInstr:
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
++    case Opcode::kUnicodeCountProperty:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUseType:
+     case Opcode::kWaitHandleLoadCoroOrResult:
+@@ -855,6 +856,7 @@ bool isPassthrough(const Instr& instr) {
+     case Opcode::kUnaryOp:
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
++    case Opcode::kUnicodeCountProperty:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUnpackExToTuple:
+diff --git a/cinderx/Jit/hir/hir.h b/cinderx/Jit/hir/hir.h
+index a0d273a..7e369c9 100644
+--- a/cinderx/Jit/hir/hir.h
++++ b/cinderx/Jit/hir/hir.h
+@@ -1197,6 +1197,14 @@ DEFINE_SIMPLE_INSTR(StoreUdfDataF32, (TObject, TCDouble), Operands<2>);
+ DEFINE_SIMPLE_INSTR(StoreUdfDataF64, (TObject, TCDouble), Operands<2>);
+ DEFINE_SIMPLE_INSTR(StoreUdfDataNull, (TObject), Operands<1>);
+ 
++// Count code points matching a generic Unicode property.  The text operand
++// must be an exact str and the property operand is a validated primitive id.
++DEFINE_SIMPLE_INSTR(
++    UnicodeCountProperty,
++    (TUnicodeExact, TCInt64),
++    HasOutput,
++    Operands<2>);
++
+ // Invokes a function with a static entry point, where we can
+ // directly provide the arguments using the x64 calling convention.
+ class INSTR_CLASS(
+diff --git a/cinderx/Jit/hir/hir_ops.h b/cinderx/Jit/hir/hir_ops.h
+index df28235..6b8dbe5 100644
+--- a/cinderx/Jit/hir/hir_ops.h
++++ b/cinderx/Jit/hir/hir_ops.h
+@@ -189,6 +189,7 @@ namespace jit::hir {
+   V(UnaryOp)                       \
+   V(UnicodeCompare)                \
+   V(UnicodeConcat)                 \
++  V(UnicodeCountProperty)          \
+   V(UnicodeRepeat)                 \
+   V(UnicodeSubscr)                 \
+   V(UnpackExToTuple)               \
+diff --git a/cinderx/Jit/hir/instr_effects.cpp b/cinderx/Jit/hir/instr_effects.cpp
+index 528e799..65bf516 100644
+--- a/cinderx/Jit/hir/instr_effects.cpp
++++ b/cinderx/Jit/hir/instr_effects.cpp
+@@ -71,6 +71,7 @@ MemoryEffects memoryEffects(const Instr& inst) {
+     case Opcode::kTpAlloc:
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
++    case Opcode::kUnicodeCountProperty:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUnreachable:
+@@ -491,6 +492,7 @@ bool hasArbitraryExecution(const Instr& inst) {
+     case Opcode::kTpAlloc:
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
++    case Opcode::kUnicodeCountProperty:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUnreachable:
+diff --git a/cinderx/Jit/hir/parser.cpp b/cinderx/Jit/hir/parser.cpp
+index e04a19c..de7b41f 100644
+--- a/cinderx/Jit/hir/parser.cpp
++++ b/cinderx/Jit/hir/parser.cpp
+@@ -822,6 +822,12 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
+       NEW_INSTR(StoreUdfDataNull, guarded_slot);
+       break;
+     }
++    case Opcode::kUnicodeCountProperty: {
++      auto text = ParseRegister();
++      auto property = ParseRegister();
++      NEW_INSTR(UnicodeCountProperty, dst, text, property);
++      break;
++    }
+     case Opcode::kPhi: {
+       expect("<");
+       PhiInfo info{dst};
+diff --git a/cinderx/Jit/hir/pass.cpp b/cinderx/Jit/hir/pass.cpp
+index 20b20c7..78d724e 100644
+--- a/cinderx/Jit/hir/pass.cpp
++++ b/cinderx/Jit/hir/pass.cpp
+@@ -483,6 +483,9 @@ Type outputType(
+     case Opcode::kIndexUnbox: {
+       return TCInt64;
+     }
++    case Opcode::kUnicodeCountProperty: {
++      return TCInt64;
++    }
+ 
+     // Check opcodes return a copy of their input that is statically known to
+     // not be null.
+diff --git a/cinderx/Jit/hir/printer.cpp b/cinderx/Jit/hir/printer.cpp
+index 019a3f9..7a3b85e 100644
+--- a/cinderx/Jit/hir/printer.cpp
++++ b/cinderx/Jit/hir/printer.cpp
+@@ -321,6 +321,7 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
+     case Opcode::kXDecref:
+     case Opcode::kXIncref:
+     case Opcode::kUnicodeConcat:
++    case Opcode::kUnicodeCountProperty:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUnreachable:
+diff --git a/cinderx/Jit/hir/simplify.cpp b/cinderx/Jit/hir/simplify.cpp
+index 5c3bb06..ae7ff5c 100644
+--- a/cinderx/Jit/hir/simplify.cpp
++++ b/cinderx/Jit/hir/simplify.cpp
+@@ -2152,7 +2152,7 @@ static Register* trySpecializeCCall(Env& env, const VectorCall* instr) {
+   return nullptr;
+ }
+ 
+-bool isExactUdfScalarHelper(Register* callable, PyCFunction expected) {
++bool isExactPyCFunction(Register* callable, PyCFunction expected) {
+   Type callable_type = callable->type();
+   if (!callable_type.hasObjectSpec()) {
+     return false;
+@@ -2165,6 +2165,50 @@ bool isExactUdfScalarHelper(Register* callable, PyCFunction expected) {
+   return function->m_ml->ml_meth == expected;
+ }
+ 
++bool isExactUdfScalarHelper(Register* callable, PyCFunction expected) {
++  return isExactPyCFunction(callable, expected);
++}
++
++Register* trySimplifyUdfUnicodeCountProperty(
++    Env& env,
++    const VectorCall* instr) {
++  if (instr->frameState() == nullptr || instr->flags() != CallFlags::None ||
++      instr->numArgs() != 2 ||
++      !isExactPyCFunction(
++          instr->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfUnicodeCountProperty))) {
++    return nullptr;
++  }
++
++  Type property_type = instr->arg(1)->type();
++  if (!property_type.hasObjectSpec() ||
++      !PyLong_CheckExact(property_type.objectSpec())) {
++    return nullptr;
++  }
++  int overflow = 0;
++  const long property =
++      PyLong_AsLongAndOverflow(property_type.objectSpec(), &overflow);
++  if (overflow != 0) {
++    PyErr_Clear();
++    return nullptr;
++  }
++  if (property < kUdfUnicodePropertyMin || property > kUdfUnicodePropertyMax) {
++    return nullptr;
++  }
++
++  // Preserve the exact helper/global and constant-property assumptions that
++  // justified replacing the Python call.
++  env.emit<UseType>(instr->func(), instr->func()->type());
++  env.emit<UseType>(instr->arg(1), property_type);
++  Register* text =
++      env.emit<GuardType>(TUnicodeExact, instr->arg(0), *instr->frameState());
++  env.emit<UseType>(text, TUnicodeExact);
++  Register* property_id =
++      env.emit<LoadConst>(Type::fromCInt(property, TCInt64));
++  Register* count = env.emit<UnicodeCountProperty>(text, property_id);
++  return env.emit<PrimitiveBox>(count, TCInt64, *instr->frameState());
++}
++
+ const VectorCall* guardedUdfScalarProducer(Register* value) {
+   while (value->instr()->IsAssign() || value->instr()->IsCheckExc()) {
+     value = value->instr()->GetOperand(0);
+@@ -2482,6 +2526,9 @@ std::optional<std::pair<Instr*, std::vector<Instr*>>> isVectorCallIfIsInstance(
+ }
+ 
+ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
++  if (Register* result = trySimplifyUdfUnicodeCountProperty(env, instr)) {
++    return result;
++  }
+   if (Register* result = trySimplifyGuardedUdfDataOperation(env, instr)) {
+     return result;
+   }
+diff --git a/cinderx/Jit/jit_rt.cpp b/cinderx/Jit/jit_rt.cpp
+index 3b81777..9a2c52a 100644
+--- a/cinderx/Jit/jit_rt.cpp
++++ b/cinderx/Jit/jit_rt.cpp
+@@ -610,6 +610,81 @@ PyObject* JITRT_UdfDataStoreNull(PyObject*, PyObject* capsule) {
+   Py_RETURN_NONE;
+ }
+ 
++namespace {
++
++template <typename Predicate>
++int64_t countUnicodeProperty(PyObject* text, Predicate predicate) {
++  const Py_ssize_t length = PyUnicode_GET_LENGTH(text);
++  const int kind = PyUnicode_KIND(text);
++  const void* data = PyUnicode_DATA(text);
++  int64_t count = 0;
++  for (Py_ssize_t index = 0; index < length; index++) {
++    count += predicate(PyUnicode_READ(kind, data, index)) ? 1 : 0;
++  }
++  return count;
++}
++
++bool isValidUnicodeProperty(int64_t property) {
++  return property >= kUdfUnicodePropertyMin &&
++      property <= kUdfUnicodePropertyMax;
++}
++
++} // namespace
++
++int64_t JITRT_UnicodeCountProperty(PyObject* text, int64_t property) {
++  JIT_DCHECK(
++      PyUnicode_CheckExact(text), "UnicodeCountProperty requires an exact str");
++  JIT_DCHECK(
++      isValidUnicodeProperty(property),
++      "UnicodeCountProperty received an invalid property id");
++  switch (static_cast<UdfUnicodeProperty>(property)) {
++    case UdfUnicodeProperty::kAlnum:
++      return countUnicodeProperty(
++          text, [](Py_UCS4 ch) { return Py_UNICODE_ISALNUM(ch); });
++    case UdfUnicodeProperty::kAlpha:
++      return countUnicodeProperty(
++          text, [](Py_UCS4 ch) { return Py_UNICODE_ISALPHA(ch); });
++    case UdfUnicodeProperty::kDecimal:
++      return countUnicodeProperty(
++          text, [](Py_UCS4 ch) { return Py_UNICODE_ISDECIMAL(ch); });
++    case UdfUnicodeProperty::kDigit:
++      return countUnicodeProperty(
++          text, [](Py_UCS4 ch) { return Py_UNICODE_ISDIGIT(ch); });
++    case UdfUnicodeProperty::kNumeric:
++      return countUnicodeProperty(
++          text, [](Py_UCS4 ch) { return Py_UNICODE_ISNUMERIC(ch); });
++    case UdfUnicodeProperty::kSpace:
++      return countUnicodeProperty(
++          text, [](Py_UCS4 ch) { return Py_UNICODE_ISSPACE(ch); });
++  }
++  JIT_ABORT("unreachable Unicode property id {}", property);
++}
++
++PyObject* JITRT_UdfUnicodeCountProperty(PyObject*, PyObject* args) {
++  PyObject* text;
++  PyObject* property_obj;
++  if (!PyArg_ParseTuple(args, "OO", &text, &property_obj)) {
++    return nullptr;
++  }
++  if (!PyUnicode_CheckExact(text)) {
++    PyErr_SetString(
++        PyExc_TypeError, "Unicode property count expects an exact str");
++    return nullptr;
++  }
++  if (!PyLong_CheckExact(property_obj)) {
++    PyErr_SetString(
++        PyExc_TypeError, "Unicode property id expects an exact int");
++    return nullptr;
++  }
++  int overflow = 0;
++  const long property = PyLong_AsLongAndOverflow(property_obj, &overflow);
++  if (overflow != 0 || !isValidUnicodeProperty(property)) {
++    PyErr_SetString(PyExc_ValueError, "unsupported Unicode property id");
++    return nullptr;
++  }
++  return PyLong_FromLongLong(JITRT_UnicodeCountProperty(text, property));
++}
++
+ bool JITRT_IsUdfDataNullUnchecked(PyObject* capsule) {
+   std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
+   auto it = g_udf_scalar_slots.find(capsule);
+diff --git a/cinderx/Jit/jit_rt.h b/cinderx/Jit/jit_rt.h
+index ec52df5..73a59ca 100644
+--- a/cinderx/Jit/jit_rt.h
++++ b/cinderx/Jit/jit_rt.h
+@@ -28,6 +28,20 @@ struct JITRT_StaticCallFPReturn {
+   double xmm1;
+ };
+ 
++enum class UdfUnicodeProperty : int64_t {
++  kAlnum = 0,
++  kAlpha = 1,
++  kDecimal = 2,
++  kDigit = 3,
++  kNumeric = 4,
++  kSpace = 5,
++};
++
++constexpr int64_t kUdfUnicodePropertyMin =
++    static_cast<int64_t>(UdfUnicodeProperty::kAlnum);
++constexpr int64_t kUdfUnicodePropertyMax =
++    static_cast<int64_t>(UdfUnicodeProperty::kSpace);
++
+ // Process-local scalar-slot helpers used by python-udf-jit. Public helpers
+ // retain normal Python-call semantics. Unchecked loads and stores are emitted
+ // only after the exact guard has established an active process-local borrow.
+@@ -49,6 +63,7 @@ PyObject* JITRT_UdfDataStoreI64(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfDataStoreF32(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfDataStoreF64(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfDataStoreNull(PyObject* module, PyObject* capsule);
++PyObject* JITRT_UdfUnicodeCountProperty(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfRegisterContinuationCode(
+     PyObject* module,
+     PyObject* target);
+@@ -65,6 +80,7 @@ void JITRT_StoreUdfDataI64Unchecked(PyObject* capsule, int64_t value);
+ void JITRT_StoreUdfDataF32Unchecked(PyObject* capsule, double value);
+ void JITRT_StoreUdfDataF64Unchecked(PyObject* capsule, double value);
+ void JITRT_StoreUdfDataNullUnchecked(PyObject* capsule);
++int64_t JITRT_UnicodeCountProperty(PyObject* text, int64_t property);
+ 
+ PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Debug(
+     PyFunctionObject* func,
+diff --git a/cinderx/Jit/lir/generator.cpp b/cinderx/Jit/lir/generator.cpp
+index 7b35ace..c75c0b5 100644
+--- a/cinderx/Jit/lir/generator.cpp
++++ b/cinderx/Jit/lir/generator.cpp
+@@ -2873,6 +2873,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+             instr->GetOperand(1));
+         break;
+       }
++      case Opcode::kUnicodeCountProperty: {
++        auto instr = static_cast<const UnicodeCountProperty*>(&i);
++
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_UnicodeCountProperty,
++            instr->GetOperand(0),
++            instr->GetOperand(1));
++        break;
++      }
+       case Opcode::kUnicodeRepeat: {
+         auto instr = static_cast<const UnicodeRepeat*>(&i);
+ 
+diff --git a/cinderx/Jit/pyjit.cpp b/cinderx/Jit/pyjit.cpp
+index b8b3ccd..ce84e57 100644
+--- a/cinderx/Jit/pyjit.cpp
++++ b/cinderx/Jit/pyjit.cpp
+@@ -3552,6 +3552,10 @@ PyMethodDef jit_methods[] = {
+      JITRT_UdfDataStoreNull,
+      METH_O,
+      PyDoc_STR("Store null through a guarded nullable scalar slot.")},
++    {"_udf_unicode_count_property",
++     JITRT_UdfUnicodeCountProperty,
++     METH_VARARGS,
++     PyDoc_STR("Count exact-str code points matching a Unicode property id.")},
+     {"disable",
+      reinterpret_cast<PyCFunction>(disable_jit),
+      METH_VARARGS | METH_KEYWORDS,
+diff --git a/cinderx/PythonLib/cinderx/jit.py b/cinderx/PythonLib/cinderx/jit.py
+index 6c919e3..bf921a9 100644
+--- a/cinderx/PythonLib/cinderx/jit.py
++++ b/cinderx/PythonLib/cinderx/jit.py
+@@ -16,6 +16,7 @@ FuncAny = Callable[..., Any]
+ try:
+     from cinderjit import (
+         _deopt_gen,
++        _udf_unicode_count_property,
+         append_jit_list,
+         auto,
+         clear_runtime_stats,
+@@ -67,6 +68,8 @@ except ImportError:
+     TDeoptGenSend = TypeVar("TDeoptGenSend")
+     TDeoptGenReturn = TypeVar("TDeoptGenReturn")
+ 
++    _udf_unicode_count_property = None
++
+     def _deopt_gen(
+         gen: Generator[TDeoptGenYield, TDeoptGenSend, TDeoptGenReturn]
+         | AsyncGenerator[TDeoptGenYield, TDeoptGenSend]
+diff --git a/cinderx/PythonLib/test_cinderx/test_udf_typed_loop_intrinsic.py b/cinderx/PythonLib/test_cinderx/test_udf_typed_loop_intrinsic.py
+new file mode 100644
+index 0000000..2222512
+--- /dev/null
++++ b/cinderx/PythonLib/test_cinderx/test_udf_typed_loop_intrinsic.py
+@@ -0,0 +1,131 @@
++"""Tests for generic typed-loop Unicode property specialization."""
++
++import unittest
++
++import cinderx.jit
++
++try:
++    from cinderjit import _udf_unicode_count_property
++except ImportError:
++    _udf_unicode_count_property = None
++
++
++PROPERTY_METHODS = (
++    "isalnum",
++    "isalpha",
++    "isdecimal",
++    "isdigit",
++    "isnumeric",
++    "isspace",
++)
++
++
++def count_alnum(text):
++    return _udf_unicode_count_property(text, 0)
++
++
++def count_alpha(text):
++    return _udf_unicode_count_property(text, 1)
++
++
++def count_decimal(text):
++    return _udf_unicode_count_property(text, 2)
++
++
++def count_digit(text):
++    return _udf_unicode_count_property(text, 3)
++
++
++def count_numeric(text):
++    return _udf_unicode_count_property(text, 4)
++
++
++def count_space(text):
++    return _udf_unicode_count_property(text, 5)
++
++
++SPECIALIZED_FUNCTIONS = (
++    count_alnum,
++    count_alpha,
++    count_decimal,
++    count_digit,
++    count_numeric,
++    count_space,
++)
++
++
++@unittest.skipUnless(
++    cinderx.jit.is_enabled() and _udf_unicode_count_property is not None,
++    "requires CinderX JIT typed-loop helper",
++)
++class UdfTypedLoopIntrinsicTests(unittest.TestCase):
++    def test_public_helper_matches_python_unicode_semantics(self):
++        samples = (
++            "",
++            "ASCII 123\t\n",
++            "A²⅕٣ 中\u2003",
++            "e\u0301 café Ελληνικά",
++            "𝟡１２３",
++        )
++        for text in samples:
++            for property_id, method in enumerate(PROPERTY_METHODS):
++                with self.subTest(text=text, property=method):
++                    expected = sum(getattr(char, method)() for char in text)
++                    self.assertEqual(
++                        _udf_unicode_count_property(text, property_id),
++                        expected,
++                    )
++
++    def test_public_helper_requires_exact_types_and_known_property(self):
++        class TextSubclass(str):
++            pass
++
++        class IntSubclass(int):
++            pass
++
++        for text in (TextSubclass("abc"), b"abc", None):
++            with self.subTest(text=text):
++                with self.assertRaises(TypeError):
++                    _udf_unicode_count_property(text, 0)
++        for property_id in (IntSubclass(0), True, 0.0):
++            with self.subTest(property_id=property_id):
++                with self.assertRaises(TypeError):
++                    _udf_unicode_count_property("abc", property_id)
++        for property_id in (-1, len(PROPERTY_METHODS), 2**100):
++            with self.subTest(property_id=property_id):
++                with self.assertRaises(ValueError):
++                    _udf_unicode_count_property("abc", property_id)
++
++    def test_each_generic_property_lowers_to_one_typed_hir_operation(self):
++        text = "A²⅕٣ 中\u2003"
++        for property_id, (function, method) in enumerate(
++            zip(SPECIALIZED_FUNCTIONS, PROPERTY_METHODS)
++        ):
++            with self.subTest(property=method):
++                self.assertTrue(cinderx.jit.force_compile(function))
++                counts = cinderx.jit.get_function_hir_opcode_counts(function)
++                self.assertEqual(counts.get("UnicodeCountProperty", 0), 1, counts)
++                expected = sum(getattr(char, method)() for char in text)
++                self.assertEqual(function(text), expected)
++
++        class TextSubclass(str):
++            pass
++
++        with self.assertRaises(TypeError):
++            count_alnum(TextSubclass("abc"))
++
++    def test_unrelated_python_function_is_not_specialized(self):
++        def fake_count(text, property_id):
++            return sum(char.isalnum() for char in text) + property_id
++
++        def wrapper(text):
++            return fake_count(text, 0)
++
++        self.assertTrue(cinderx.jit.force_compile(wrapper))
++        counts = cinderx.jit.get_function_hir_opcode_counts(wrapper)
++        self.assertEqual(counts.get("UnicodeCountProperty", 0), 0, counts)
++        self.assertEqual(wrapper("a!"), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/cinderx/RuntimeTests/udf_typed_loop_intrinsic_test.cpp b/cinderx/RuntimeTests/udf_typed_loop_intrinsic_test.cpp
+new file mode 100644
+index 0000000..adf6a62
+--- /dev/null
++++ b/cinderx/RuntimeTests/udf_typed_loop_intrinsic_test.cpp
+@@ -0,0 +1,94 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++
++#include "cinderx/Jit/code_runtime.h"
++#include "cinderx/Jit/codegen/environ.h"
++#include "cinderx/Jit/compiler.h"
++#include "cinderx/Jit/context.h"
++#include "cinderx/Jit/hir/instr_effects.h"
++#include "cinderx/Jit/hir/parser.h"
++#include "cinderx/Jit/hir/pass.h"
++#include "cinderx/Jit/jit_rt.h"
++#include "cinderx/Jit/lir/generator.h"
++#include "cinderx/Jit/lir/printer.h"
++#include "cinderx/RuntimeTests/fixtures.h"
++
++#include <fmt/format.h>
++
++#include <sstream>
++#include <string>
++
++using UdfTypedLoopIntrinsicTest = RuntimeTest;
++
++namespace {
++
++std::unique_ptr<jit::hir::Function> parseUnicodeCountFunction() {
++  return jit::hir::HIRParser{}.ParseHIR(R"(
++fun test {
++  bb 0 {
++    v0 = LoadArg<0>
++    v1 = RefineType<UnicodeExact> v0
++    v2 = LoadConst<CInt64[0]>
++    v3 = UnicodeCountProperty v1 v2
++    v4 = PrimitiveBox<CInt64> v3 {
++      FrameState {
++        CurInstrOffset 0
++      }
++    }
++    Return v4
++  }
++}
++)");
++}
++
++} // namespace
++
++TEST_F(UdfTypedLoopIntrinsicTest, HIRMetadataIsTypedPureAndReplayable) {
++  auto function = parseUnicodeCountFunction();
++  ASSERT_NE(function, nullptr);
++
++  const jit::hir::Instr* count = nullptr;
++  for (const auto& block : function->cfg.blocks) {
++    for (const auto& instr : block) {
++      if (instr.IsUnicodeCountProperty()) {
++        count = &instr;
++      }
++    }
++  }
++
++  ASSERT_NE(count, nullptr);
++  EXPECT_EQ(jit::hir::outputType(*count), jit::hir::TCInt64);
++  EXPECT_TRUE(count->isReplayable());
++  EXPECT_FALSE(jit::hir::isPassthrough(*count));
++  EXPECT_FALSE(jit::hir::hasArbitraryExecution(*count));
++  EXPECT_EQ(jit::hir::memoryEffects(*count).may_store, jit::hir::AEmpty);
++}
++
++TEST_F(UdfTypedLoopIntrinsicTest, LIRCallsUnicodeCountRuntimeHelper) {
++  auto function = parseUnicodeCountFunction();
++  ASSERT_NE(function, nullptr);
++
++  jit::Compiler::runPasses(
++      *function,
++      static_cast<jit::PassConfig>(
++          jit::PassConfig::kAllExceptInliner &
++          ~jit::PassConfig::kInsertUpdatePrevInstr));
++
++  jit::codegen::Environ env;
++  env.ctx = jit::getContext();
++  jit::CodeRuntime code_runtime{
++      function->code, function->builtins, function->globals};
++  env.code_rt = &code_runtime;
++
++  jit::lir::LIRGenerator generator{function.get(), &env};
++  auto lir = generator.TranslateFunction();
++  lir->sortBasicBlocks();
++  std::stringstream stream;
++  stream << *lir;
++  const std::string text = stream.str();
++
++  EXPECT_NE(
++      text.find(fmt::format(
++          "{}", reinterpret_cast<uint64_t>(JITRT_UnicodeCountProperty))),
++      std::string::npos)
++      << text;
++}
+diff --git a/cinderx/cinderjit.pyi b/cinderx/cinderjit.pyi
+index 1b6bc04..b6c6c83 100644
+--- a/cinderx/cinderjit.pyi
++++ b/cinderx/cinderjit.pyi
+@@ -18,6 +18,7 @@ def _deopt_gen(
+         | Coroutine[TDeoptGenYield, TDeoptGenSend, TDeoptGenReturn]
+     ),
+ ) -> bool: ...
++def _udf_unicode_count_property(text: str, property_id: int) -> int: ...
+ def append_jit_list(entry: str) -> None: ...
+ def auto() -> None: ...
+ def clear_runtime_stats() -> None: ...
