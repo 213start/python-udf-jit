@@ -1,0 +1,170 @@
+{
+  "schema_version": "1.0",
+  "created_at": "2026-08-03",
+  "workload": "pipeline_text_fineweb_full_min/alphanumeric-UDF-piercing",
+  "experiment": "generic_typed_loop_cinderx_single_ab",
+  "classification": "targeted_piercing_ab",
+  "source": {
+    "udfjit_base_revision": "90a60c66dcca1ecc9297b97adb6bf8e8eed2a52f",
+    "branch": "master",
+    "cinderx_upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
+    "production_patch": "vendor/cinderx/patches/0005-generic-typed-loop-specialization.patch",
+    "production_patch_sha256": "0ecedf7b544fab7d41faf50491eede95b3106492e86cd4f4b3e04d70e81225de",
+    "production_patch_series_sha256": "4445776e936e146260ef6ba19bdc6dcdc50d1f76b4f78e37d506acd9d63ec2d5",
+    "candidate_runtime_tree_sha256": "621bce6a1323bcfbbee185eec57305a892ddd03e6231b97f47749d659300eae3",
+    "diagnostic_overlay_sha256": "438f4e89a223a14deecef46f025a37effc282f0b6ad6bd8ff959cd6c53bf34a1",
+    "ab_harness_sha256": "b99aea9ab2f187f50253589264e3139d6e3d67a8b0034cd3322623d3abcc0f1b",
+    "diagnostic_harness_sha256": "4c1946fda8359436b9d8b18808d3b64cc8af68d2fbccaca296c601553ac7a6fc",
+    "ab_semantic_hash": "84c1d10b6d6ba930ecaa58e0c8a4e64c76d5ff93b837363d15c6b2b7c1a69a56",
+    "diagnostic_semantic_hash": "1ec82beda6828b11a5ceb6e2e18a3ac27916bdf02198d6e3616aa11ba59ca0cc"
+  },
+  "environment": {
+    "host": "aarch64-lab-host",
+    "arch": "aarch64",
+    "python": "3.14.3",
+    "image": "python-udf-jit:u13-20260729-071503-eb97ee8a",
+    "cpu_affinity": "32",
+    "rounds": 7,
+    "calls_per_round": 400,
+    "characters_per_round": 4172800,
+    "thread_limits": {
+      "OMP_NUM_THREADS": 1,
+      "OPENBLAS_NUM_THREADS": 1,
+      "MKL_NUM_THREADS": 1
+    }
+  },
+  "diagnostic_isolation": {
+    "performance_run": {
+      "UDFJIT_DIAGNOSTICS": "off",
+      "PYTHONJITUDFDIAGNOSTICS": "0",
+      "structured_overlay_applied": false,
+      "hir_lir_asm_dump": false
+    },
+    "diagnostic_run": {
+      "UDFJIT_DIAGNOSTICS": "full",
+      "PYTHONJITUDFDIAGNOSTICS": "1",
+      "structured_overlay_applied": true,
+      "timing_used_for_performance_claim": false
+    },
+    "off_path_import_check": "A fresh subprocess compiled and executed a typed region while proving python_udf_jit.diagnostics.worker_runtime was absent from sys.modules."
+  },
+  "diagnostic_chain": {
+    "bundle_status": "complete",
+    "artifact_count": 28,
+    "bundle_manifest_sha256": "56394402a68128dc8c21402a6ee8568a787df82ab9a30f7815f9d0f523101048",
+    "chain_status_sha256": "71bfd3873b3f15d80b0ccd1bd75bc4b98c0dd5e74248fdffc7cb5813f14d971c",
+    "operation_provenance_sha256": "ed24e481af32b068d864ae09bdc7c00a132733f26fc129a49ad3185d5c1f9aaa",
+    "hir_sha256": "b868e44a301e78909fa630b53cc7b6a5cf4601faf9869ad83f3a56daa546199c",
+    "lir_sha256": "b417d227ec0c4e18343f98efed468d9592335b008f14a88cf93ceb8d5a04931b",
+    "machine_ranges_sha256": "399fe57d3fb1eb95db8c089f1f3cc99fb96603dd92ef834fb939c355aa6aa076",
+    "chain": {
+      "source_ranges": "available",
+      "original_bytecode": "available",
+      "typed_semantic": "available",
+      "behavior": "available",
+      "type_evidence": "available",
+      "pattern_analysis": "available",
+      "generic_lowering": "available",
+      "physical_lowering": "available",
+      "generated_bytecode": "available",
+      "cinderx_hir": "available",
+      "cinderx_lir": "available",
+      "machine": "available"
+    },
+    "analysis": {
+      "behavior_family": "numeric_loop",
+      "loop_kind": "iterator_loop",
+      "loop_count": 1,
+      "loop_depth": 1,
+      "reduction": "binary.add",
+      "container_type": "str",
+      "element_type": "unicode.scalar",
+      "iterator_strategy": "unicode_storage",
+      "required_guard": "exact:str",
+      "physical_operation": "unicode.count_property"
+    },
+    "backend": {
+      "execution_mode": "cinderx_unicode_property_hir",
+      "jit_compiled": true,
+      "UnicodeCountProperty_count": 1,
+      "hir_node_count": 97,
+      "lir_node_count": 249,
+      "machine_range_count": 237,
+      "code_size_bytes": 2520,
+      "stack_size_bytes": 112,
+      "spill_stack_size_bytes": 8,
+      "overall_compile_ns": 3293000
+    },
+    "intrinsic_origin": {
+      "generated_bytecode_offset": 202,
+      "hir_id": "51",
+      "hir_opcode": "UnicodeCountProperty",
+      "lir": [
+        ["244", "Move"],
+        ["245", "Move"],
+        ["98", "Call"]
+      ],
+      "machine_ranges": [
+        ["99", 4],
+        ["100", 4],
+        ["101", 8]
+      ]
+    },
+    "provenance": {
+      "semantic_operation_count": 17,
+      "operations_with_original_bytecode": 17,
+      "operations_with_generated_bytecode": 17,
+      "operations_with_hir": 16,
+      "operations_with_lir": 16,
+      "operations_with_machine_ranges": 16
+    },
+    "validation_log": "artifact://generic-typed-loop-20260803/diagnostics/validation.log",
+    "privacy_scan_log": "artifact://generic-typed-loop-20260803/diagnostics/privacy-scan.log",
+    "raw_bundle": "artifact://generic-typed-loop-20260803/diagnostics/bundle-56394402a68128dc"
+  },
+  "ab": {
+    "protocol": "single-process adjacent A then B on CPU 32; original CinderX JIT UDF versus guarded UDF JIT + CinderX typed specialization",
+    "baseline": {
+      "mode": "original_cinderx_jit_udf",
+      "median_ns": 460061800,
+      "samples_ns": [460147090, 459999650, 460061800, 459746480, 458432950, 461264460, 460781100],
+      "checksum": 400
+    },
+    "candidate": {
+      "mode": "cinderx_unicode_property_hir",
+      "median_ns": 42561090,
+      "samples_ns": [42607500, 42629610, 42561090, 42558530, 42522630, 43017170, 42488820],
+      "checksum": 400,
+      "UnicodeCountProperty_count": 1
+    },
+    "comparisons": {
+      "speedup": 10.8094459046984,
+      "candidate_ns_per_character": 10.199647718558282
+    },
+    "correctness": {
+      "baseline_checksum": 400,
+      "candidate_checksum": 400,
+      "same_calls_and_characters": true,
+      "baseline_jit_compiled": true,
+      "candidate_jit_compiled": true,
+      "exact_str_guard": true,
+      "runtime_dependency_guards": true,
+      "unicode_boundary_tests": true,
+      "positive_compile_cache_tests": true
+    },
+    "log": "artifact://generic-typed-loop-20260803/ab/run.jsonl"
+  },
+  "validation": {
+    "patch_series_reapplied_from_upstream": true,
+    "patch_series_tree_hash_matched": true,
+    "production_cinderx_build": "pass",
+    "production_python_tests": "4 passed",
+    "runtime_tests": "2 passed",
+    "diagnostic_overlay_apply": "pass with context offsets only",
+    "diagnostic_overlay_python_tests": "5 passed",
+    "diagnostic_bundle_validation": "valid, complete, executed_content=false",
+    "diagnostic_privacy_canary": "absent",
+    "post_review_python_tests": "74 passed remotely; local full suite: 492 passed, 20 skipped, 434 subtests passed"
+  },
+  "scope_caveat": "This is a targeted alphanumeric-UDF perforation A/B, not a full pipeline_text_fineweb_full_min wall-clock result. It proves the optimization mechanism and stage potential; scheduler, Ray, wrappers, other operators, model loading, guard misses, compile amortization, and end-to-end Amdahl limits remain for the next validation level."
+}

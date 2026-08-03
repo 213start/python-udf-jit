@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import dis
 import hashlib
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
-from python_udf_jit.diagnostics.bundle import read_bundle, read_json_artifact
+from python_udf_jit.compiler.typed_frontend import capture_typed_loop
+from python_udf_jit.compiler.typed_ir import EXACT_UNICODE
+from python_udf_jit.diagnostics.bundle import (
+    read_artifact_bytes,
+    read_bundle,
+    read_json_artifact,
+)
 from python_udf_jit.diagnostics.config import (
     DiagnosticRuntimeContext,
     OFF_DIAGNOSTIC_POLICY,
@@ -29,6 +37,14 @@ from python_udf_jit.runtime.variant import WorkerProcessKey
 from python_udf_jit.provider.scalar_python.compiler import (
     ScalarLoweringSnapshot,
 )
+from python_udf_jit.provider.scalar_python.typed_loop import (
+    BackendCompilation,
+    CompileStatus,
+    RuntimeFeedback,
+    TypedRegionCompileRequest,
+    TypedRegionCompiler,
+    lower_unicode_count_physical,
+)
 from tests.unit.diagnostics.test_cinderx_bridge import _document
 from tests.unit.diagnostics.test_provenance import (
     _module_and_graph,
@@ -42,6 +58,63 @@ def _identity(value):
 
 def _generated(value):
     return value
+
+
+def _typed_alpha_count(text: str) -> int:
+    return sum(1 for character in text if character.isalpha())
+
+
+def _typed_alpha_ratio(
+    text: str,
+    threshold: float = 0.73123456789,
+) -> bool:
+    return sum(1 for character in text if character.isalpha()) / len(text) >= threshold
+
+
+class _TypedDiagnosticBackend:
+    adapter_version = "typed-diagnostic-test-v1"
+
+    def compile(self, lowering):
+        return self._compile(lowering, None)
+
+    def compile_with_diagnostics(self, lowering, diagnostic_sink):
+        return self._compile(lowering, diagnostic_sink)
+
+    def _compile(self, lowering, diagnostic_sink):
+        methods = (
+            "isalnum",
+            "isalpha",
+            "isdecimal",
+            "isdigit",
+            "isnumeric",
+            "isspace",
+        )
+
+        def helper(text, property_id):
+            return sum(
+                getattr(character, methods[property_id])()
+                for character in text
+            )
+
+        physical = lower_unicode_count_physical(lowering, helper)
+        if diagnostic_sink is not None:
+            diagnostic_sink.prepare_typed_compilation(
+                physical.function,
+                physical.generated_code_hash,
+            )
+        return BackendCompilation(
+            True,
+            "test_unicode_property_hir",
+            (("UnicodeCountProperty", 1),),
+            physical,
+        )
+
+
+class _GenericTypedDiagnosticBackend:
+    adapter_version = "generic-typed-diagnostic-test-v1"
+
+    def compile(self, _lowering):
+        return BackendCompilation(True, "test_generic_bytecode")
 
 
 class WorkerDiagnosticBindingTests(unittest.TestCase):
@@ -229,7 +302,7 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
                     "UDFJIT_DIAGNOSTICS": "full",
                     "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
                     "UDFJIT_DIAGNOSTIC_FILTER": "candidate:candidate-a",
-                    "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                    "UDFJIT_DIAGNOSTIC_SOURCE": "text",
                     "UDFJIT_DIAGNOSTIC_PERF": "off",
                     "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
                     "UDFJIT_DIAGNOSTIC_MAX_BYTES": str(4 * 1024 * 1024),
@@ -318,6 +391,7 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
             self.assertTrue(
                 {
                     "source/ranges.json",
+                    "source/source.py",
                     "bytecode/original.dis",
                     "semantic/core.final.txt",
                     "lowering/generated_ast.txt",
@@ -343,6 +417,307 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
             _generated.__udfjit_generated_code_hash__,
             generated_hash,
         )
+
+    def test_full_typed_path_records_each_generic_and_physical_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = resolve_diagnostic_policy(
+                {
+                    "UDFJIT_DIAGNOSTICS": "full",
+                    "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
+                    "UDFJIT_DIAGNOSTIC_FILTER": "candidate:candidate-a",
+                    "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                    "UDFJIT_DIAGNOSTIC_PERF": "off",
+                    "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                    "UDFJIT_DIAGNOSTIC_MAX_BYTES": str(4 * 1024 * 1024),
+                },
+                DiagnosticRuntimeContext(
+                    dedicated_worker=True,
+                    workspace_root=root / "workspace",
+                    home_root=root / "home",
+                ),
+            )
+            runtime = WorkerDiagnosticRuntime(
+                policy,
+                run_id="run-a",
+                runtime_mode="auto",
+                process_key="worker-a",
+                process_id=os.getpid(),
+                user_function=_typed_alpha_ratio,
+            )
+            captured = capture_typed_loop(
+                _typed_alpha_ratio,
+                input_types=(EXACT_UNICODE,),
+            )
+            backend = _TypedDiagnosticBackend()
+            compiler = TypedRegionCompiler(
+                backend,
+                call_threshold=1,
+                negative_ttl_ns=1_000_000_000,
+                diagnostic_sink=runtime,
+            )
+            deferred = compiler.compile(
+                TypedRegionCompileRequest(
+                    captured.module,
+                    RuntimeFeedback(call_count=0, deopt_count=0),
+                    captured.analysis.to_documents(),
+                    captured.runtime_guard,
+                )
+            )
+            self.assertEqual(deferred.status, CompileStatus.DEFERRED)
+
+            original_compile = backend.compile_with_diagnostics
+            fail_once = mock.Mock(
+                side_effect=RuntimeError("synthetic first backend failure")
+            )
+            backend.compile_with_diagnostics = fail_once
+            failed = compiler.compile(
+                TypedRegionCompileRequest(
+                    captured.module,
+                    RuntimeFeedback(call_count=1, deopt_count=0),
+                    captured.analysis.to_documents(),
+                    captured.runtime_guard,
+                )
+            )
+            self.assertEqual(failed.status, CompileStatus.FAILURE)
+            backend.compile_with_diagnostics = original_compile
+            compiler._negative.clear(compiler._cache_key(captured.module))
+
+            def structured_document(function, compile_instance_id):
+                offsets = [
+                    instruction.offset
+                    for instruction in dis.get_instructions(function)
+                ]
+                return {
+                    "schema_version": 1,
+                    "status": "available",
+                    "compile_instance_id": compile_instance_id,
+                    "generated_code_hash": getattr(
+                        function,
+                        "__udfjit_generated_code_hash__",
+                    ),
+                    "jit_compiled": True,
+                    "unavailable_reason": None,
+                    "jit_gate_reason": None,
+                    "code_start": 4096,
+                    "code_size": len(offsets) * 8,
+                    "stack_size": 32,
+                    "spill_stack_size": 8,
+                    "pass_timings": [],
+                    "hir_nodes": [
+                        {
+                            "hir_id": str(index),
+                            "opcode": "BytecodeOrigin",
+                            "bytecode_offset": offset,
+                            "synthetic_kind": None,
+                        }
+                        for index, offset in enumerate(offsets)
+                    ],
+                    "lir_nodes": [
+                        {
+                            "lir_id": str(index),
+                            "opcode": "LoweredOrigin",
+                            "hir_ids": [str(index)],
+                            "synthetic_kind": None,
+                        }
+                        for index, _offset in enumerate(offsets)
+                    ],
+                    "machine_ranges": [
+                        {
+                            "range_id": str(index),
+                            "start": 4096 + index * 8,
+                            "end": 4096 + (index + 1) * 8,
+                            "section": "hot",
+                            "symbol": "generated_typed_region",
+                            "lir_ids": [str(index)],
+                            "hir_ids": [str(index)],
+                            "synthetic_kind": None,
+                        }
+                        for index, _offset in enumerate(offsets)
+                    ],
+                    "deopt_metadata": [],
+                }
+
+            jit_module = ModuleType("cinderx.jit")
+            jit_module.get_udfjit_compilation_diagnostics = (
+                structured_document
+            )
+            cinderx_module = ModuleType("cinderx")
+            cinderx_module.jit = jit_module
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "cinderx": cinderx_module,
+                    "cinderx.jit": jit_module,
+                },
+            ):
+                decision = compiler.compile(
+                    TypedRegionCompileRequest(
+                        captured.module,
+                        RuntimeFeedback(call_count=1, deopt_count=0),
+                        captured.analysis.to_documents(),
+                        captured.runtime_guard,
+                    )
+                )
+                repeated = compiler.compile(
+                    TypedRegionCompileRequest(
+                        captured.module,
+                        RuntimeFeedback(call_count=1, deopt_count=0),
+                        captured.analysis.to_documents(),
+                        captured.runtime_guard,
+                    )
+                )
+            self.assertEqual(decision.status, CompileStatus.COMPILED)
+            self.assertEqual(repeated.status, CompileStatus.COMPILED)
+            self.assertEqual(
+                decision.variant("A-中"),
+                _typed_alpha_ratio("A-中"),
+            )
+            bundle_ref = runtime.finalize()
+            self.assertIsNotNone(bundle_ref)
+            bundle = read_bundle(bundle_ref.path)
+            paths = {artifact.path for artifact in bundle.artifacts}
+            chain = read_json_artifact(bundle, "typed/chain-status.json")
+            provenance = read_json_artifact(
+                bundle,
+                "typed/operation-provenance.json",
+            )
+            canary = b"0.73123456789"
+            for artifact in bundle.artifacts:
+                self.assertNotIn(
+                    canary,
+                    read_artifact_bytes(bundle, artifact.path),
+                    artifact.path,
+                )
+
+        self.assertTrue(
+            {
+                "typed/source-ranges.json",
+                "typed/bytecode-original.dis",
+                "typed/semantic-v2.txt",
+                "typed/behavior-profile.json",
+                "typed/type-evidence.json",
+                "typed/pattern-analysis.json",
+                "typed/specialization-plan.json",
+                "typed/generic-lowering.py",
+                "typed/physical-lowering.py",
+                "typed/generated-bytecode.dis",
+                "typed/backend.json",
+                "typed/cinderx/hir.final.txt",
+                "typed/cinderx/lir.txt",
+                "typed/cinderx/machine-ranges.txt",
+                "typed/operation-provenance.json",
+                "typed/chain-status.json",
+            }.issubset(paths)
+        )
+        self.assertEqual(chain["cinderx_hir"], "available")
+        self.assertEqual(chain["cinderx_lir"], "available")
+        self.assertEqual(chain["machine"], "available")
+        self.assertEqual(chain["physical_lowering"], "available")
+        self.assertTrue(
+            any(entry["hir_ids"] for entry in provenance["entries"])
+        )
+        self.assertTrue(
+            all(
+                entry["original_bytecode_offsets"]
+                for entry in provenance["entries"]
+            )
+        )
+        self.assertTrue(
+            any(entry["machine_range_ids"] for entry in provenance["entries"])
+        )
+
+    def test_full_typed_path_retries_after_unrecordable_guard_decision(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = resolve_diagnostic_policy(
+                {
+                    "UDFJIT_DIAGNOSTICS": "full",
+                    "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
+                    "UDFJIT_DIAGNOSTIC_FILTER": "candidate:candidate-a",
+                    "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                    "UDFJIT_DIAGNOSTIC_PERF": "off",
+                    "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                    "UDFJIT_DIAGNOSTIC_MAX_BYTES": str(4 * 1024 * 1024),
+                },
+                DiagnosticRuntimeContext(
+                    dedicated_worker=True,
+                    workspace_root=root / "workspace",
+                    home_root=root / "home",
+                ),
+            )
+            runtime = WorkerDiagnosticRuntime(
+                policy,
+                run_id="run-a",
+                runtime_mode="auto",
+                process_key="worker-a",
+                process_id=os.getpid(),
+                user_function=_typed_alpha_ratio,
+            )
+            captured = capture_typed_loop(
+                _typed_alpha_ratio,
+                input_types=(EXACT_UNICODE,),
+            )
+            compiler = TypedRegionCompiler(
+                _GenericTypedDiagnosticBackend(),
+                call_threshold=1,
+                negative_ttl_ns=1_000_000_000,
+                diagnostic_sink=runtime,
+            )
+            missing_guard = compiler.compile(
+                TypedRegionCompileRequest(
+                    captured.module,
+                    RuntimeFeedback(call_count=1, deopt_count=0),
+                )
+            )
+
+            self.assertEqual(missing_guard.status, CompileStatus.UNSUPPORTED)
+            self.assertEqual(
+                missing_guard.reason_code,
+                "runtime_dependency_guard_missing",
+            )
+            self.assertNotIn(
+                captured.module.semantic_hash,
+                runtime._typed_regions_recorded,
+            )
+
+            compiled = compiler.compile(
+                TypedRegionCompileRequest(
+                    captured.module,
+                    RuntimeFeedback(call_count=1, deopt_count=0),
+                    captured.analysis.to_documents(),
+                    captured.runtime_guard,
+                )
+            )
+
+            self.assertEqual(compiled.status, CompileStatus.COMPILED)
+            self.assertEqual(
+                compiled.variant("A-中"),
+                _typed_alpha_ratio("A-中"),
+            )
+            bundle_ref = runtime.finalize()
+            self.assertIsNotNone(bundle_ref)
+            bundle = read_bundle(bundle_ref.path)
+            paths = {artifact.path for artifact in bundle.artifacts}
+            decision = read_json_artifact(bundle, "typed/decision.json")
+            chain = read_json_artifact(bundle, "typed/chain-status.json")
+
+        self.assertTrue(
+            {
+                "typed/semantic-v2.json",
+                "typed/behavior-profile.json",
+                "typed/type-evidence.json",
+                "typed/pattern-analysis.json",
+                "typed/generated-bytecode.json",
+                "typed/operation-provenance.json",
+                "typed/chain-status.json",
+            }.issubset(paths)
+        )
+        self.assertEqual(decision["status"], "compiled")
+        self.assertEqual(chain["generic_lowering"], "available")
+        self.assertEqual(chain["generated_bytecode"], "available")
 
     def test_full_perf_evidence_is_ingested_before_worker_finalization(
         self,
