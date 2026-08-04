@@ -108,14 +108,6 @@ def _redacted_typed_module_document(module) -> dict[str, object]:
     return document
 
 
-def _redacted_physical_lowering_document(physical) -> dict[str, object]:
-    document = physical.to_document()
-    document["physical_attributes"] = _redacted_attributes_document(
-        document["physical_attributes"]
-    )
-    return document
-
-
 def _redacted_generated_artifacts(source: str) -> tuple[str, str]:
     module = ast.parse(source)
 
@@ -134,6 +126,38 @@ def _redacted_generated_artifacts(source: str) -> tuple[str, str]:
 
     redacted = ast.fix_missing_locations(_RedactConstants().visit(module))
     return ast.unparse(redacted) + "\n", generated_ast_text(module)
+
+
+def _has_generic_cinderx_hir_summary(
+    opcode_counts: tuple[tuple[str, int], ...],
+) -> bool:
+    """Recognize a typed region from ordinary CinderX HIR, not UDF kernels."""
+
+    counts = dict(opcode_counts)
+    if any(
+        counts.get(opcode, 0)
+        for opcode in (
+            "UnicodeCountProperty",
+            "UnicodeFsmSequence",
+            "UnicodeMapSequence",
+            "VectorCall",
+        )
+    ):
+        return False
+    if not counts.get("Phi", 0) or not counts.get("CondBranch", 0):
+        return False
+    return any(
+        counts.get(opcode, 0)
+        for opcode in (
+            "IntBinaryOp",
+            "PrimitiveSelect",
+            "PrimitiveTableGet",
+            "PrimitiveTableLookup",
+            "SequenceBuilderAppend",
+            "UnicodeClassify",
+            "UnicodeRead",
+        )
+    )
 
 
 def _selector_matches(
@@ -321,6 +345,7 @@ class WorkerDiagnosticRuntime:
         self,
         function: FunctionType,
         generated_code_hash: str,
+        operation_lines: tuple[tuple[str, int], ...],
     ) -> str:
         """Bind a typed generated function before CinderX compiles it."""
 
@@ -343,6 +368,23 @@ class WorkerDiagnosticRuntime:
             function,
             "__udfjit_generated_code_hash__",
             generated_code_hash,
+        )
+        if (
+            not isinstance(operation_lines, tuple)
+            or any(
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                or type(item[1]) is not int
+                or item[1] < 0
+                for item in operation_lines
+            )
+        ):
+            raise ValueError("typed_diagnostic_operation_lines_invalid")
+        setattr(
+            function,
+            "__udfjit_typed_operation_lines__",
+            operation_lines,
         )
         return compile_instance_id
 
@@ -506,21 +548,17 @@ class WorkerDiagnosticRuntime:
                 "machine": "unavailable",
                 "original_bytecode": "available",
                 "pattern_analysis": "available",
-                "physical_lowering": "unavailable",
                 "schema_version": 1,
                 "source_ranges": "available",
                 "typed_semantic": "available",
                 "type_evidence": "available",
+                "udf_physical_lowering": "not_applicable_backend_owned",
             }
             variant = decision.variant
             if variant is not None:
                 lowering = variant.lowering
                 backend = variant.backend
                 generic_map = dict(lowering.operation_lines)
-                physical = backend.physical_lowering
-                physical_map = (
-                    {} if physical is None else dict(physical.operation_lines)
-                )
                 generated = build_bytecode_artifacts(
                     variant.jit_function.__code__,
                     code_hash=variant.code_hash,
@@ -544,22 +582,12 @@ class WorkerDiagnosticRuntime:
                 provenance_entries: list[dict[str, object]] = []
                 for operation in module.operations:
                     generic_line = generic_map[operation.operation_id]
-                    physical_line = physical_map.get(operation.operation_id)
-                    if physical is not None and physical_line is None:
-                        raise ValueError(
-                            "typed_physical_provenance_incomplete"
-                        )
-                    generated_line = (
-                        generic_line
-                        if physical is None
-                        else physical_line
-                    )
                     provenance_entries.append(
                         {
                             "generated_bytecode_offsets": list(
-                                offsets_by_line.get(generated_line, ())
+                                offsets_by_line.get(generic_line, ())
                             ),
-                            "generated_line": generated_line,
+                            "generated_line": generic_line,
                             "generic_line": generic_line,
                             "hir_ids": [],
                             "lir_ids": [],
@@ -571,7 +599,6 @@ class WorkerDiagnosticRuntime:
                                     (),
                                 )
                             ),
-                            "physical_line": physical_line,
                             "source_offset": operation.source_offset,
                         }
                     )
@@ -640,13 +667,8 @@ class WorkerDiagnosticRuntime:
                 )
                 chain["generic_lowering"] = "available"
                 chain["generated_bytecode"] = "available"
-                if any(
-                    dict(backend.hir_opcode_counts).get(opcode, 0)
-                    for opcode in (
-                        "UnicodeCountProperty",
-                        "UnicodeFsmSequence",
-                        "UnicodeMapSequence",
-                    )
+                if _has_generic_cinderx_hir_summary(
+                    backend.hir_opcode_counts
                 ):
                     chain["cinderx_hir"] = "available_summary"
                 compile_instance_id = (
@@ -777,46 +799,6 @@ class WorkerDiagnosticRuntime:
                         chain["cinderx_hir"] = "available"
                         chain["cinderx_lir"] = "available"
                         chain["machine"] = "available"
-                if physical is not None:
-                    if self.policy.source_policy is DiagnosticSourcePolicy.TEXT:
-                        physical_source = physical.generated_source
-                        physical_ast = physical.generated_ast_text
-                    else:
-                        physical_source, physical_ast = (
-                            _redacted_generated_artifacts(
-                                physical.generated_source
-                            )
-                        )
-                    artifacts.extend(
-                        (
-                            (
-                                "typed/physical-lowering.json",
-                                "application/json",
-                                (
-                                    physical.to_document()
-                                    if self.policy.source_policy
-                                    is DiagnosticSourcePolicy.TEXT
-                                    else _redacted_physical_lowering_document(
-                                        physical
-                                    )
-                                ),
-                                "physical",
-                            ),
-                            (
-                                "typed/physical-lowering.py",
-                                "text/x-python",
-                                physical_source,
-                                "physical",
-                            ),
-                            (
-                                "typed/physical-lowering.ast",
-                                "text/plain",
-                                physical_ast,
-                                "physical",
-                            ),
-                        )
-                    )
-                    chain["physical_lowering"] = "available"
                 artifacts.append(
                     (
                         "typed/operation-provenance.json",

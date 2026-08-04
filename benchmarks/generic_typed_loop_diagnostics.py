@@ -143,7 +143,6 @@ def main() -> int:
         "cinderx_hir",
         "cinderx_lir",
         "machine",
-        "physical_lowering",
     )
     unavailable = {
         stage: chain.get(stage)
@@ -152,6 +151,10 @@ def main() -> int:
     }
     if unavailable:
         raise RuntimeError(f"diagnostic chain incomplete: {unavailable}")
+    if chain.get("udf_physical_lowering") != "not_applicable_backend_owned":
+        raise RuntimeError(
+            "typed diagnostics must attribute physical lowering to CinderX"
+        )
     linked_operations = sum(
         bool(entry["machine_range_ids"])
         for entry in provenance["entries"]
@@ -169,11 +172,7 @@ def main() -> int:
         "normalized_pattern": captured.normalized_pattern,
         "operation_count": len(provenance["entries"]),
         "pattern": arguments.pattern,
-        "physical_operation": (
-            decision.variant.backend.physical_lowering.physical_operation
-            if decision.variant.backend.physical_lowering is not None
-            else None
-        ),
+        "physical_lowering_owner": "cinderx",
         "semantic_hash": captured.module.semantic_hash,
     }
     print(json.dumps(document, sort_keys=True))

@@ -29,6 +29,7 @@ from python_udf_jit.diagnostics.hotspots import NormalizedPerfProfile
 from python_udf_jit.diagnostics.report import validate_diagnostic_bundle
 from python_udf_jit.diagnostics.worker_runtime import (
     WorkerDiagnosticRuntime,
+    _has_generic_cinderx_hir_summary,
 )
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
 from python_udf_jit.integration.daft_ray.worker import (
@@ -46,9 +47,6 @@ from python_udf_jit.provider.scalar_python.typed_loop import (
     RuntimeFeedback,
     TypedRegionCompileRequest,
     TypedRegionCompiler,
-    lower_unicode_count_physical,
-    lower_unicode_fsm_physical,
-    lower_unicode_map_physical,
 )
 from tests.unit.diagnostics.test_cinderx_bridge import _document
 from tests.unit.diagnostics.test_provenance import (
@@ -98,32 +96,22 @@ class _TypedDiagnosticBackend:
         return self._compile(lowering, diagnostic_sink)
 
     def _compile(self, lowering, diagnostic_sink):
-        methods = (
-            "isalnum",
-            "isalpha",
-            "isdecimal",
-            "isdigit",
-            "isnumeric",
-            "isspace",
-        )
-
-        def helper(text, property_id):
-            return sum(
-                getattr(character, methods[property_id])()
-                for character in text
-            )
-
-        physical = lower_unicode_count_physical(lowering, helper)
         if diagnostic_sink is not None:
             diagnostic_sink.prepare_typed_compilation(
-                physical.function,
-                physical.generated_code_hash,
+                lowering.function,
+                lowering.generated_code_hash,
+                lowering.operation_lines,
             )
         return BackendCompilation(
             True,
-            "test_unicode_property_hir",
-            (("UnicodeCountProperty", 1),),
-            physical,
+            "test_generic_typed_hir",
+            (
+                ("CondBranch", 1),
+                ("IntBinaryOp", 2),
+                ("Phi", 2),
+                ("UnicodeClassify", 1),
+                ("UnicodeRead", 1),
+            ),
         )
 
 
@@ -142,28 +130,62 @@ class _SequenceTypedDiagnosticBackend:
             operation.op for operation in lowering.module.operations
         }
         if "immutable.lookup" in operation_names:
-            physical = lower_unicode_map_physical(
-                lowering,
-                lambda text, _keys, _values: text,
+            counts = (
+                ("CondBranch", 1),
+                ("IntBinaryOp", 1),
+                ("Phi", 2),
+                ("PrimitiveTableLookup", 1),
+                ("SequenceBuilderAppend", 1),
+                ("UnicodeRead", 1),
             )
-            opcode = "UnicodeMapSequence"
         elif "fsm.transition" in operation_names:
-            physical = lower_unicode_fsm_physical(
-                lowering,
-                lambda text, _property, _state, _descriptor: text,
+            counts = (
+                ("CondBranch", 2),
+                ("IntBinaryOp", 5),
+                ("Phi", 3),
+                ("PrimitiveTableGet", 3),
+                ("SequenceBuilderAppend", 2),
+                ("UnicodeClassify", 1),
+                ("UnicodeRead", 1),
             )
-            opcode = "UnicodeFsmSequence"
         else:
             raise AssertionError("sequence descriptor expected")
         return BackendCompilation(
             True,
-            "test_unicode_sequence_hir",
-            ((opcode, 1),),
-            physical,
+            "test_generic_typed_hir",
+            counts,
         )
 
 
 class WorkerDiagnosticBindingTests(unittest.TestCase):
+    def test_generic_hir_summary_requires_standard_loop_hir(self) -> None:
+        self.assertTrue(
+            _has_generic_cinderx_hir_summary(
+                (
+                    ("Phi", 2),
+                    ("CondBranch", 1),
+                    ("UnicodeRead", 1),
+                    ("UnicodeClassify", 1),
+                    ("IntBinaryOp", 2),
+                )
+            )
+        )
+        self.assertFalse(
+            _has_generic_cinderx_hir_summary(
+                (("UnicodeCountProperty", 1),)
+            )
+        )
+        self.assertFalse(
+            _has_generic_cinderx_hir_summary(
+                (
+                    ("Phi", 1),
+                    ("CondBranch", 1),
+                    ("UnicodeRead", 1),
+                    ("VectorCall", 1),
+                )
+            )
+        )
+
     def _context(self, diagnostic_policy):
         return WorkerRuntimeContext(
             "run-a",
@@ -464,7 +486,7 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
             generated_hash,
         )
 
-    def test_full_typed_path_records_each_generic_and_physical_layer(self) -> None:
+    def test_full_typed_path_records_each_backend_owned_layer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             policy = resolve_diagnostic_policy(
@@ -663,7 +685,6 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
                 "typed/pattern-analysis.json",
                 "typed/specialization-plan.json",
                 "typed/generic-lowering.py",
-                "typed/physical-lowering.py",
                 "typed/generated-bytecode.dis",
                 "typed/backend.json",
                 "typed/cinderx/hir.final.txt",
@@ -677,7 +698,10 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
         self.assertEqual(chain["cinderx_hir"], "available")
         self.assertEqual(chain["cinderx_lir"], "available")
         self.assertEqual(chain["machine"], "available")
-        self.assertEqual(chain["physical_lowering"], "available")
+        self.assertEqual(
+            chain["udf_physical_lowering"],
+            "not_applicable_backend_owned",
+        )
         self.assertTrue(
             any(entry["hir_ids"] for entry in provenance["entries"])
         )
@@ -770,17 +794,8 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
                         bundle,
                         "typed/semantic-v2.json",
                     )
-                    physical = read_json_artifact(
-                        bundle,
-                        "typed/physical-lowering.json",
-                    )
                     semantic_text = json.dumps(
                         semantic,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                    physical_text = json.dumps(
-                        physical,
                         ensure_ascii=False,
                         sort_keys=True,
                     )
@@ -788,41 +803,30 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
                     if source_policy == "text":
                         for canary in canaries:
                             self.assertIn(canary, semantic_text)
-                            self.assertIn(canary, physical_text)
                         continue
 
                     for canary in canaries:
                         self.assertNotIn(canary, semantic_text)
-                        self.assertNotIn(canary, physical_text)
                     semantic_metadata = [
                         json.loads(value)
                         for operation in semantic["operations"]
                         for _name, value in operation["attributes"]
                         if value.startswith('{"count":')
                     ]
-                    physical_metadata = [
-                        json.loads(value)
-                        for _name, value in physical["physical_attributes"]
-                        if value.startswith('{"count":')
-                    ]
                     expected_counts = sorted(
                         len(json.loads(canary)) for canary in canaries
                     )
-                    for metadata in (
-                        semantic_metadata,
-                        physical_metadata,
-                    ):
-                        self.assertEqual(
-                            sorted(value["count"] for value in metadata),
-                            expected_counts,
+                    self.assertEqual(
+                        sorted(value["count"] for value in semantic_metadata),
+                        expected_counts,
+                    )
+                    self.assertTrue(
+                        all(
+                            value["shape"] == [value["count"]]
+                            and len(value["sha256"]) == 64
+                            for value in semantic_metadata
                         )
-                        self.assertTrue(
-                            all(
-                                value["shape"] == [value["count"]]
-                                and len(value["sha256"]) == 64
-                                for value in metadata
-                            )
-                        )
+                    )
 
     def test_udf_selector_enables_typed_worker_recording(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
