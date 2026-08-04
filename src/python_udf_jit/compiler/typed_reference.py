@@ -131,12 +131,15 @@ def _execute_operation(
             result = chr(replacements[table_index])
     elif operation.op == "fsm.transition":
         state_count = int(operation.attribute("state_count") or "0")
+        class_count = int(operation.attribute("class_count") or "0")
         transitions = decode_int_table(
             operation.attribute("transitions") or "",
             max_items=128,
             maximum=state_count - 1,
         )
-        result = transitions[int(arguments[0]) * 2 + int(arguments[1])]
+        result = transitions[
+            int(arguments[0]) * class_count + int(arguments[1])
+        ]
     elif operation.op == "sequence.builder.create":
         result = []
     elif operation.op == "sequence.builder.append":
@@ -144,6 +147,7 @@ def _execute_operation(
         builder.append(arguments[1])
         result = builder
     elif operation.op == "sequence.builder.apply":
+        class_count = int(operation.attribute("class_count") or "0")
         actions = decode_int_table(
             operation.attribute("actions") or "",
             max_items=128,
@@ -153,7 +157,9 @@ def _execute_operation(
             operation.attribute("emissions") or "",
             max_items=128,
         )
-        table_index = int(arguments[2]) * 2 + int(arguments[3])
+        table_index = (
+            int(arguments[2]) * class_count + int(arguments[3])
+        )
         action = actions[table_index]
         builder = list(arguments[0])  # persistent reference semantics
         if action in {2, 3}:

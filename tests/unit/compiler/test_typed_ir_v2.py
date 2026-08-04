@@ -357,6 +357,7 @@ class TypedSemanticIrV2Tests(unittest.TestCase):
                         "op1",
                         "entry",
                         "sequence.builder.create",
+                        ("%item",),
                         result_id="%builder",
                         result_type=integer_builder,
                         may_raise=True,

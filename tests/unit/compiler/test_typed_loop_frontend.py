@@ -272,6 +272,17 @@ class TypedLoopFrontendTests(unittest.TestCase):
                 self.assertIn("immutable.lookup", operations)
                 self.assertIn("sequence.builder.append", operations)
                 self.assertIn("sequence.builder.finish", operations)
+                create = next(
+                    operation
+                    for operation in captured.module.operations
+                    if operation.op == "sequence.builder.create"
+                )
+                length = next(
+                    operation
+                    for operation in captured.module.operations
+                    if operation.op == "sequence.length"
+                )
+                self.assertEqual(create.operands, (length.result_id,))
                 self.assertEqual(
                     captured.analysis.behavior.family.value,
                     "sequence_transform",

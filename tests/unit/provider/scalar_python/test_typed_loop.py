@@ -6,7 +6,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from unittest import mock
@@ -19,7 +18,6 @@ from python_udf_jit.compiler.typed_ir import (
     Exactness,
     TypeKind,
     TypeSpec,
-    build_typed_module,
 )
 from python_udf_jit.provider.scalar_python.typed_loop import (
     BackendCompilation,
@@ -27,12 +25,8 @@ from python_udf_jit.provider.scalar_python.typed_loop import (
     CompileStatus,
     RuntimeFeedback,
     TypedGuardMiss,
-    TypedLoweringError,
     TypedRegionCompileRequest,
     TypedRegionCompiler,
-    lower_unicode_fsm_physical,
-    lower_unicode_map_physical,
-    lower_unicode_count_physical,
     lower_typed_loop,
 )
 
@@ -92,37 +86,6 @@ _SPACE_RUN = re.compile(r"\s+")
 
 def collapse_space_runs(text: str) -> str:
     return _SPACE_RUN.sub(" ", text).strip()
-
-
-def _map_helper(text: str, keys: str, values: str) -> str:
-    return text.translate(str.maketrans(dict(zip(keys, values, strict=True))))
-
-
-def _fsm_helper(
-    text: str,
-    property_id: int,
-    initial_state: int,
-    descriptor: str,
-) -> str:
-    methods = ("isalnum", "isalpha", "isdecimal", "isdigit", "isnumeric", "isspace")
-    table_length = len(descriptor) // 3
-    transitions = descriptor[:table_length]
-    actions = descriptor[table_length : 2 * table_length]
-    emissions = descriptor[2 * table_length :]
-    state = initial_state
-    output: list[str] = []
-    for value in text:
-        table_index = state * 2 + int(getattr(value, methods[property_id])())
-        action = ord(actions[table_index])
-        emission = emissions[table_index]
-        if action in {2, 3}:
-            output.append(emission)
-        if action in {1, 3, 4}:
-            output.append(value)
-        if action == 4:
-            output.append(emission)
-        state = ord(transitions[table_index])
-    return "".join(output)
 
 
 class _StringSubclass(str):
@@ -248,66 +211,6 @@ class TypedLoopLoweringTests(unittest.TestCase):
         self.assertEqual(len(lowering.generated_code_hash), 64)
         self.assertNotIn("explicit_ratio", lowering.generated_source)
 
-    def test_unicode_physicalization_is_shared_across_shapes_and_properties(
-        self,
-    ) -> None:
-        methods = (
-            "isalnum",
-            "isalpha",
-            "isdecimal",
-            "isdigit",
-            "isnumeric",
-            "isspace",
-        )
-        calls: list[tuple[str, int]] = []
-
-        def helper(text: str, property_id: int) -> int:
-            calls.append((text, property_id))
-            return sum(getattr(character, methods[property_id])() for character in text)
-
-        cases = (
-            (generator_ratio, 0),
-            (explicit_ratio, 0),
-            (alpha_count, 1),
-            (space_count, 5),
-        )
-        for function, property_id in cases:
-            with self.subTest(function=function.__name__):
-                captured = capture_typed_loop(
-                    function,
-                    input_types=(EXACT_UNICODE,),
-                )
-                generic = lower_typed_loop(captured.module)
-                physical = lower_unicode_count_physical(generic, helper)
-                text = "A²⅕٣ 中\u2003"
-                self.assertEqual(physical.function(text), function(text))
-                self.assertEqual(physical.property_id, property_id)
-                self.assertEqual(calls[-1], (text, property_id))
-                self.assertEqual(
-                    {operation.operation_id for operation in captured.module.operations},
-                    {operation_id for operation_id, _ in physical.operation_lines},
-                )
-                self.assertNotIn("for ", physical.generated_source)
-                self.assertNotIn("while ", physical.generated_source)
-                self.assertNotIn(function.__name__, physical.generated_source)
-
-        self.assertEqual(len(calls), len(cases))
-
-    def test_unicode_physicalization_preserves_exact_type_guard(self) -> None:
-        lowering = lower_typed_loop(
-            capture_typed_loop(
-                alpha_count,
-                input_types=(EXACT_UNICODE,),
-            ).module
-        )
-        physical = lower_unicode_count_physical(
-            lowering,
-            lambda text, _property: sum(character.isalpha() for character in text),
-        )
-
-        with self.assertRaises(TypedGuardMiss):
-            physical.function(_StringSubclass("abc"))
-
     def test_sequence_transforms_share_generic_loop_and_type_lowering(self) -> None:
         cases = (scalar_remap, collapse_space_runs)
         for function in cases:
@@ -325,113 +228,51 @@ class TypedLoopLoweringTests(unittest.TestCase):
                 for text in ("", "  α\tβ  ", "x→y", "中文\u2003text"):
                     self.assertEqual(lowering.function(text), function(text))
 
-    def test_immutable_lookup_builder_physicalizes_without_business_mapping(
-        self,
-    ) -> None:
-        captured = capture_typed_loop(
-            scalar_remap,
-            input_types=(EXACT_UNICODE,),
-        )
-        physical = lower_unicode_map_physical(
-            lower_typed_loop(captured.module),
-            _map_helper,
-        )
+    def test_canonical_bridge_exposes_only_generic_data_primitives(self) -> None:
+        cases = (alpha_count, scalar_remap, collapse_space_runs)
+        forbidden = {
+            "_fsm_transition",
+            "_immutable_unicode_lookup",
+            "_sequence_builder_apply",
+            "_sequence_builder_append",
+            "unicode.count_property",
+            "unicode.fsm_sequence",
+            "unicode.map_sequence",
+        }
+        for function in cases:
+            with self.subTest(function=function.__name__):
+                lowering = lower_typed_loop(
+                    capture_typed_loop(
+                        function,
+                        input_types=(EXACT_UNICODE,),
+                    ).module
+                )
 
-        self.assertEqual(physical.physical_operation, "unicode.map_sequence")
-        self.assertIsNone(physical.property_id)
-        self.assertEqual(physical.function("α→β!"), "a>b!")
-        self.assertNotIn("while ", physical.generated_source)
-        self.assertEqual(
-            {operation.operation_id for operation in captured.module.operations},
-            {operation_id for operation_id, _ in physical.operation_lines},
-        )
-        with self.assertRaises(TypedGuardMiss):
-            physical.function(_StringSubclass("α"))
+                self.assertTrue(
+                    {
+                        "_typed_sequence_length",
+                        "_typed_unicode_read",
+                    }.issubset(lowering.function.__globals__)
+                )
+                self.assertFalse(
+                    any(name in lowering.generated_source for name in forbidden)
+                )
+                for text in ("", "Ab-α→β", "  a\t\n中文\u2003"):
+                    self.assertEqual(lowering.function(text), function(text))
 
-    def test_unicode_classifier_fsm_builder_physicalizes_from_tables(self) -> None:
-        captured = capture_typed_loop(
-            collapse_space_runs,
-            input_types=(EXACT_UNICODE,),
-        )
-        physical = lower_unicode_fsm_physical(
-            lower_typed_loop(captured.module),
-            _fsm_helper,
-        )
-
-        self.assertEqual(physical.physical_operation, "unicode.fsm_sequence")
-        self.assertEqual(physical.property_id, 5)
-        for text in ("", "  a\t\nb  ", "\u2003中文\u2029 text\u3000"):
-            self.assertEqual(physical.function(text), collapse_space_runs(text))
-        attributes = dict(physical.physical_attributes)
-        self.assertEqual(attributes["property"], "space")
-        self.assertEqual(attributes["state_count"], "3")
-        self.assertNotIn("collapse_space_runs", physical.generated_source)
-
-    def test_non_unicode_loop_does_not_enter_unicode_physicalization(self) -> None:
-        sequence_type = TypeSpec(
-            TypeKind.SEQUENCE,
-            "list",
-            (INT64,),
-            Exactness.EXACT,
-            "python_object",
-        )
+    def test_fsm_bridge_materializes_generic_control_and_table_lookup(self) -> None:
         lowering = lower_typed_loop(
             capture_typed_loop(
-                numeric_total,
-                input_types=(sequence_type,),
+                collapse_space_runs,
+                input_types=(EXACT_UNICODE,),
             ).module
         )
 
-        with self.assertRaisesRegex(
-            TypedLoweringError,
-            "unicode_count_kernel_shape_mismatch",
-        ):
-            lower_unicode_count_physical(lowering, lambda _text, _property: 0)
-
-    def test_physicalization_proves_the_induction_step(self) -> None:
-        captured = capture_typed_loop(
-            alpha_count,
-            input_types=(EXACT_UNICODE,),
-        )
-        module = captured.module
-        zero = next(
-            operation.result_id
-            for operation in module.operations
-            if operation.op == "constant"
-            and operation.literal is not None
-            and type(operation.literal.value) is int
-            and operation.literal.value == 0
-        )
-        operations = tuple(
-            replace(
-                operation,
-                operands=("%index", zero),
-            )
-            if operation.block_id == "body"
-            and operation.op == "binary.add"
-            and "%index" in operation.operands
-            else operation
-            for operation in module.operations
-        )
-        malformed = build_typed_module(
-            function_id=module.function_id,
-            entry_block=module.entry_block,
-            input_types=module.input_types,
-            output_type=module.output_type,
-            blocks=module.blocks,
-            control_edges=module.control_edges,
-            operations=operations,
-            return_operation_id=module.return_operation_id,
-        )
-
-        with self.assertRaisesRegex(
-            TypedLoweringError,
-            "unicode_count_induction_increment_invalid",
-        ):
-            lower_unicode_count_physical(
-                lower_typed_loop(malformed),
-                lambda _text, _property: 0,
-            )
+        self.assertIn("_typed_table_get", lowering.generated_source)
+        self.assertIn("_typed_builder_append", lowering.generated_source)
+        self.assertIn("if ", lowering.generated_source)
+        self.assertNotIn("_typed_builder_apply", lowering.generated_source)
+        self.assertNotIn("_typed_fsm_transition", lowering.generated_source)
 
 
 class TypedRegionCompilerTests(unittest.TestCase):
@@ -695,14 +536,29 @@ class CinderXTypedLoopBackendTests(unittest.TestCase):
         cinderx_module.jit = jit_module
         return {"cinderx": cinderx_module, "cinderx.jit": jit_module}
 
-    def test_unicode_helper_requires_the_specialized_hir_opcode(self) -> None:
+    def test_generic_typed_entry_owns_unicode_reduction_lowering(self) -> None:
         jit_module = ModuleType("cinderx.jit")
-        jit_module._udf_unicode_count_property = lambda text, _property: sum(
-            character.isalpha() for character in text
+        calls = []
+
+        def compile_typed_region(function, semantic, plan):
+            calls.append((function, semantic, plan))
+            return True
+
+        jit_module.compile_typed_region = compile_typed_region
+        # Keeping the retired helper visible proves that the adapter no longer
+        # selects the whole-algorithm shortcut when the generic entry exists.
+        jit_module._udf_unicode_count_property = lambda *_args: self.fail(
+            "whole-algorithm Unicode count helper must not be called"
         )
-        jit_module.force_compile = lambda _function: True
         jit_module.get_function_hir_opcode_counts = (
-            lambda _function: {"UnicodeCountProperty": 1}
+            lambda _function: {
+                "Phi": 2,
+                "CondBranch": 1,
+                "IntBinaryOp": 2,
+                "LoadField": 1,
+                "UnicodeRead": 1,
+                "UnicodeClassify": 1,
+            }
         )
         jit_module.is_jit_compiled = lambda _function: True
 
@@ -710,12 +566,19 @@ class CinderXTypedLoopBackendTests(unittest.TestCase):
             result = CinderXTypedLoopBackend().compile(self.lowering)
 
         self.assertTrue(result.jit_compiled)
-        self.assertEqual(result.execution_mode, "cinderx_unicode_property_hir")
-        self.assertIsNotNone(result.physical_lowering)
+        self.assertEqual(result.execution_mode, "cinderx_generic_typed_hir")
+        self.assertEqual(len(calls), 1)
+        _, semantic, plan = calls[0]
+        self.assertEqual(semantic["semantic_hash"], self.lowering.module_hash)
+        self.assertEqual(plan["plan_hash"], self.lowering.plan.plan_hash)
+        operations = {operation["op"] for operation in semantic["operations"]}
+        self.assertIn("sequence.get", operations)
+        self.assertIn("unicode.property", operations)
+        self.assertNotIn("unicode.count_property", operations)
 
-    def test_generic_typed_entry_is_used_when_physical_helper_is_absent(self) -> None:
+    def test_generic_typed_entry_does_not_prescribe_backend_hir_shape(self) -> None:
         jit_module = ModuleType("cinderx.jit")
-        jit_module.compile_typed_region = lambda _function, _plan: True
+        jit_module.compile_typed_region = lambda _function, _semantic, _plan: True
         jit_module.get_function_hir_opcode_counts = lambda _function: {"Phi": 2}
         jit_module.is_jit_compiled = lambda _function: True
 
@@ -723,29 +586,42 @@ class CinderXTypedLoopBackendTests(unittest.TestCase):
             result = CinderXTypedLoopBackend().compile(self.lowering)
 
         self.assertTrue(result.jit_compiled)
-        self.assertEqual(result.execution_mode, "cinderx_typed_hir_adapter")
-        self.assertIsNone(result.physical_lowering)
+        self.assertEqual(result.execution_mode, "cinderx_generic_typed_hir")
+        self.assertEqual(result.hir_opcode_counts, (("Phi", 2),))
 
-    def test_sequence_helpers_require_the_corresponding_generic_hir_opcode(
-        self,
-    ) -> None:
+    def test_sequence_patterns_use_the_same_generic_hir_entry(self) -> None:
         cases = (
             (
                 scalar_remap,
-                "_udf_unicode_map_sequence",
-                _map_helper,
-                "UnicodeMapSequence",
-                "cinderx_unicode_map_hir",
+                {
+                    "CondBranch": 1,
+                    "IntBinaryOp": 1,
+                    "Phi": 2,
+                    "LoadField": 1,
+                    "PrimitiveTableLookup": 1,
+                    "SequenceBuilderAppend": 1,
+                    "SequenceBuilderCreate": 1,
+                    "SequenceBuilderFinish": 1,
+                    "UnicodeRead": 1,
+                },
             ),
             (
                 collapse_space_runs,
-                "_udf_unicode_fsm_sequence",
-                _fsm_helper,
-                "UnicodeFsmSequence",
-                "cinderx_unicode_fsm_hir",
+                {
+                    "CondBranch": 2,
+                    "IntBinaryOp": 5,
+                    "Phi": 3,
+                    "LoadField": 1,
+                    "PrimitiveTableGet": 3,
+                    "SequenceBuilderAppend": 2,
+                    "SequenceBuilderCreate": 1,
+                    "SequenceBuilderFinish": 1,
+                    "UnicodeRead": 1,
+                    "UnicodeClassify": 1,
+                },
             ),
         )
-        for function, helper_name, helper, opcode, mode in cases:
+        for function, required_counts in cases:
             with self.subTest(function=function.__name__):
                 lowering = lower_typed_loop(
                     capture_typed_loop(
@@ -754,10 +630,17 @@ class CinderXTypedLoopBackendTests(unittest.TestCase):
                     ).module
                 )
                 jit_module = ModuleType("cinderx.jit")
-                setattr(jit_module, helper_name, helper)
-                jit_module.force_compile = lambda _function: True
+                documents = []
+                jit_module.compile_typed_region = (
+                    lambda _function, semantic, plan: documents.append(
+                        (semantic, plan)
+                    )
+                    or True
+                )
                 jit_module.get_function_hir_opcode_counts = (
-                    lambda _function, opcode=opcode: {opcode: 1}
+                    lambda _function, required_counts=required_counts: dict(
+                        required_counts
+                    )
                 )
                 jit_module.is_jit_compiled = lambda _function: True
 
@@ -765,39 +648,64 @@ class CinderXTypedLoopBackendTests(unittest.TestCase):
                     result = CinderXTypedLoopBackend().compile(lowering)
 
                 self.assertTrue(result.jit_compiled)
-                self.assertEqual(result.execution_mode, mode)
-                self.assertIsNotNone(result.physical_lowering)
+                self.assertEqual(result.execution_mode, "cinderx_generic_typed_hir")
+                self.assertEqual(len(documents), 1)
+                semantic_operations = {
+                    operation["op"]
+                    for operation in documents[0][0]["operations"]
+                }
+                self.assertFalse(
+                    semantic_operations
+                    & {
+                        "unicode.count_property",
+                        "unicode.map_sequence",
+                        "unicode.fsm_sequence",
+                    }
+                )
 
-    def test_builder_pattern_does_not_fall_back_to_quadratic_generic_code(
-        self,
-    ) -> None:
+    def test_unseen_unicode_property_needs_no_adapter_change(self) -> None:
         lowering = lower_typed_loop(
             capture_typed_loop(
-                scalar_remap,
+                space_count,
                 input_types=(EXACT_UNICODE,),
             ).module
         )
         jit_module = ModuleType("cinderx.jit")
-        jit_module.compile_typed_region = lambda _function, _plan: True
+        documents = []
+        jit_module.compile_typed_region = (
+            lambda _function, semantic, plan: documents.append((semantic, plan))
+            or True
+        )
+        jit_module.get_function_hir_opcode_counts = lambda _function: {
+            "CondBranch": 1,
+            "IntBinaryOp": 2,
+            "Phi": 2,
+            "LoadField": 1,
+            "UnicodeRead": 1,
+            "UnicodeClassify": 1,
+        }
+        jit_module.is_jit_compiled = lambda _function: True
 
         with mock.patch.dict(sys.modules, self._modules(jit_module)):
             result = CinderXTypedLoopBackend().compile(lowering)
 
-        self.assertFalse(result.jit_compiled)
-        self.assertEqual(
-            result.execution_mode,
-            "cinderx_sequence_transform_intrinsic",
-        )
+        self.assertTrue(result.jit_compiled)
+        properties = {
+            dict(operation["attributes"])["property"]
+            for operation in documents[0][0]["operations"]
+            if operation["op"] == "unicode.property"
+        }
+        self.assertEqual(properties, {"space"})
 
     def test_backend_rejection_is_reported_without_claiming_jit_success(self) -> None:
         jit_module = ModuleType("cinderx.jit")
-        jit_module.compile_typed_region = lambda _function, _plan: False
+        jit_module.compile_typed_region = lambda _function, _semantic, _plan: False
 
         with mock.patch.dict(sys.modules, self._modules(jit_module)):
             result = CinderXTypedLoopBackend().compile(self.lowering)
 
         self.assertFalse(result.jit_compiled)
-        self.assertEqual(result.execution_mode, "cinderx_typed_hir_adapter")
+        self.assertEqual(result.execution_mode, "cinderx_generic_typed_hir")
 
 
 if __name__ == "__main__":

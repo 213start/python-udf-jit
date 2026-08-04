@@ -1563,6 +1563,7 @@ class _ModuleBuilder:
         builder = self.operation(
             "entry",
             "sequence.builder.create",
+            (length,),
             result_type=UNICODE_BUILDER,
             may_raise=True,
             source_offset=plan.setup_source_line,

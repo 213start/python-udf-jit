@@ -307,7 +307,7 @@ def _verify_operation_schema(
     elif operation.op == "sequence.builder.create":
         _exact_attributes(operation, attributes, set())
         if (
-            operation.operands
+            operand_types != (INT64,)
             or operation.result_type is None
             or operation.result_type.kind is not TypeKind.BUILDER
         ):
