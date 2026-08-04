@@ -152,6 +152,13 @@ def unsupported_side_effect(items: list[int]) -> int:
     return total
 
 
+def guarded_bound_ratio(text: str, *, minimum: float) -> bool:
+    if not text:
+        return False
+    accepted = sum(1 for character in text if character.isalnum())
+    return accepted / len(text) >= minimum
+
+
 class TypedLoopFrontendTests(unittest.TestCase):
     @staticmethod
     def _integer_sequence() -> TypeSpec:
@@ -195,6 +202,52 @@ class TypedLoopFrontendTests(unittest.TestCase):
                 execute_typed_module(explicit.module, (text,)),
                 explicit_ratio(text),
             )
+
+    def test_bound_argument_and_guarded_region_normalize_generically(self) -> None:
+        captured = capture_typed_loop(
+            guarded_bound_ratio,
+            input_types=(EXACT_UNICODE,),
+            bound_arguments={"minimum": 0.5},
+            allow_guarded_region=True,
+        )
+
+        self.assertIsNotNone(captured.entry_guard)
+        self.assertFalse(captured.entry_guard.matches(("",)))
+        self.assertTrue(captured.entry_guard.matches(("abc-",)))
+        self.assertEqual(
+            execute_typed_module(captured.module, ("abc-",)),
+            guarded_bound_ratio("abc-", minimum=0.5),
+        )
+        self.assertIn(
+            "bound_argument",
+            {dependency.kind for dependency in captured.runtime_guard.dependencies},
+        )
+
+    def test_guarded_region_requires_explicit_opt_in(self) -> None:
+        with self.assertRaises(TypedCaptureError):
+            capture_typed_loop(
+                guarded_bound_ratio,
+                input_types=(EXACT_UNICODE,),
+                bound_arguments={"minimum": 0.5},
+            )
+
+    def test_bound_argument_changes_semantic_identity(self) -> None:
+        lower = capture_typed_loop(
+            guarded_bound_ratio,
+            input_types=(EXACT_UNICODE,),
+            bound_arguments={"minimum": 0.2},
+            allow_guarded_region=True,
+        )
+        higher = capture_typed_loop(
+            guarded_bound_ratio,
+            input_types=(EXACT_UNICODE,),
+            bound_arguments={"minimum": 0.8},
+            allow_guarded_region=True,
+        )
+
+        self.assertNotEqual(lower.module.semantic_hash, higher.module.semantic_hash)
+        self.assertTrue(lower.runtime_guard.matches())
+        self.assertTrue(higher.runtime_guard.matches())
 
     def test_numeric_loop_uses_same_frontend_without_text_knowledge(self) -> None:
         sequence_type = TypeSpec(

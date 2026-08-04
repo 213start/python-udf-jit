@@ -165,8 +165,14 @@ class WorkerDiagnosticRuntime:
         self._typed_regions_recorded: set[str] = set()
         self._analysis = None
         self._partial = False
+        selector_kind, _, selector_value = policy.selector.partition(":")
         self._selected = policy.selector.startswith(
             ("artifact:", "candidate:")
+        ) or (
+            selector_kind == "udf"
+            and code_identity_from_code(user_function.__code__).sha256.startswith(
+                selector_value
+            )
         )
         self._perf_recorded = False
         self._finalized = False
@@ -326,13 +332,16 @@ class WorkerDiagnosticRuntime:
         neither imports this module nor builds any of these documents.
         """
 
+        module = request.region
+        selector_kind, _, selector_value = self._selector.partition(":")
+        if selector_kind == "region":
+            self._selected = module.semantic_hash.startswith(selector_value)
         if (
             not self._selected
             or self.policy.profile is not DiagnosticProfile.FULL
             or decision.status.value not in {"compiled", "unsupported"}
         ):
             return
-        module = request.region
         try:
             analysis = decision.worker_analysis
         except Exception:
@@ -784,6 +793,40 @@ class WorkerDiagnosticRuntime:
         finally:
             with self._lock:
                 self._typed_regions_recording.discard(module.semantic_hash)
+
+    def record_typed_runtime_summary(
+        self,
+        document: dict[str, object],
+    ) -> bool:
+        """Attach bounded Worker lifecycle counters to a typed diagnostic bundle."""
+
+        if (
+            not self._selected
+            or self.policy.profile is not DiagnosticProfile.FULL
+        ):
+            return False
+        allowed = {
+            "calls",
+            "compile_attempts",
+            "compile_successes",
+            "execution_mode",
+            "fallbacks",
+            "guard_misses",
+            "hits",
+            "reason_code",
+            "schema_version",
+            "semantic_hash",
+            "wrapper_depth",
+        }
+        if set(document) != allowed:
+            self.mark_partial()
+            return False
+        return self._artifact(
+            "typed/runtime-summary.json",
+            "application/json",
+            document,
+            layer="runtime",
+        )
 
     def record_compilation(
         self,

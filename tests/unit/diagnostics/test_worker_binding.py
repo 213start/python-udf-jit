@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 from python_udf_jit.compiler.typed_frontend import capture_typed_loop
+from python_udf_jit.compiler.identity import code_identity_from_code
 from python_udf_jit.compiler.typed_ir import EXACT_UNICODE
 from python_udf_jit.diagnostics.bundle import (
     read_artifact_bytes,
@@ -573,6 +574,23 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
                 decision.variant("A-中"),
                 _typed_alpha_ratio("A-中"),
             )
+            self.assertTrue(
+                runtime.record_typed_runtime_summary(
+                    {
+                        "calls": 128,
+                        "compile_attempts": 1,
+                        "compile_successes": 1,
+                        "execution_mode": "test_typed_diagnostic",
+                        "fallbacks": 1,
+                        "guard_misses": 0,
+                        "hits": 127,
+                        "reason_code": "typed_loop_hit",
+                        "schema_version": 1,
+                        "semantic_hash": captured.module.semantic_hash,
+                        "wrapper_depth": 2,
+                    }
+                )
+            )
             bundle_ref = runtime.finalize()
             self.assertIsNotNone(bundle_ref)
             bundle = read_bundle(bundle_ref.path)
@@ -607,6 +625,7 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
                 "typed/cinderx/lir.txt",
                 "typed/cinderx/machine-ranges.txt",
                 "typed/operation-provenance.json",
+                "typed/runtime-summary.json",
                 "typed/chain-status.json",
             }.issubset(paths)
         )
@@ -625,6 +644,64 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
         )
         self.assertTrue(
             any(entry["machine_range_ids"] for entry in provenance["entries"])
+        )
+
+    def test_udf_selector_enables_typed_worker_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code_sha256 = code_identity_from_code(
+                _typed_alpha_ratio.__code__
+            ).sha256
+            policy = resolve_diagnostic_policy(
+                {
+                    "UDFJIT_DIAGNOSTICS": "full",
+                    "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
+                    "UDFJIT_DIAGNOSTIC_FILTER": f"udf:{code_sha256[:16]}",
+                    "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                    "UDFJIT_DIAGNOSTIC_PERF": "off",
+                    "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                    "UDFJIT_DIAGNOSTIC_MAX_BYTES": str(4 * 1024 * 1024),
+                },
+                DiagnosticRuntimeContext(
+                    dedicated_worker=True,
+                    workspace_root=root / "workspace",
+                    home_root=root / "home",
+                ),
+            )
+            runtime = WorkerDiagnosticRuntime(
+                policy,
+                run_id="run-a",
+                runtime_mode="auto",
+                process_key="worker-a",
+                process_id=os.getpid(),
+                user_function=_typed_alpha_ratio,
+            )
+            captured = capture_typed_loop(
+                _typed_alpha_ratio,
+                input_types=(EXACT_UNICODE,),
+            )
+            decision = TypedRegionCompiler(
+                _GenericTypedDiagnosticBackend(),
+                call_threshold=1,
+                negative_ttl_ns=1_000_000_000,
+                diagnostic_sink=runtime,
+            ).compile(
+                TypedRegionCompileRequest(
+                    captured.module,
+                    RuntimeFeedback(call_count=1, deopt_count=0),
+                    captured.analysis.to_documents(),
+                    captured.runtime_guard,
+                )
+            )
+            bundle_ref = runtime.finalize()
+            self.assertEqual(decision.status, CompileStatus.COMPILED)
+            self.assertIsNotNone(bundle_ref)
+            bundle = read_bundle(bundle_ref.path)
+            paths = {artifact.path for artifact in bundle.artifacts}
+
+        self.assertIn(
+            "typed/semantic-v2.json",
+            paths,
         )
 
     def test_full_typed_path_retries_after_unrecordable_guard_decision(

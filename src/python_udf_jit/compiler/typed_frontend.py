@@ -3,6 +3,7 @@ from __future__ import annotations
 import __future__
 import ast
 import builtins
+import copy
 import functools
 import hashlib
 import inspect
@@ -10,6 +11,7 @@ import json
 import sys
 import textwrap
 import types
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from python_udf_jit.compiler.core_ir import (
@@ -83,6 +85,31 @@ class TypedCaptureResult:
     normalized_pattern: str
     dependency_hashes: tuple[str, ...]
     runtime_guard: "TypedRuntimeGuard"
+    entry_guard: "TypedEntryGuard | None" = None
+
+
+@dataclass(frozen=True)
+class TypedEntryGuard:
+    """A proven outer side exit that protects one compiled loop region."""
+
+    kind: str
+    input_type: TypeSpec
+
+    def matches(self, inputs: tuple[object, ...]) -> bool:
+        if len(inputs) != 1:
+            return False
+        value = inputs[0]
+        exact_type = {
+            "str": str,
+            "list": list,
+            "tuple": tuple,
+            "range": range,
+        }.get(self.input_type.name)
+        if exact_type is None or type(value) is not exact_type:
+            return False
+        if self.kind == "non_empty_sequence":
+            return len(value) > 0  # type: ignore[arg-type]
+        return False
 
 
 @dataclass(frozen=True)
@@ -156,6 +183,8 @@ class _RuntimeDependency:
             if isinstance(namespace, dict):
                 return namespace[self.name]
             return getattr(namespace, self.name)
+        if self.kind == "bound_argument":
+            return self.expected
         raise LookupError(self.kind)
 
     def matches(self, function: types.FunctionType) -> bool:
@@ -348,6 +377,7 @@ def _portable_dependency(
 def _signature_layout(
     function: types.FunctionType,
     node: ast.FunctionDef,
+    bound_arguments: Mapping[str, object],
 ) -> _SignatureLayout:
     positional_names = tuple(
         argument.arg for argument in (*node.args.posonlyargs, *node.args.args)
@@ -390,11 +420,17 @@ def _signature_layout(
         or set(keyword_defaults) != set(live_keyword_defaults)
     ):
         _fail("function_default_layout_mismatch")
+    all_names = {*positional_names, *keyword_names}
+    unknown_bound = sorted(set(bound_arguments) - all_names)
+    if unknown_bound:
+        _fail("bound_argument_unknown", unknown_bound[0])
+    if positional_names and positional_names[0] in bound_arguments:
+        _fail("bound_argument_input", positional_names[0])
     for name in positional_names[1:]:
-        if name not in live_positional_defaults:
+        if name not in live_positional_defaults and name not in bound_arguments:
             _fail("additional_parameter_required", name)
     for name in keyword_names:
-        if name not in live_keyword_defaults:
+        if name not in live_keyword_defaults and name not in bound_arguments:
             _fail("additional_parameter_required", name)
     return _SignatureLayout(
         live_positional_defaults,
@@ -405,6 +441,7 @@ def _signature_layout(
 def _constant_environment(
     function: types.FunctionType,
     layout: _SignatureLayout,
+    bound_arguments: Mapping[str, object],
 ) -> tuple[dict[str, object], tuple[_RuntimeDependency, ...]]:
     defaults = function.__defaults__ or ()
     environment: dict[str, object] = {}
@@ -438,6 +475,12 @@ def _constant_environment(
             )
         )
         environment[name] = value
+    for name in sorted(bound_arguments):
+        value = bound_arguments[name]
+        dependencies.append(
+            _portable_dependency("bound_argument", name, None, value)
+        )
+        environment[name] = value
     for index, (name, cell) in enumerate(
         zip(
             function.__code__.co_freevars,
@@ -463,6 +506,77 @@ def _constant_environment(
             )
             environment[name] = value
     return environment, tuple(dependencies)
+
+
+def _strip_non_empty_side_exit(
+    statements: list[ast.stmt],
+    *,
+    input_name: str,
+    input_type: TypeSpec,
+    allow_guarded_region: bool,
+) -> tuple[list[ast.stmt], TypedEntryGuard | None]:
+    if not statements:
+        return statements, None
+    candidate = statements[0]
+    if not (
+        isinstance(candidate, ast.If)
+        and not candidate.orelse
+        and isinstance(candidate.test, ast.UnaryOp)
+        and isinstance(candidate.test.op, ast.Not)
+        and isinstance(candidate.test.operand, ast.Name)
+        and candidate.test.operand.id == input_name
+        and len(candidate.body) == 1
+        and isinstance(candidate.body[0], ast.Return)
+    ):
+        return statements, None
+    if not allow_guarded_region:
+        return statements, None
+    return statements[1:], TypedEntryGuard("non_empty_sequence", input_type)
+
+
+class _ReplaceLoadedName(ast.NodeTransformer):
+    def __init__(self, name: str, replacement: ast.expr) -> None:
+        self._name = name
+        self._replacement = replacement
+        self.replacements = 0
+
+    def visit_Name(self, node: ast.Name):  # noqa: N802 - ast API
+        if isinstance(node.ctx, ast.Load) and node.id == self._name:
+            self.replacements += 1
+            return ast.copy_location(
+                copy.deepcopy(self._replacement),
+                node,
+            )
+        return node
+
+
+def _inline_single_reduction_binding(
+    statements: list[ast.stmt],
+) -> list[ast.stmt]:
+    """Normalize ``tmp = sum(...); return f(tmp)`` into one return expression."""
+
+    if (
+        len(statements) != 2
+        or not isinstance(statements[0], ast.Assign)
+        or len(statements[0].targets) != 1
+        or not isinstance(statements[0].targets[0], ast.Name)
+        or not isinstance(statements[1], ast.Return)
+        or statements[1].value is None
+    ):
+        return statements
+    assignment = statements[0]
+    try:
+        _contains_sum(assignment.value)
+    except TypedCaptureError:
+        return statements
+    replacer = _ReplaceLoadedName(
+        assignment.targets[0].id,
+        assignment.value,
+    )
+    value = replacer.visit(ast.fix_missing_locations(statements[1].value))
+    if replacer.replacements != 1 or not isinstance(value, ast.expr):
+        return statements
+    return [ast.copy_location(ast.Return(value), statements[1])]
 
 
 def _builtin_dependencies(
@@ -1159,11 +1273,17 @@ def capture_typed_loop(
     function: types.FunctionType,
     *,
     input_types: tuple[TypeSpec, ...],
+    bound_arguments: Mapping[str, object] | None = None,
+    allow_guarded_region: bool = False,
 ) -> TypedCaptureResult:
     if type(function) is not types.FunctionType:
         _fail("function_required")
     if len(input_types) != 1 or input_types[0].kind is not TypeKind.SEQUENCE:
         _fail("single_sequence_input_required")
+    if bound_arguments is None:
+        bound_arguments = {}
+    elif not isinstance(bound_arguments, Mapping):
+        _fail("bound_arguments_invalid")
     try:
         source_lines, source_first_line = inspect.getsourcelines(function)
     except (OSError, TypeError):
@@ -1175,9 +1295,13 @@ def capture_typed_loop(
     if not positional:
         _fail("function_input_missing")
     input_name = positional[0].arg
-    layout = _signature_layout(function, node)
+    layout = _signature_layout(function, node, bound_arguments)
     identity = code_identity(function)
-    constants, constant_dependencies = _constant_environment(function, layout)
+    constants, constant_dependencies = _constant_environment(
+        function,
+        layout,
+        bound_arguments,
+    )
     dependencies = (
         _RuntimeDependency(
             "code",
@@ -1191,6 +1315,13 @@ def capture_typed_loop(
     )
     runtime_guard = TypedRuntimeGuard(function, dependencies)
     statements = _strip_docstring(list(node.body))
+    statements, entry_guard = _strip_non_empty_side_exit(
+        statements,
+        input_name=input_name,
+        input_type=input_types[0],
+        allow_guarded_region=allow_guarded_region,
+    )
+    statements = _inline_single_reduction_binding(statements)
     if len(statements) == 1 and isinstance(statements[0], ast.Return) and statements[0].value is not None:
         plan = _parse_generator(
             input_name,
@@ -1222,4 +1353,5 @@ def capture_typed_loop(
         "iterator_reduction",
         runtime_guard.dependency_hashes,
         runtime_guard,
+        entry_guard,
     )

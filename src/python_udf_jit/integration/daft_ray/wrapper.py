@@ -26,6 +26,18 @@ class FallbackOnlyWrapper:
     logical_schema: str | None = None
     usage_context: str | None = None
     _worker_adapter: Any = field(default=None, init=False, repr=False, compare=False)
+    _typed_loop_adapter: Any = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _typed_loop_terminal_bypass: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _serialization_version: int = field(
         default=WRAPPER_SERIALIZATION_VERSION,
         init=False,
@@ -81,6 +93,8 @@ class FallbackOnlyWrapper:
     def __getstate__(self) -> dict[str, Any]:
         state = dict(self.__dict__)
         state["_worker_adapter"] = None
+        state["_typed_loop_adapter"] = None
+        state["_typed_loop_terminal_bypass"] = False
         state["_serialization_version"] = WRAPPER_SERIALIZATION_VERSION
         return state
 
@@ -98,6 +112,8 @@ class FallbackOnlyWrapper:
             raise ValueError("wrapper_serialization_version_unsupported")
         self.__dict__.update(state)
         self._worker_adapter = None
+        self._typed_loop_adapter = None
+        self._typed_loop_terminal_bypass = False
 
     def scalar_call_view(self) -> ScalarCallView:
         if self.logical_schema is None or self.usage_context is None:
@@ -126,9 +142,41 @@ class FallbackOnlyWrapper:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if (
             os.environ.get("UDFJIT_MODE", "off") != "auto"
-            or not self.carrier.finalized
             or self.logical_schema is None
         ):
+            return self._fallback(args, kwargs, "u2_fallback_only")
+        schema = self.logical_schema.lower()
+        if "string" in schema and "float64" not in schema:
+            if self._typed_loop_terminal_bypass:
+                return self.original_callable(*args, **kwargs)
+            typed_adapter = self._typed_loop_adapter
+            if (
+                typed_adapter is not None
+                and getattr(typed_adapter, "owner_pid", None) != os.getpid()
+            ):
+                typed_adapter = None
+                self._typed_loop_adapter = None
+            if typed_adapter is None:
+                try:
+                    from python_udf_jit.integration.daft_ray.typed_loop_worker import (
+                        build_worker_typed_loop_adapter,
+                    )
+
+                    typed_adapter = build_worker_typed_loop_adapter(self)
+                    self._typed_loop_adapter = typed_adapter
+                except Exception as error:
+                    return self._fallback(
+                        args,
+                        kwargs,
+                        f"typed_loop_adapter_init_failed:{type(error).__name__}",
+                    )
+            outcome = typed_adapter.invoke(args, kwargs)
+            if outcome.handled:
+                return outcome.value
+            if outcome.terminal:
+                self._typed_loop_terminal_bypass = True
+            return self._fallback(args, kwargs, outcome.reason_code)
+        if not self.carrier.finalized:
             return self._fallback(args, kwargs, "u2_fallback_only")
         adapter = self._worker_adapter
         if adapter is not None and getattr(adapter, "owner_pid", None) != os.getpid():

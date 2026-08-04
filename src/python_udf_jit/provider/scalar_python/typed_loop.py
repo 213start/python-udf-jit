@@ -235,6 +235,14 @@ class CinderXTypedLoopBackend:
         lowering: TypedLoopLowering,
         diagnostic_sink: TypedLoopDiagnosticSink | None,
     ) -> BackendCompilation:
+        import cinderx
+
+        initializer = getattr(cinderx, "init", None)
+        initialized = getattr(cinderx, "is_initialized", None)
+        if callable(initializer) and (
+            not callable(initialized) or not initialized()
+        ):
+            initializer()
         import cinderx.jit
 
         unicode_count = getattr(

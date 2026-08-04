@@ -55,6 +55,18 @@ class _Adapter:
         return self.result
 
 
+class _TypedAdapter:
+    owner_pid = os.getpid()
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = 0
+
+    def invoke(self, _args, _kwargs):
+        self.calls += 1
+        return self.outcome
+
+
 def make_wrapper(original=operator.add):
     return FallbackOnlyWrapper(
         candidate_id="candidate-test",
@@ -87,6 +99,18 @@ class WrapperSerializationTest(unittest.TestCase):
 
         self.assertIs(wrapper._worker_adapter, adapter)
         self.assertIsNone(restored._worker_adapter)
+
+    def test_pickle_roundtrip_drops_process_local_typed_loop_adapter(self):
+        wrapper = make_wrapper()
+        adapter = object()
+        wrapper._typed_loop_adapter = adapter
+        wrapper._typed_loop_terminal_bypass = True
+
+        restored = pickle.loads(pickle.dumps(wrapper))
+
+        self.assertIs(wrapper._typed_loop_adapter, adapter)
+        self.assertIsNone(restored._typed_loop_adapter)
+        self.assertFalse(restored._typed_loop_terminal_bypass)
 
     def test_serialized_state_declares_the_current_version(self):
         state = make_wrapper().__getstate__()
@@ -207,6 +231,72 @@ class WrapperSerializationTest(unittest.TestCase):
                 wrapper(21)
 
         self.assertEqual(original.calls, 0)
+
+    def test_auto_string_schema_uses_typed_loop_result(self):
+        from python_udf_jit.integration.daft_ray.typed_loop_worker import (
+            TypedLoopInvocation,
+        )
+
+        original = CountingCallable()
+        wrapper = make_wrapper(original)
+        wrapper.finalize("{'text': 'String'}", "filter")
+        adapter = _TypedAdapter(TypedLoopInvocation(True, 42, "typed_loop_hit"))
+        wrapper._typed_loop_adapter = adapter
+
+        with mock.patch.dict(os.environ, {"UDFJIT_MODE": "auto"}):
+            result = wrapper(21)
+
+        self.assertEqual(result, 42)
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(original.calls, 0)
+
+    def test_auto_string_schema_falls_back_once_when_typed_loop_declines(self):
+        from python_udf_jit.integration.daft_ray.typed_loop_worker import (
+            TypedLoopInvocation,
+        )
+
+        original = CountingCallable()
+        wrapper = make_wrapper(original)
+        wrapper.finalize("{'text': 'String'}", "filter")
+        adapter = _TypedAdapter(
+            TypedLoopInvocation(False, reason_code="predicate_unsupported")
+        )
+        wrapper._typed_loop_adapter = adapter
+
+        with mock.patch.dict(os.environ, {"UDFJIT_MODE": "auto"}):
+            result = wrapper(21)
+
+        self.assertEqual(result, 42)
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(original.calls, 1)
+
+    def test_terminal_typed_decline_bypasses_future_adapter_and_events(self):
+        from python_udf_jit.integration.daft_ray.typed_loop_worker import (
+            TypedLoopInvocation,
+        )
+
+        original = CountingCallable()
+        wrapper = make_wrapper(original)
+        wrapper.finalize("{'text': 'String'}", "filter")
+        adapter = _TypedAdapter(
+            TypedLoopInvocation(
+                False,
+                reason_code="predicate_unsupported",
+                terminal=True,
+            )
+        )
+        wrapper._typed_loop_adapter = adapter
+
+        with mock.patch.dict(os.environ, {"UDFJIT_MODE": "auto"}):
+            with mock.patch(
+                "python_udf_jit.integration.daft_ray.wrapper.events.try_emit"
+            ) as emit:
+                self.assertEqual(wrapper(21), 42)
+                self.assertEqual(wrapper(22), 44)
+
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(original.calls, 2)
+        emit.assert_called_once()
 
 
 if __name__ == "__main__":
