@@ -13,10 +13,10 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 (Status) | Partially Implemented（P0 targeted validation complete） |
+| 状态 (Status) | Implemented for the exact-str generic typed-region subset |
 | 作者 (Authors) | Python UDF JIT 项目组 |
 | 创建日期 (Created) | 2026-08-03 |
-| 更新日期 (Updated) | 2026-08-03 |
+| 更新日期 (Updated) | 2026-08-04 |
 | 相关 Issue/PR | TBD；进入 Reviewing 前必须创建并回填 |
 | 上游设计 | `docs/design/2026-07-13-python-udf-jit-architecture.md` |
 | 证据输入 | `docs/reports/2026-08-03-fineweb-udfjit-cinderx-backend-opportunity.md`、`docs/reports/2026-08-03-generic-loop-type-specialization-validation.md` |
@@ -27,6 +27,7 @@
 | --- | --- | --- | --- |
 | V0.1 | 2026-08-03 | Python UDF JIT 项目组 | 首次提出“行为分类 × 类型系统 × 通用 Pass”设计，废弃业务语义 opcode 方案。 |
 | V0.2 | 2026-08-03 | Python UDF JIT 项目组 | 完成 P0 typed CFG/SSA、循环/归约分析、Unicode property backend、全链路诊断和穿刺 A/B；P1 builder/FSM/full-pipeline 仍开放。 |
+| V0.3 | 2026-08-04 | Python UDF JIT 项目组 | 删除 whole-loop helper 路径，完成 CinderX generic HIR/LIR、immutable lookup、bool-class FSM、sequence builder、closure devirtualization、generator failure cache、全链诊断和 FineWeb 200K A/B。 |
 
 ## 0.4 Keywords 关键词
 
@@ -491,8 +492,8 @@ Constant pattern/replacement validation
 | P0-A | Core IR v2：block arg/phi、loop、typed iterator、参数化类型、参考解释器 | 数值循环、显式字符计数 | 建立通用语义基线 |
 | P0-B | ClosureTargetPropagation、GeneratorInline、LoopCanonicalization、ReductionRecognition | alphanumeric + 非文本 reduction | 消除 generator/boxing/dispatch |
 | P0-C | Worker HIR Builder、exact type guard、AutoJIT/ROI 接入、失败负缓存 | 多类型 iterator loop | 形成真实 UDF JIT→CinderX 链 |
-| P1-A | ImmutableLookupSpecialization、SequenceBuilderLowering | punctuation + 枚举/bytes 转换 | 覆盖查表和可变长输出 |
-| P1-B | ConstantRegexAutomaton 的受限子集 | whitespace + 非文本协议扫描 | 覆盖状态机和常量模式 |
+| P1-A | ImmutableLookupSpecialization、SequenceBuilderLowering | punctuation + 无关标量映射 | 已完成 exact-str / Unicode scalar subset |
+| P1-B | Bool-class FSM + SequenceBuilderLowering | whitespace + 无关 run collapse | 已完成；更一般分类类型仍分期扩展 |
 | P2 | 更多容器、复杂异常边、OSR/loop versioning | 跨业务 corpus | 扩展覆盖率 |
 
 历史 stage share 下，alphanumeric 与 punctuation 两项原型合计对应约 20.07% 的 E2E 时间下降投影
@@ -634,7 +635,7 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 更新 `docs/USERGUIDE.md` 的诊断章节，增加 Behavior/Type/Pattern Analysis 产物说明；新增开发者文档
 “Semantic Core IR v2 节点与 Pass 编写规则”。普通 UDF 用户手册不暴露内部 IR 或 CinderX SPI。
 
-## 3.13 P0 实现状态
+## 3.13 实现状态
 
 | 设计项 | 状态 | 实现位置 |
 | --- | --- | --- |
@@ -643,15 +644,16 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 | generator/显式循环的通用 capture | 已实现 P0 subset | `compiler/typed_frontend.py` |
 | Worker ROI、重分析、正/负缓存、规范 lowering | 已实现 | `provider/scalar_python/typed_loop.py` |
 | 默认值/closure/global/builtin 运行时依赖 Guard | 已实现 | `compiler/typed_frontend.py`、`provider/scalar_python/typed_loop.py` |
-| exact Unicode property count 物理化 | 已实现，覆盖 6 种 property | CinderX production patch 0005 |
-| Source→Bytecode→IR→HIR→LIR→Machine provenance | 已实现 | `diagnostics/worker_runtime.py` + diagnostics overlay |
-| SequenceBuilder、ImmutableLookup、BranchFSM | 未实现 | P1 |
-| 真实 FineWeb full-pipeline ABBA | 未完成 | 下一验证层级 |
+| exact Unicode property 标量访问和归约 | 已实现，覆盖 6 种 property | CinderX `UnicodeData/Kind/Read/Classify` + 普通 CFG/HIR |
+| Source→Bytecode→IR→HIR→LIR→Machine provenance | 已实现 | `diagnostics/worker_runtime.py` + CinderX startup-gated provenance |
+| SequenceBuilder、ImmutableLookup、bool-class FSM | 已实现 exact-str subset | CinderX `PrimitiveTable*`、branch、`SequenceBuilder*` |
+| closure wrapper 去虚拟化/内联 | 已实现 | exact closure target `GuardIs` + generic inliner |
+| generator 编译稳定性和确定性失败负缓存 | 已实现 | 普通 generator lowering + bounded negative cache |
+| FineWeb 200K 简单 A/B | 已完成 | 执行耗时下降 18.36%，端到端下降 18.19% |
 
-P0 的 `UnicodeCountProperty` 是类型化后端 primitive，不是 Semantic IR 业务 opcode。其 matcher 必须
-证明 exact type、规范 loop bound、初始 index 0、increment 1、predicate dataflow、reduction backedge 和
-唯一 exit result；任一事实不成立即返回 unsupported。实现与验证证据见
-`docs/reports/2026-08-03-generic-loop-type-specialization-validation.md`。
+当前实现不含 `UnicodeCountProperty` 等整段循环 HIR。后端必须从已验证的 CFG、类型、表和 builder
+数据流构造普通 CinderX HIR；任一事实不成立即返回 unsupported。实现与最终验证证据见
+`docs/reports/2026-08-04-generic-sequence-patterns-validation.md`。
 
 # 4 缺点和风险
 

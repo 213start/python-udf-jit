@@ -1,26 +1,23 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "created_at": "2026-08-04",
+  "experiment": "cinderx_generic_hir_lir_simple_ab",
   "workload": "pipeline_text_fineweb_full_min/three-generic-text-patterns",
-  "experiment": "generic_sequence_patterns_simple_ab",
-  "classification": "targeted-kernel-and-single-pipeline-ab",
   "source": {
-    "branch": "master",
-    "udfjit_base_revision": "06e3b3c81f86b96303aa7a70c1062eb4ee86e14b",
-    "cinderx_upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
-    "production_patch": "vendor/cinderx/patches/0006-generic-sequence-patterns.patch",
-    "production_patch_sha256": "634ca864ff35b8f16c604a721a47a1da342901e5bddb446d671a6186ccd5c543",
-    "production_patch_series_sha256": "4cb5b1c3d8fdef334d70c4f3c1a1baf9ef14424713985f15049eefeba8eeae32",
-    "candidate_runtime_tree_sha256": "2dd7292f59f07a6c8cd2b0bca69f9f87dbefe6f4c320e3c34b99e95e6e7281d6",
-    "diagnostic_overlay_sha256": "cb8272c298a576551695ef2b62a51be3fea91f66f7380c0557c43af829cc800a",
-    "diagnostic_overlay_packaging": "Locked separately and not applied to the production build used for any final timing."
+    "udf_jit_base_revision": "37bfe94",
+    "cinderx_base_revision": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
+    "measured_candidate": "synchronized final working trees before batch commits",
+    "physical_lowering_owner": "cinderx",
+    "removed_route": "whole-loop UnicodeCountProperty/UnicodeMapSequence/UnicodeFsmSequence helpers"
   },
   "environment": {
     "host": "aarch64-lab-host",
     "arch": "aarch64",
     "python": "3.14.3",
-    "image": "python-udf-jit:u13-20260729-071503-eb97ee8a",
+    "build_image": "python-udf-jit:u13-20260729-071503-eb97ee8a",
+    "pipeline_image": "python-udf-jit-volc:u13-46f8c726",
     "cpu_affinity": "4-7",
+    "ray_num_cpus": 4,
     "thread_limits": {
       "OMP_NUM_THREADS": 1,
       "OPENBLAS_NUM_THREADS": 1,
@@ -29,229 +26,168 @@
       "VECLIB_MAXIMUM_THREADS": 1
     }
   },
-  "patterns": {
-    "alphanumeric": {
-      "normalized_pattern": "iterator_reduction",
-      "physical_operation": "unicode.count_property",
-      "execution_mode": "cinderx_unicode_property_hir",
-      "required_hir": "UnicodeCountProperty",
-      "hir_count": 1
-    },
-    "punctuation": {
-      "normalized_pattern": "iterator_immutable_lookup_builder",
-      "physical_operation": "unicode.map_sequence",
-      "execution_mode": "cinderx_unicode_map_hir",
-      "required_hir": "UnicodeMapSequence",
-      "hir_count": 1,
-      "keys": [8211, 8212, 8216, 8217, 8220, 8221],
-      "values": [45, 45, 39, 39, 34, 34]
-    },
-    "whitespace": {
-      "normalized_pattern": "iterator_unicode_fsm_builder",
-      "physical_operation": "unicode.fsm_sequence",
-      "execution_mode": "cinderx_unicode_fsm_hir",
-      "required_hir": "UnicodeFsmSequence",
-      "hir_count": 1,
-      "property": "space",
-      "initial_state": 0,
-      "state_count": 3,
-      "transitions": [1, 0, 1, 2, 1, 2],
-      "actions": [1, 0, 1, 0, 3, 0],
-      "emissions": [0, 0, 0, 0, 32, 0]
+  "architecture": {
+    "portable_layers": [
+      "typed CFG/SSA",
+      "type/effect/guard facts",
+      "source and bytecode provenance"
+    ],
+    "backend_layers": [
+      "generic CinderX HIR",
+      "ordinary CinderX HIR passes",
+      "generic LIR",
+      "machine code"
+    ],
+    "patterns": {
+      "alphanumeric": {
+        "normalized_pattern": "iterator_reduction",
+        "semantic_operations": ["unicode.property", "binary.add", "binary.truediv", "compare.ge"],
+        "required_hir": ["UnicodeData", "UnicodeKind", "UnicodeRead", "UnicodeClassify", "IntBinaryOp"],
+        "vector_call_count": 0
+      },
+      "punctuation": {
+        "normalized_pattern": "iterator_immutable_lookup_builder",
+        "semantic_operations": ["immutable.lookup", "sequence.builder.append"],
+        "required_hir": ["PrimitiveTableLookup", "SequenceBuilderCreate", "SequenceBuilderAppend", "SequenceBuilderFinish"],
+        "vector_call_count": 0
+      },
+      "whitespace": {
+        "normalized_pattern": "iterator_unicode_fsm_builder",
+        "semantic_operations": ["unicode.property", "fsm.transition", "sequence.builder.apply"],
+        "required_hir": ["UnicodeClassify", "PrimitiveTableGet", "CondBranch", "SequenceBuilderAppend"],
+        "vector_call_count": 0
+      }
     }
   },
   "diagnostic_isolation": {
     "performance": {
       "UDFJIT_DIAGNOSTICS": "off",
       "PYTHONJITUDFDIAGNOSTICS": "0",
-      "production_source_overlay_applied": false,
-      "runtime_diagnostic_api_available": false,
       "timing_used_from_diagnostic_workers": false
     },
     "diagnostics": {
       "UDFJIT_DIAGNOSTICS": "full",
       "PYTHONJITUDFDIAGNOSTICS": "1",
-      "dedicated_workers": true
+      "dedicated_workers": true,
+      "startup_only_cinderx_flag": true
     }
   },
   "direct_ab": {
-    "protocol": "Actual target UDFs over the frozen 10K values; baseline then candidate; five rounds per arm; median; full output parity checked before timing; diagnostics off.",
-    "rows": 10000,
-    "rounds": 5,
+    "protocol": "Original UDF under ordinary CinderX JIT versus UDF JIT typed region plus CinderX generic HIR; diagnostics off; fixed CPU; seven median rounds; checksum equality required.",
+    "calls_per_round": 400,
+    "characters_per_round": 4275200,
+    "rounds": 7,
     "patterns": {
       "alphanumeric": {
-        "baseline_median_ns": 3889610680,
-        "baseline_samples_ns": [3889083750, 3889922890, 3889610680, 3888951500, 3919177250],
-        "candidate_median_ns": 495840310,
-        "candidate_samples_ns": [495957320, 495760730, 495773510, 495840310, 496040300],
-        "checksum": 10000,
-        "speedup": 7.844482591582762
+        "baseline_median_ns": 474729880,
+        "baseline_samples_ns": [474364270, 474729880, 475992070, 476847590, 475898700, 474638890, 474382880],
+        "candidate_median_ns": 43128610,
+        "candidate_samples_ns": [43292250, 43173430, 43089480, 43209900, 43002350, 43128610, 43086110],
+        "checksum": 300,
+        "speedup": 11.007307678128278
       },
       "punctuation": {
-        "baseline_median_ns": 1153955140,
-        "baseline_samples_ns": [1154612350, 1154007420, 1153955140, 1153515820, 1153799000],
-        "candidate_median_ns": 425126060,
-        "candidate_samples_ns": [425094040, 425392590, 425321060, 425126060, 425123650],
-        "checksum": 47307528,
-        "speedup": 2.7143834466416856
+        "baseline_median_ns": 132738640,
+        "baseline_samples_ns": [132420810, 132463040, 132738640, 132938750, 132643140, 133187110, 132843450],
+        "candidate_median_ns": 42695400,
+        "candidate_samples_ns": [42730920, 42695400, 42694210, 42690140, 42708730, 42708390, 42693430],
+        "checksum": 5116400,
+        "speedup": 3.108968179241792
       },
       "whitespace": {
-        "baseline_median_ns": 2952907600,
-        "baseline_samples_ns": [2952984210, 2953247500, 2952592360, 2952907600, 2952751990],
-        "candidate_median_ns": 761287140,
-        "candidate_samples_ns": [761623080, 761349020, 761183370, 761287140, 760772280],
-        "checksum": 47306338,
-        "speedup": 3.878835520589511
+        "baseline_median_ns": 233744840,
+        "baseline_samples_ns": [233955190, 233873250, 233970020, 233734530, 233744840, 233517670, 233539000],
+        "candidate_median_ns": 94506740,
+        "candidate_samples_ns": [94774270, 94527580, 94506740, 94511800, 94503050, 94484150, 94505820],
+        "checksum": 6198900,
+        "speedup": 2.473313966813372
       }
-    },
-    "log_sha256": "06ba2f60909898201b71d4639f3d7a37e1a698cadf6d6b95d578495aa480d7d9",
-    "log": "artifact://generic-text-patterns-20260804/logs/three-pattern-ab-production-writer-r4.log"
+    }
   },
   "pipeline_ab": {
-    "protocol": "Single simple A/B as authorized: off then auto, 13 unchanged stages, frozen 10K input, locked manifest, diagnostics off, all recorded numerical-library thread limits fixed to one.",
-    "task_sha256": "8839ef528b2fd3cabaf99bbc03cf2630d3386e2280ba64dba177dd3c4e9f0d64",
-    "input_rows": 10000,
-    "output_rows": 9992,
-    "execution_stages": 13,
+    "protocol": "Single simple A/B as authorized: off then auto; frozen FineWeb 200K Lance input; unchanged execution operators; final sink not timed; diagnostics off.",
+    "task_id": "pipeline_text_fineweb_full_min@v0__udfjit_lance_200k",
+    "task_json_sha256": "f57921f1b6040a5db6c9a3609d0b3ab2a3d07d2ee63e96e3d352a2a9aea1c745",
+    "input_fingerprint": "sha256:80e9d0ce05d073f6685059c5cf4861dbfbf81936a9f2c3592b48a15eeb07fdc2",
+    "input_rows": 200000,
+    "output_rows": 199765,
     "baseline": {
-      "run_id": "74fab111-2c07-4f11-864d-94125e8735fd",
-      "pipeline_execute_s": 26.419683,
-      "ray_init_s": 7.287112,
-      "total_s": 33.70679556007963,
-      "result_sha256": "d64574b4e34e67788f488cb340250ed264f7751d8670e54b6917fcf0bf1b8a7c",
-      "log_sha256": "104de11d679963ddc8f43698258a2fc9c085865c33a70bb8c27b24333c8b8f37"
+      "run_id": "8feb43b8-8d37-46a3-a762-1bfc21b9b598",
+      "pipeline_execute_s": 522.088468,
+      "ray_init_s": 6.750793,
+      "total_s": 528.8406557198614,
+      "result_sha256": "44668bcfc6bd5612ca5fd317acf44d3e72c33375a669f8c0730fa35aba1730ff",
+      "log_sha256": "378eee3aa339b5fd3233bdaf686c0614e2e517164acce6203463f2c16695127f"
     },
     "candidate": {
-      "run_id": "cd26d289-f836-4cf8-9a13-bdc4d15d5354",
-      "pipeline_execute_s": 24.20201,
-      "ray_init_s": 6.885287,
-      "total_s": 31.087297359947115,
-      "result_sha256": "6f5c1b2f8319390102a26198d527f1ac0dcaf1ee51302a0b753f6fed33f9adc6",
-      "log_sha256": "5967421f5506874ebbf035084ccd02d1bcfa559841d67e0ad97874216b035b1d"
+      "run_id": "332f3ad5-ce80-42ea-b3a3-b325980b3e67",
+      "pipeline_execute_s": 426.246999,
+      "ray_init_s": 6.379938,
+      "total_s": 432.6282499199733,
+      "result_sha256": "84a2f72bd3a4d6f2a97e25a5596cfe47b199848d92abdb858d0ba329a9da2138",
+      "log_sha256": "d5cd1cafeff92bcd01140681695868e765a9cc570e3f1b9c0987131ca8c719e3"
     },
     "comparison": {
-      "pipeline_speedup": 1.0916317694274151,
-      "pipeline_time_reduction": 0.08394018202262299,
-      "total_speedup": 1.0842626546078422,
-      "total_time_reduction": 0.07771424594377319,
-      "hard_target_s": 22.34,
-      "hard_target_reached": false
+      "pipeline_speedup": 1.2248496041610841,
+      "pipeline_time_reduction": 0.18357323494837274,
+      "total_speedup": 1.2223904837876058,
+      "total_time_reduction": 0.18193080422102405,
+      "above_standalone_cinderx_10_percent_expectation": true
     },
     "perf_lock": {
       "status": "warn",
       "violations": [],
-      "interpretation": "All required thread limits are present. Remaining warnings are host-level observability/topology conditions shared by both arms: governor and turbo unreadable, swap present, NUMA policy unbound, and virtualization unrecorded."
+      "interpretation": "Both arms used the same host, CPU budget and explicit numerical-library thread limits; remaining warnings are shared host observability conditions."
     }
-  },
-  "correctness": {
-    "mode": "fresh diagnostics-off full-value materialization",
-    "baseline_rows": 9992,
-    "candidate_rows": 9992,
-    "baseline_multiset_sha256": "0b3c525fe120a66cf6b6bb41085e51f14df5860bfc433a9659e3c603427090de",
-    "candidate_multiset_sha256": "0b3c525fe120a66cf6b6bb41085e51f14df5860bfc433a9659e3c603427090de",
-    "baseline_ordered_sha256": "7849166715284abade1002d9cc11bdbf933ff65ade0090a7130d16862c17d2ac",
-    "candidate_ordered_sha256": "d9f914889eb5eb3b569e999643e40ad0a3cf4271fef5d64ca7a1a6440abfca32",
-    "ordered_contract": false,
-    "baseline_result_sha256": "ec1a58dd8b7b54d50616785aafddf5957ed0b99ac733971e7d835b9cd8562338",
-    "candidate_result_sha256": "7437336630eb6ab47f6e492d2f96bd2525deb001002087c98d42d92a62942670"
   },
   "worker_diagnostics": {
     "common_chain": {
       "source_ranges": "available",
       "original_bytecode": "available",
       "typed_semantic": "available",
-      "behavior": "available",
-      "type_evidence": "available",
-      "pattern_analysis": "available",
       "generic_lowering": "available",
-      "physical_lowering": "available",
       "generated_bytecode": "available",
       "cinderx_hir": "available",
       "cinderx_lir": "available",
-      "machine": "available"
+      "machine": "available",
+      "udf_physical_lowering": "not_applicable_backend_owned"
     },
-    "alphanumeric": {
-      "manifest_sha256": "0af5d023deba28b4976a4b99813dceb5af939fab3c7b1127a68e066d5a7cbe6a",
-      "artifact_count": 29,
+    "reduction": {
+      "artifact_count": 25,
       "status": "complete",
-      "calls": 15,
-      "compile_attempts": 1,
-      "compile_successes": 1,
-      "fallbacks": 7,
-      "hits": 8,
-      "guard_misses": 0,
-      "wrapper_depth": 3
+      "linked_operations": 10,
+      "manifest_sha256": "bd79281436960c60c6de96f8cf9e3a511932ab7bf58f9b8d06dd7ca9e2cf014b"
     },
-    "punctuation": {
-      "manifest_sha256": "771746867ca7fa61fbbc0e47398ef0b1f67746ef3358b1a74e19d67640d56eaa",
-      "artifact_count": 29,
+    "mapping": {
+      "artifact_count": 25,
       "status": "complete",
-      "calls": 15,
-      "compile_attempts": 1,
-      "compile_successes": 1,
-      "fallbacks": 7,
-      "hits": 8,
-      "guard_misses": 0,
-      "wrapper_depth": 2
+      "linked_operations": 8,
+      "manifest_sha256": "ef14397846420d24ac56aac5583522b292b7bb76cbe7a255e592e14ae8975f14"
     },
-    "whitespace": {
-      "manifest_sha256": "5f5764398d3331e1cb537354ac40e12c358adfae1228d2171b51326bb2435ef5",
-      "artifact_count": 29,
+    "fsm": {
+      "artifact_count": 25,
       "status": "complete",
-      "calls": 15,
-      "compile_attempts": 1,
-      "compile_successes": 1,
-      "fallbacks": 7,
-      "hits": 8,
-      "guard_misses": 0,
-      "wrapper_depth": 2
-    },
-    "post_review_log_sha256": "dd488a6c40a70c7a28a982bd3b8b825c576f1fd0016fcfc2aef2e5692d80f698"
-  },
-  "rejected_runs": [
-    {
-      "name": "pipeline-r1",
-      "reason": "UDFJIT_MANIFEST_PATH was omitted, so auto failed open and did not provide JIT performance evidence."
-    },
-    {
-      "name": "worker-diagnostics-r1",
-      "reason": "The manifest was omitted; the run did not prove compiled Worker execution."
-    },
-    {
-      "name": "unicode-map-linear-scan",
-      "reason": "The first native map implementation regressed punctuation to 0.666x and was replaced by bounded ordered lookup."
-    },
-    {
-      "name": "unicode-map-input-width-reuse",
-      "reason": "It violated CPython canonical Unicode width for wide-to-ASCII mappings and was rejected by semantic tests."
-    },
-    {
-      "name": "pipeline-production-r3",
-      "reason": "The symmetric run showed 11.55% but omitted NUMEXPR_NUM_THREADS and VECLIB_MAXIMUM_THREADS, so the fully locked runs supersede it."
-    },
-    {
-      "name": "pipeline-production-r4",
-      "reason": "The fully locked run showed 9.61% but preceded the validated wrapper and diagnostic hardening; post-review r5 is the final result."
+      "linked_operations": 9,
+      "manifest_sha256": "73fabb3422f80c5af869af911500a7d2da3a558365bfebfaac054bc91a170d39"
     }
-  ],
+  },
   "validation": {
-    "local_python": "512 passed, 10 skipped on Python 3.14.6",
-    "cinderx_python": "9 passed",
-    "cinderx_runtime_tests": "4 passed",
-    "production_diagnostic_overlay_absent": true,
-    "production_build_log_sha256": "fae3531fdbc17d36f1fdc7716d37815ddca25852d99aaa3805a0c80ad8d11b26",
-    "production_cinderx_test_log_sha256": "f2ce83336f1d61bdd360aca40604d0b3d72de66882e761a85bddc177f2439912",
-    "production_runtime_test_log_sha256": "dc87e4892b8f837d6713bc62a6723e491cdeb15827cd036156f457ffe79860f9",
-    "production_patch_apply": "exact, no offsets or backup files",
-    "diagnostic_overlay_apply": "exact on the final patch 0006 production tree",
-    "normalized_candidate_file_count": 1611,
-    "normalized_candidate_sha256": "2dd7292f59f07a6c8cd2b0bca69f9f87dbefe6f4c320e3c34b99e95e6e7281d6",
-    "full_output_parity": true,
-    "three_real_worker_variants_compiled": true
+    "udf_jit_related_tests": "85 passed",
+    "cinderx_python_tests": "13 passed",
+    "cross_repo_integration": "1 passed",
+    "cinderx_targeted_runtime_tests": "2 passed",
+    "clean_cinderx_build": true,
+    "full_runtime_tests": "blocked by unrelated duplicate definitions in osr_loop_header_secondary_entry_test.cpp",
+    "two_independent_sequence_builders": true,
+    "wrapper_vectorcall_removed": true,
+    "generator_compile_path": true,
+    "deterministic_generator_failure_cache": true
   },
   "conclusion": {
+    "generic_backend_implementation_reached": true,
     "coverage_goal_reached": true,
-    "pipeline_hard_target_reached": false,
-    "next_backend_priority": "Profile and generalize the next remaining repeated-scan pattern, likely language-id character/regex scans; do not reorder operators or add business-specific semantics."
+    "pipeline_target_above_standalone_cinderx_reached": true,
+    "operator_reordering_used": false,
+    "business_specific_hir_used": false
   }
 }

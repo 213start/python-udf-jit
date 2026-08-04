@@ -119,12 +119,12 @@ multiset_sha256 = 0b3c525fe120a66cf6b6bb41085e51f14df5860bfc433a9659e3c603427090
 
 ## 2026-08-04 后续结果
 
-上述后端优先级中的 punctuation immutable lookup/builder 与 whitespace Unicode FSM/builder 已完成。
-三种目标 UDF 均在真实 Worker 命中各自唯一 HIR。保持 13 个 stage、补齐全部线程锁的最终简单
-A/B 将 pipeline 执行段在不含诊断 overlay 的生产 CinderX 中从 26.4197 s 降至 24.2020 s
-（1.0916x，耗时下降 8.39%）。三个 Worker 在 review hardening 后仍全部命中；覆盖目标通过，
-但 15% 硬目标仍未通过。
-详见 `docs/reports/2026-08-04-generic-sequence-patterns-validation.md`。
+本节早期的 whole-loop helper 结果已被后续 generic HIR/LIR 实现取代。最终实现删除
+`UnicodeCountProperty`、`UnicodeMapSequence`、`UnicodeFsmSequence` 整段 helper 路径，由 UDF JIT
+传递 typed CFG/SSA，CinderX 以 `Unicode*` 标量访问、`PrimitiveTable*`、普通分支和
+`SequenceBuilder*` 生成机器码。FineWeb 200K 简单 A/B 的执行阶段为 522.088 s → 426.247 s
+（1.2249x，耗时下降 18.36%），端到端为 528.841 s → 432.628 s（1.2224x，耗时下降 18.19%）。
+最终结论和诊断证据见 `docs/reports/2026-08-04-generic-sequence-patterns-validation.md`。
 
 ## 验证
 
