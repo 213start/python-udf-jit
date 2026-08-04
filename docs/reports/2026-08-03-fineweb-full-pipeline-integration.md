@@ -117,6 +117,15 @@ multiset_sha256 = 0b3c525fe120a66cf6b6bb41085e51f14df5860bfc433a9659e3c603427090
 结构化原始数据见
 `docs/reports/evidence/2026-08-03-fineweb-full-pipeline-integration-ab.json`。
 
+## 2026-08-04 后续结果
+
+上述后端优先级中的 punctuation immutable lookup/builder 与 whitespace Unicode FSM/builder 已完成。
+三种目标 UDF 均在真实 Worker 命中各自唯一 HIR。保持 13 个 stage、补齐全部线程锁的最终简单
+A/B 将 pipeline 执行段在不含诊断 overlay 的生产 CinderX 中从 26.4197 s 降至 24.2020 s
+（1.0916x，耗时下降 8.39%）。三个 Worker 在 review hardening 后仍全部命中；覆盖目标通过，
+但 15% 硬目标仍未通过。
+详见 `docs/reports/2026-08-04-generic-sequence-patterns-validation.md`。
+
 ## 验证
 
 - Python 3.14 unit：442 passed，412 subtests passed；
