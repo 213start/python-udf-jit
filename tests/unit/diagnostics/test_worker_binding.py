@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import dis
 import hashlib
+import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -45,6 +47,8 @@ from python_udf_jit.provider.scalar_python.typed_loop import (
     TypedRegionCompileRequest,
     TypedRegionCompiler,
     lower_unicode_count_physical,
+    lower_unicode_fsm_physical,
+    lower_unicode_map_physical,
 )
 from tests.unit.diagnostics.test_cinderx_bridge import _document
 from tests.unit.diagnostics.test_provenance import (
@@ -70,6 +74,18 @@ def _typed_alpha_ratio(
     threshold: float = 0.73123456789,
 ) -> bool:
     return sum(1 for character in text if character.isalpha()) / len(text) >= threshold
+
+
+def _typed_symbol_remap(text: str) -> str:
+    substitutions = str.maketrans({"α": "a", "β": "b", "→": ">"})
+    return text.translate(substitutions)
+
+
+_TYPED_SPACE_RUN = re.compile(r"\s+")
+
+
+def _typed_space_collapse(text: str) -> str:
+    return _TYPED_SPACE_RUN.sub(" ", text).strip()
 
 
 class _TypedDiagnosticBackend:
@@ -116,6 +132,35 @@ class _GenericTypedDiagnosticBackend:
 
     def compile(self, _lowering):
         return BackendCompilation(True, "test_generic_bytecode")
+
+
+class _SequenceTypedDiagnosticBackend:
+    adapter_version = "sequence-typed-diagnostic-test-v1"
+
+    def compile(self, lowering):
+        operation_names = {
+            operation.op for operation in lowering.module.operations
+        }
+        if "immutable.lookup" in operation_names:
+            physical = lower_unicode_map_physical(
+                lowering,
+                lambda text, _keys, _values: text,
+            )
+            opcode = "UnicodeMapSequence"
+        elif "fsm.transition" in operation_names:
+            physical = lower_unicode_fsm_physical(
+                lowering,
+                lambda text, _property, _state, _descriptor: text,
+            )
+            opcode = "UnicodeFsmSequence"
+        else:
+            raise AssertionError("sequence descriptor expected")
+        return BackendCompilation(
+            True,
+            "test_unicode_sequence_hir",
+            ((opcode, 1),),
+            physical,
+        )
 
 
 class WorkerDiagnosticBindingTests(unittest.TestCase):
@@ -645,6 +690,139 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
         self.assertTrue(
             any(entry["machine_range_ids"] for entry in provenance["entries"])
         )
+
+    def test_sequence_descriptors_follow_the_diagnostic_source_policy(
+        self,
+    ) -> None:
+        cases = (
+            (
+                _typed_symbol_remap,
+                ("[945,946,8594]", "[97,98,62]"),
+            ),
+            (
+                _typed_space_collapse,
+                (
+                    "[1,0,1,2,1,2]",
+                    "[1,0,1,0,3,0]",
+                    "[0,0,0,0,32,0]",
+                ),
+            ),
+        )
+        for source_policy in ("ranges", "text"):
+            for function, canaries in cases:
+                with self.subTest(
+                    source_policy=source_policy,
+                    function=function.__name__,
+                ), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    policy = resolve_diagnostic_policy(
+                        {
+                            "UDFJIT_DIAGNOSTICS": "full",
+                            "UDFJIT_DIAGNOSTIC_DIR": str(
+                                root / "diagnostics"
+                            ),
+                            "UDFJIT_DIAGNOSTIC_FILTER": (
+                                "candidate:candidate-a"
+                            ),
+                            "UDFJIT_DIAGNOSTIC_SOURCE": source_policy,
+                            "UDFJIT_DIAGNOSTIC_PERF": "off",
+                            "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                            "UDFJIT_DIAGNOSTIC_MAX_BYTES": str(
+                                4 * 1024 * 1024
+                            ),
+                        },
+                        DiagnosticRuntimeContext(
+                            dedicated_worker=True,
+                            workspace_root=root / "workspace",
+                            home_root=root / "home",
+                        ),
+                    )
+                    runtime = WorkerDiagnosticRuntime(
+                        policy,
+                        run_id="run-a",
+                        runtime_mode="auto",
+                        process_key="worker-a",
+                        process_id=os.getpid(),
+                        user_function=function,
+                    )
+                    captured = capture_typed_loop(
+                        function,
+                        input_types=(EXACT_UNICODE,),
+                    )
+                    decision = TypedRegionCompiler(
+                        _SequenceTypedDiagnosticBackend(),
+                        call_threshold=1,
+                        negative_ttl_ns=1_000_000_000,
+                        diagnostic_sink=runtime,
+                    ).compile(
+                        TypedRegionCompileRequest(
+                            captured.module,
+                            RuntimeFeedback(call_count=1, deopt_count=0),
+                            captured.analysis.to_documents(),
+                            captured.runtime_guard,
+                        )
+                    )
+                    self.assertEqual(decision.status, CompileStatus.COMPILED)
+                    bundle_ref = runtime.finalize()
+                    self.assertIsNotNone(bundle_ref)
+                    bundle = read_bundle(bundle_ref.path)
+                    semantic = read_json_artifact(
+                        bundle,
+                        "typed/semantic-v2.json",
+                    )
+                    physical = read_json_artifact(
+                        bundle,
+                        "typed/physical-lowering.json",
+                    )
+                    semantic_text = json.dumps(
+                        semantic,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    physical_text = json.dumps(
+                        physical,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+
+                    if source_policy == "text":
+                        for canary in canaries:
+                            self.assertIn(canary, semantic_text)
+                            self.assertIn(canary, physical_text)
+                        continue
+
+                    for canary in canaries:
+                        self.assertNotIn(canary, semantic_text)
+                        self.assertNotIn(canary, physical_text)
+                    semantic_metadata = [
+                        json.loads(value)
+                        for operation in semantic["operations"]
+                        for _name, value in operation["attributes"]
+                        if value.startswith('{"count":')
+                    ]
+                    physical_metadata = [
+                        json.loads(value)
+                        for _name, value in physical["physical_attributes"]
+                        if value.startswith('{"count":')
+                    ]
+                    expected_counts = sorted(
+                        len(json.loads(canary)) for canary in canaries
+                    )
+                    for metadata in (
+                        semantic_metadata,
+                        physical_metadata,
+                    ):
+                        self.assertEqual(
+                            sorted(value["count"] for value in metadata),
+                            expected_counts,
+                        )
+                        self.assertTrue(
+                            all(
+                                value["shape"] == [value["count"]]
+                                and len(value["sha256"]) == 64
+                                for value in metadata
+                            )
+                        )
 
     def test_udf_selector_enables_typed_worker_recording(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import atexit
 import builtins
+import dis
 import inspect
 import os
 import textwrap
@@ -136,6 +137,10 @@ class ResolvedTypedLoopCallable:
     wrapper_depth: int
 
 
+class _TypedLoopDiagnosticError(RuntimeError):
+    """An explicitly requested typed-loop diagnostic could not run."""
+
+
 def _function_node(function: types.FunctionType) -> ast.FunctionDef:
     try:
         lines, _ = inspect.getsourcelines(function)
@@ -159,6 +164,103 @@ def _strip_docstring(statements: list[ast.stmt]) -> list[ast.stmt]:
     ):
         return statements[1:]
     return statements
+
+
+def _receiver_trampoline_bindings(
+    function: types.FunctionType,
+) -> tuple[types.FunctionType, tuple[_LiveBinding, ...]] | None:
+    """Prove the Daft receiver shim is exactly ``wrapped(*args, **kwargs)``."""
+
+    wrapped = vars(function).get("__wrapped__")
+    if not isinstance(wrapped, types.FunctionType):
+        return None
+    code = function.__code__
+    if (
+        code.co_argcount != 1
+        or code.co_kwonlyargcount != 0
+        or not code.co_flags & inspect.CO_VARARGS
+        or not code.co_flags & inspect.CO_VARKEYWORDS
+        or function.__defaults__
+        or function.__kwdefaults__
+    ):
+        return None
+    closure = function.__closure__ or ()
+    matches: list[tuple[int, str]] = []
+    try:
+        for index, (name, cell) in enumerate(
+            zip(code.co_freevars, closure, strict=True)
+        ):
+            if cell.cell_contents is wrapped:
+                matches.append((index, name))
+    except (ValueError, TypeError):
+        return None
+    if len(matches) != 1:
+        return None
+    index, closure_name = matches[0]
+    variadic_offset = code.co_argcount + code.co_kwonlyargcount
+    if len(code.co_varnames) <= variadic_offset + 1:
+        return None
+    vararg_name = code.co_varnames[variadic_offset]
+    keyword_name = code.co_varnames[variadic_offset + 1]
+    instructions = [
+        instruction
+        for instruction in dis.get_instructions(function)
+        if instruction.opname not in {"CACHE", "COPY_FREE_VARS", "NOP", "RESUME"}
+    ]
+    if len(instructions) != 8:
+        return None
+    if instructions[0].opname == "PUSH_NULL":
+        callee = instructions[1]
+    elif instructions[1].opname == "PUSH_NULL":
+        callee = instructions[0]
+    else:
+        return None
+    payload = instructions[2:]
+    payload_names = tuple(
+        (
+            "LOAD_FAST"
+            if instruction.opname == "LOAD_FAST_BORROW"
+            else instruction.opname
+        )
+        for instruction in payload
+    )
+    if (
+        callee.opname != "LOAD_DEREF"
+        or callee.argval != closure_name
+        or payload_names
+        != (
+            "LOAD_FAST",
+            "BUILD_MAP",
+            "LOAD_FAST",
+            "DICT_MERGE",
+            "CALL_FUNCTION_EX",
+            "RETURN_VALUE",
+        )
+        or payload[0].argval != vararg_name
+        or payload[1].arg != 0
+        or payload[2].argval != keyword_name
+        or payload[3].arg != 1
+        or payload[4].arg not in {None, 1}
+    ):
+        return None
+    return wrapped, (
+        _LiveBinding(function, "code", "__code__", code, identity=True),
+        _LiveBinding(
+            function,
+            "closure",
+            closure_name,
+            wrapped,
+            index=index,
+            identity=True,
+        ),
+        _LiveBinding(
+            function,
+            "attribute",
+            "__wrapped__",
+            wrapped,
+            identity=True,
+        ),
+    )
 
 
 def _default_bindings(
@@ -365,53 +467,20 @@ def resolve_typed_loop_callable(
         if id(current) in seen:
             raise TypedCaptureError("thin_wrapper_cycle")
         seen.add(id(current))
-        wrapped = getattr(current, "__wrapped__", None)
-        code = current.__code__
-        if (
-            isinstance(wrapped, types.FunctionType)
-            and code.co_argcount == 1
-            and code.co_flags & inspect.CO_VARARGS
-        ):
-            closure = current.__closure__ or ()
-            matches = [
-                (index, name)
-                for index, (name, cell) in enumerate(
-                    zip(code.co_freevars, closure, strict=True)
-                )
-                if cell.cell_contents is wrapped
-            ]
-            if len(matches) != 1:
-                raise TypedCaptureError("receiver_trampoline_binding_invalid")
-            index, name = matches[0]
-            bindings.extend(
-                (
-                    _LiveBinding(
-                        current,
-                        "code",
-                        "__code__",
-                        code,
-                        identity=True,
-                    ),
-                    _LiveBinding(
-                        current,
-                        "closure",
-                        name,
-                        wrapped,
-                        index=index,
-                        identity=True,
-                    ),
-                    _LiveBinding(
-                        current,
-                        "attribute",
-                        "__wrapped__",
-                        wrapped,
-                        identity=True,
-                    ),
-                )
-            )
+        receiver_trampoline = _receiver_trampoline_bindings(current)
+        if receiver_trampoline is not None:
+            wrapped, receiver_bindings = receiver_trampoline
+            bindings.extend(receiver_bindings)
             current = wrapped
             depth += 1
             continue
+        if "__wrapped__" in vars(current):
+            return ResolvedTypedLoopCallable(
+                current,
+                dict(incoming),
+                _WrapperGuard(tuple(bindings)),
+                depth,
+            )
         unwrapped = _unwrap_thin_call(current, incoming)
         if unwrapped is None:
             return ResolvedTypedLoopCallable(
@@ -456,6 +525,10 @@ class WorkerTypedLoopAdapter:
         self._candidate_id = candidate_id
         self._call_threshold = call_threshold
         self._backend = backend or CinderXTypedLoopBackend()
+        self._has_receiver_trampoline = (
+            isinstance(original_callable, types.FunctionType)
+            and _receiver_trampoline_bindings(original_callable) is not None
+        )
         self._lock = RLock()
         self._calls = 0
         self._compile_attempts = 0
@@ -486,14 +559,7 @@ class WorkerTypedLoopAdapter:
     ) -> tuple[object, ...] | None:
         if kwargs:
             return None
-        function = self._original_callable
-        code = getattr(function, "__code__", None)
-        if (
-            isinstance(code, types.CodeType)
-            and code.co_argcount == 1
-            and code.co_flags & inspect.CO_VARARGS
-            and isinstance(getattr(function, "__wrapped__", None), types.FunctionType)
-        ):
+        if self._has_receiver_trampoline:
             return args[1:] if len(args) == 2 else None
         return args if len(args) == 1 else None
 
@@ -539,7 +605,7 @@ class WorkerTypedLoopAdapter:
             selector_kind, _, selector_value = policy.selector.partition(":")
             selected = (
                 selector_kind == "candidate"
-                and self._candidate_id.startswith(selector_value)
+                and self._candidate_id == selector_value
             ) or (
                 selector_kind == "udf"
                 and code_identity(function).sha256.startswith(selector_value)
@@ -559,8 +625,11 @@ class WorkerTypedLoopAdapter:
             self._diagnostic_runtime = runtime
             atexit.register(self._finalize_diagnostics)
             return runtime
-        except Exception:
-            return None
+        except Exception as error:
+            raise _TypedLoopDiagnosticError(
+                "typed_loop_diagnostics_initialize_failed:"
+                f"{type(error).__name__}:{error}"
+            ) from error
 
     def _compile_locked(self) -> None:
         self._compile_attempts += 1
@@ -586,6 +655,8 @@ class WorkerTypedLoopAdapter:
                     captured.runtime_guard,
                 )
             )
+        except _TypedLoopDiagnosticError:
+            raise
         except TypedCaptureError as error:
             self._reason_code = error.reason_code
             self._terminal = True
@@ -685,8 +756,11 @@ class WorkerTypedLoopAdapter:
         try:
             runtime.record_typed_runtime_summary(document)
             runtime.finalize()
-        except Exception:
-            pass
+        except Exception as error:
+            raise _TypedLoopDiagnosticError(
+                "typed_loop_diagnostics_finalize_failed:"
+                f"{type(error).__name__}:{error}"
+            ) from error
 
 
 def build_worker_typed_loop_adapter(wrapper: Any) -> WorkerTypedLoopAdapter:

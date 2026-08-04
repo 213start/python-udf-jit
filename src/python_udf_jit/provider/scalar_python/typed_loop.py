@@ -5,6 +5,7 @@ import hashlib
 import json
 import marshal
 import types
+from bisect import bisect_left
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -18,21 +19,26 @@ from python_udf_jit.compiler.typed_analysis import (
 )
 from python_udf_jit.compiler.typed_ir import (
     BOOL,
+    EXACT_UNICODE,
     FLOAT64,
     INT64,
+    UNICODE_BUILDER,
     UNICODE_SCALAR,
     Exactness,
     TypeKind,
     TypeSpec,
+    TypedBlockArgument,
     TypedControlEdge,
     TypedOperation,
     TypedSemanticModule,
+    decode_int_table,
+    encode_int_table,
 )
 from python_udf_jit.runtime.negative_cache import NegativeCache
 from python_udf_jit.compiler.typed_verifier import verify_typed_module
 
 
-TYPED_LOOP_ADAPTER_VERSION = "typed-loop-adapter-v1"
+TYPED_LOOP_ADAPTER_VERSION = "typed-loop-adapter-v2"
 
 
 class TypedGuardMiss(RuntimeError):
@@ -72,6 +78,8 @@ class TypedLoopSpecializationPlan:
     element_type: str
     reduction_operation: str
     accumulator_type: str
+    result_strategy: str
+    state_operations: tuple[str, ...]
     predicate_operations: tuple[str, ...]
     required_guards: tuple[str, ...]
     backend_requirements: tuple[str, ...]
@@ -90,12 +98,14 @@ class TypedLoopSpecializationPlan:
             "pattern_kind": self.pattern_kind,
             "predicate_operations": list(self.predicate_operations),
             "reduction_operation": self.reduction_operation,
+            "result_strategy": self.result_strategy,
             "required_guards": list(self.required_guards),
+            "state_operations": list(self.state_operations),
         }
 
     def recompute_hash(self) -> str:
         return _canonical_hash(
-            b"python-udf-jit-typed-loop-plan-v1\0",
+            b"python-udf-jit-typed-loop-plan-v2\0",
             self.semantic_document(),
         )
 
@@ -125,12 +135,13 @@ class PhysicalTypedLoopLowering:
     module_hash: str
     plan_hash: str
     physical_operation: str
-    property_id: int
+    property_id: int | None
     function: types.FunctionType
     generated_source: str
     generated_ast_text: str
     generated_code_hash: str
     operation_lines: tuple[tuple[str, int], ...]
+    physical_attributes: tuple[tuple[str, str], ...] = ()
 
     @property
     def code_size(self) -> int:
@@ -144,6 +155,7 @@ class PhysicalTypedLoopLowering:
             "physical_operation": self.physical_operation,
             "plan_hash": self.plan_hash,
             "property_id": self.property_id,
+            "physical_attributes": [list(value) for value in self.physical_attributes],
         }
 
 
@@ -245,25 +257,39 @@ class CinderXTypedLoopBackend:
             initializer()
         import cinderx.jit
 
-        unicode_count = getattr(
-            cinderx.jit,
-            "_udf_unicode_count_property",
-            None,
+        physical_attempts = (
+            (
+                getattr(cinderx.jit, "_udf_unicode_map_sequence", None),
+                lower_unicode_map_physical,
+                "UnicodeMapSequence",
+                "cinderx_unicode_map_hir",
+            ),
+            (
+                getattr(cinderx.jit, "_udf_unicode_fsm_sequence", None),
+                lower_unicode_fsm_physical,
+                "UnicodeFsmSequence",
+                "cinderx_unicode_fsm_hir",
+            ),
+            (
+                getattr(cinderx.jit, "_udf_unicode_count_property", None),
+                lower_unicode_count_physical,
+                "UnicodeCountProperty",
+                "cinderx_unicode_property_hir",
+            ),
         )
-        if callable(unicode_count):
+        for helper, physical_lowerer, required_opcode, execution_mode in physical_attempts:
+            if not callable(helper):
+                continue
             try:
-                physical = lower_unicode_count_physical(lowering, unicode_count)
+                physical = physical_lowerer(lowering, helper)
             except TypedLoweringError:
-                physical = None
-            if physical is not None:
-                self._prepare_diagnostics(
-                    diagnostic_sink,
-                    physical.function,
-                    physical.generated_code_hash,
-                )
-            if physical is not None and cinderx.jit.force_compile(
-                physical.function
-            ):
+                continue
+            self._prepare_diagnostics(
+                diagnostic_sink,
+                physical.function,
+                physical.generated_code_hash,
+            )
+            if cinderx.jit.force_compile(physical.function):
                 raw_counts = cinderx.jit.get_function_hir_opcode_counts(
                     physical.function
                 )
@@ -273,14 +299,20 @@ class CinderXTypedLoopBackend:
                 }
                 if (
                     cinderx.jit.is_jit_compiled(physical.function)
-                    and counts.get("UnicodeCountProperty", 0) == 1
+                    and counts.get(required_opcode, 0) == 1
                 ):
                     return BackendCompilation(
                         True,
-                        "cinderx_unicode_property_hir",
+                        execution_mode,
                         tuple(sorted(counts.items())),
                         physical,
                     )
+
+        if lowering.analysis.patterns.builder_operations:
+            return BackendCompilation(
+                False,
+                "cinderx_sequence_transform_intrinsic",
+            )
 
         self._prepare_diagnostics(
             diagnostic_sink,
@@ -455,6 +487,52 @@ _UNICODE_PROPERTY_ID = {
 }
 
 
+def _immutable_unicode_lookup(
+    value: str,
+    keys: tuple[int, ...],
+    replacements: tuple[int, ...],
+) -> str:
+    codepoint = ord(value)
+    table_index = bisect_left(keys, codepoint)
+    if table_index == len(keys) or keys[table_index] != codepoint:
+        return value
+    return chr(replacements[table_index])
+
+
+def _sequence_builder_append(builder: list[str], value: str) -> list[str]:
+    result = list(builder)
+    result.append(value)
+    return result
+
+
+def _fsm_transition(
+    state: int,
+    classification: bool,
+    transitions: tuple[int, ...],
+) -> int:
+    return transitions[state * 2 + int(classification)]
+
+
+def _sequence_builder_apply(
+    builder: list[str],
+    value: str,
+    state: int,
+    classification: bool,
+    actions: tuple[int, ...],
+    emissions: tuple[int, ...],
+) -> list[str]:
+    table_index = state * 2 + int(classification)
+    action = actions[table_index]
+    result = list(builder)
+    if action in {2, 3}:
+        result.append(chr(emissions[table_index]))
+    if action in {1, 3, 4}:
+        result.append(value)
+    if action == 4:
+        result.append(chr(emissions[table_index]))
+    return result
+
+
 class _CanonicalLoopLowerer:
     def __init__(
         self,
@@ -524,6 +602,20 @@ class _CanonicalLoopLowerer:
             return ast.Subscript(value=operands[0], slice=operands[1], ctx=ast.Load())
         if operation.op == "mapping.lookup":
             return ast.Subscript(value=operands[0], slice=operands[1], ctx=ast.Load())
+        if operation.op == "immutable.lookup":
+            keys = decode_int_table(
+                operation.attribute("keys") or "",
+                max_items=256,
+            )
+            replacements = decode_int_table(
+                operation.attribute("values") or "",
+                max_items=256,
+            )
+            return ast.Call(
+                func=ast.Name(id="_immutable_unicode_lookup", ctx=ast.Load()),
+                args=[operands[0], ast.Constant(keys), ast.Constant(replacements)],
+                keywords=[],
+            )
         if operation.op == "unicode.property":
             method = _UNICODE_METHOD.get(operation.attribute("property") or "")
             if method is None:
@@ -531,6 +623,54 @@ class _CanonicalLoopLowerer:
             return ast.Call(
                 func=ast.Attribute(value=operands[0], attr=method, ctx=ast.Load()),
                 args=[],
+                keywords=[],
+            )
+        if operation.op == "fsm.transition":
+            transitions = decode_int_table(
+                operation.attribute("transitions") or "",
+                max_items=128,
+                maximum=int(operation.attribute("state_count") or "0") - 1,
+            )
+            return ast.Call(
+                func=ast.Name(id="_fsm_transition", ctx=ast.Load()),
+                args=[operands[0], operands[1], ast.Constant(transitions)],
+                keywords=[],
+            )
+        if operation.op == "sequence.builder.create":
+            return ast.List(elts=[], ctx=ast.Load())
+        if operation.op == "sequence.builder.append":
+            return ast.Call(
+                func=ast.Name(id="_sequence_builder_append", ctx=ast.Load()),
+                args=operands,
+                keywords=[],
+            )
+        if operation.op == "sequence.builder.apply":
+            actions = decode_int_table(
+                operation.attribute("actions") or "",
+                max_items=128,
+                maximum=4,
+            )
+            emissions = decode_int_table(
+                operation.attribute("emissions") or "",
+                max_items=128,
+            )
+            return ast.Call(
+                func=ast.Name(id="_sequence_builder_apply", ctx=ast.Load()),
+                args=[
+                    *operands,
+                    ast.Constant(actions),
+                    ast.Constant(emissions),
+                ],
+                keywords=[],
+            )
+        if operation.op == "sequence.builder.finish":
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Constant(""),
+                    attr="join",
+                    ctx=ast.Load(),
+                ),
+                args=[operands[0]],
                 keywords=[],
             )
         _fail("operation_lowering_unsupported", operation.op)
@@ -633,9 +773,8 @@ class _CanonicalLoopLowerer:
 
     def build(self) -> tuple[types.FunctionType, str, str, tuple[tuple[str, int], ...]]:
         loops = self.analysis.patterns.loops
-        reductions = self.analysis.patterns.reductions
-        if len(loops) != 1 or len(reductions) != 1:
-            _fail("single_reduction_loop_required")
+        if len(loops) != 1:
+            _fail("single_typed_loop_required")
         loop = loops[0]
         header = self.blocks[loop.header]
         if len(loop.latches) != 1:
@@ -829,6 +968,10 @@ class _CanonicalLoopLowerer:
         code = compile(module_node, filename, "exec")
         globals_namespace: dict[str, object] = {
             "_TypedGuardMiss": TypedGuardMiss,
+            "_fsm_transition": _fsm_transition,
+            "_immutable_unicode_lookup": _immutable_unicode_lookup,
+            "_sequence_builder_append": _sequence_builder_append,
+            "_sequence_builder_apply": _sequence_builder_apply,
             "__builtins__": __builtins__,
         }
         for index, type_spec in enumerate(self.module.input_types):
@@ -1266,6 +1409,660 @@ def lower_unicode_count_physical(
     )
 
 
+@dataclass(frozen=True)
+class _SequenceTransformScaffold:
+    input_value: str
+    item_value: str
+    builder_value: str
+    state_value: str | None
+    result_value: str
+    operations: dict[str, TypedOperation]
+    definitions: dict[str, TypedOperation]
+    collapsed_operation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _UnicodeMapKernel:
+    scaffold: _SequenceTransformScaffold
+    keys: tuple[int, ...]
+    values: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _UnicodeFsmKernel:
+    scaffold: _SequenceTransformScaffold
+    property_name: str
+    property_id: int
+    initial_state: int
+    state_count: int
+    transitions: tuple[int, ...]
+    actions: tuple[int, ...]
+    emissions: tuple[int, ...]
+
+
+def _single_operation(
+    operations: tuple[TypedOperation, ...],
+    op: str,
+    *,
+    reason: str,
+) -> TypedOperation:
+    matches = tuple(operation for operation in operations if operation.op == op)
+    if len(matches) != 1:
+        _fail(reason)
+    return matches[0]
+
+
+def _constant_int(
+    definitions: dict[str, TypedOperation],
+    value_id: str,
+    *,
+    reason: str,
+) -> int:
+    operation = definitions.get(value_id)
+    if (
+        operation is None
+        or operation.op != "constant"
+        or operation.literal is None
+        or type(operation.literal.value) is not int
+    ):
+        _fail(reason)
+    return operation.literal.value
+
+
+def _match_sequence_transform_scaffold(
+    lowering: TypedLoopLowering,
+    *,
+    with_state: bool,
+) -> _SequenceTransformScaffold:
+    module = lowering.module
+    analysis = lowering.analysis
+    expected_arguments = 3 if with_state else 2
+    if (
+        module.input_types != (EXACT_UNICODE,)
+        or module.output_type != EXACT_UNICODE
+        or len(analysis.patterns.loops) != 1
+        or analysis.patterns.reductions
+    ):
+        _fail("sequence_transform_shape_mismatch")
+    loop = analysis.patterns.loops[0]
+    blocks = {block.block_id: block for block in module.blocks}
+    if (
+        set(blocks) != {"entry", "header", "body", "exit"}
+        or module.entry_block != "entry"
+        or loop.header != "header"
+        or loop.latches != ("body",)
+        or set(loop.blocks) != {"header", "body"}
+        or loop.kind != "iterator_loop"
+        or len(blocks["header"].arguments) != expected_arguments
+        or blocks["header"].arguments[0].value_id != "%index"
+        or blocks["header"].arguments[0].type != INT64
+        or blocks["header"].arguments[1].value_id != "%builder"
+        or blocks["header"].arguments[1].type != UNICODE_BUILDER
+        or blocks["body"].arguments
+        or blocks["exit"].arguments
+        != (TypedBlockArgument("%result_builder", UNICODE_BUILDER),)
+    ):
+        _fail("sequence_transform_cfg_mismatch")
+    state_value = None
+    if with_state:
+        state_argument = blocks["header"].arguments[2]
+        if state_argument.value_id != "%state" or state_argument.type != INT64:
+            _fail("sequence_transform_state_mismatch")
+        state_value = state_argument.value_id
+
+    operations = {operation.operation_id: operation for operation in module.operations}
+    definitions = {
+        operation.result_id: operation
+        for operation in module.operations
+        if operation.result_id is not None
+    }
+    by_block = {
+        block_id: tuple(operations[value] for value in block.operation_ids)
+        for block_id, block in blocks.items()
+    }
+    entry_operation_names = tuple(
+        operation.op for operation in by_block["entry"]
+    )
+    constant_count = entry_operation_names.count("constant")
+    if (
+        sorted(
+            name for name in entry_operation_names if name != "constant"
+        )
+        != sorted(
+            (
+                "argument",
+                "jump",
+                "sequence.builder.create",
+                "sequence.length",
+            )
+        )
+        or constant_count not in ({2, 3} if with_state else {2})
+    ):
+        _fail("sequence_transform_entry_operations_mismatch")
+    input_operation = _single_operation(
+        by_block["entry"],
+        "argument",
+        reason="sequence_transform_input_missing",
+    )
+    length = _single_operation(
+        by_block["entry"],
+        "sequence.length",
+        reason="sequence_transform_length_missing",
+    )
+    builder = _single_operation(
+        by_block["entry"],
+        "sequence.builder.create",
+        reason="sequence_transform_builder_missing",
+    )
+    entry_jump = _single_operation(
+        by_block["entry"],
+        "jump",
+        reason="sequence_transform_entry_jump_missing",
+    )
+    if (
+        input_operation.result_id is None
+        or input_operation.attribute("index") != "0"
+        or length.operands != (input_operation.result_id,)
+        or builder.result_id is None
+        or entry_jump.attribute("target_block") != "header"
+    ):
+        _fail("sequence_transform_entry_invalid")
+
+    comparison = _single_operation(
+        by_block["header"],
+        "compare.lt",
+        reason="sequence_transform_condition_missing",
+    )
+    branch = _single_operation(
+        by_block["header"],
+        "branch",
+        reason="sequence_transform_branch_missing",
+    )
+    if (
+        len(by_block["header"]) != 2
+        or length.result_id is None
+        or comparison.operands != ("%index", length.result_id)
+        or comparison.result_id is None
+        or branch.operands != (comparison.result_id,)
+        or branch.attribute("true_block") != "body"
+        or branch.attribute("false_block") != "exit"
+    ):
+        _fail("sequence_transform_condition_invalid")
+
+    item = _single_operation(
+        by_block["body"],
+        "sequence.get",
+        reason="sequence_transform_item_missing",
+    )
+    index_update = tuple(
+        operation
+        for operation in by_block["body"]
+        if operation.op == "binary.add" and "%index" in operation.operands
+    )
+    body_jump = _single_operation(
+        by_block["body"],
+        "jump",
+        reason="sequence_transform_backedge_missing",
+    )
+    if (
+        item.result_id is None
+        or item.operands != (input_operation.result_id, "%index")
+        or len(index_update) != 1
+        or index_update[0].result_id is None
+        or len(index_update[0].operands) != 2
+        or body_jump.attribute("target_block") != "header"
+    ):
+        _fail("sequence_transform_iteration_invalid")
+    increment_ids = tuple(
+        value for value in index_update[0].operands if value != "%index"
+    )
+    if (
+        len(increment_ids) != 1
+        or _constant_int(
+            definitions,
+            increment_ids[0],
+            reason="sequence_transform_increment_invalid",
+        )
+        != 1
+    ):
+        _fail("sequence_transform_increment_invalid")
+
+    entry_edge = next(
+        (
+            edge
+            for edge in module.control_edges
+            if edge.source_block == "entry"
+            and edge.target_block == "header"
+            and edge.kind == "jump"
+        ),
+        None,
+    )
+    backedge = next(
+        (
+            edge
+            for edge in module.control_edges
+            if edge.source_block == "body"
+            and edge.target_block == "header"
+            and edge.kind == "jump"
+        ),
+        None,
+    )
+    true_edge = next(
+        (
+            edge
+            for edge in module.control_edges
+            if edge.source_block == "header" and edge.kind == "branch_true"
+        ),
+        None,
+    )
+    false_edge = next(
+        (
+            edge
+            for edge in module.control_edges
+            if edge.source_block == "header" and edge.kind == "branch_false"
+        ),
+        None,
+    )
+    if (
+        len(module.control_edges) != 4
+        or entry_edge is None
+        or backedge is None
+        or true_edge is None
+        or true_edge.target_block != "body"
+        or true_edge.arguments
+        or false_edge is None
+        or false_edge.target_block != "exit"
+        or false_edge.arguments != ("%builder",)
+        or len(entry_edge.arguments) != expected_arguments
+        or len(backedge.arguments) != expected_arguments
+        or _constant_int(
+            definitions,
+            entry_edge.arguments[0],
+            reason="sequence_transform_initial_index_invalid",
+        )
+        != 0
+        or entry_edge.arguments[1] != builder.result_id
+        or backedge.arguments[0] != index_update[0].result_id
+    ):
+        _fail("sequence_transform_edges_invalid")
+
+    finish = _single_operation(
+        by_block["exit"],
+        "sequence.builder.finish",
+        reason="sequence_transform_finish_missing",
+    )
+    return_operation = _single_operation(
+        by_block["exit"],
+        "return",
+        reason="sequence_transform_return_missing",
+    )
+    if (
+        len(by_block["exit"]) != 2
+        or finish.operands != ("%result_builder",)
+        or finish.result_id is None
+        or return_operation.operands != (finish.result_id,)
+        or return_operation.operation_id != module.return_operation_id
+    ):
+        _fail("sequence_transform_exit_invalid")
+    collapsed = tuple(
+        sorted(
+            operation.operation_id
+            for operation in module.operations
+            if operation is not input_operation and operation is not return_operation
+        )
+    )
+    return _SequenceTransformScaffold(
+        input_operation.result_id,
+        item.result_id,
+        "%builder",
+        state_value,
+        finish.result_id,
+        operations,
+        definitions,
+        collapsed,
+    )
+
+
+def _match_unicode_map_kernel(lowering: TypedLoopLowering) -> _UnicodeMapKernel:
+    scaffold = _match_sequence_transform_scaffold(lowering, with_state=False)
+    body = tuple(
+        operation
+        for operation in lowering.module.operations
+        if operation.block_id == "body"
+    )
+    if sorted(operation.op for operation in body) != sorted(
+        (
+            "binary.add",
+            "immutable.lookup",
+            "jump",
+            "sequence.builder.append",
+            "sequence.get",
+        )
+    ):
+        _fail("unicode_map_operations_mismatch")
+    lookup = _single_operation(
+        body,
+        "immutable.lookup",
+        reason="unicode_map_lookup_missing",
+    )
+    append = _single_operation(
+        body,
+        "sequence.builder.append",
+        reason="unicode_map_append_missing",
+    )
+    keys = decode_int_table(lookup.attribute("keys") or "", max_items=256)
+    values = decode_int_table(lookup.attribute("values") or "", max_items=256)
+    backedge = next(
+        edge
+        for edge in lowering.module.control_edges
+        if edge.source_block == "body" and edge.kind == "jump"
+    )
+    if (
+        lookup.operands != (scaffold.item_value, scaffold.item_value)
+        or lookup.result_id is None
+        or append.operands != (scaffold.builder_value, lookup.result_id)
+        or append.result_id is None
+        or backedge.arguments[1] != append.result_id
+        or len(keys) != len(values)
+        or tuple(sorted(keys)) != keys
+        or len(set(keys)) != len(keys)
+    ):
+        _fail("unicode_map_dataflow_invalid")
+    return _UnicodeMapKernel(scaffold, keys, values)
+
+
+def _match_unicode_fsm_kernel(lowering: TypedLoopLowering) -> _UnicodeFsmKernel:
+    scaffold = _match_sequence_transform_scaffold(lowering, with_state=True)
+    body = tuple(
+        operation
+        for operation in lowering.module.operations
+        if operation.block_id == "body"
+    )
+    if sorted(operation.op for operation in body) != sorted(
+        (
+            "binary.add",
+            "fsm.transition",
+            "jump",
+            "sequence.builder.apply",
+            "sequence.get",
+            "unicode.property",
+        )
+    ):
+        _fail("unicode_fsm_operations_mismatch")
+    classifier = _single_operation(
+        body,
+        "unicode.property",
+        reason="unicode_fsm_classifier_missing",
+    )
+    transition = _single_operation(
+        body,
+        "fsm.transition",
+        reason="unicode_fsm_transition_missing",
+    )
+    apply = _single_operation(
+        body,
+        "sequence.builder.apply",
+        reason="unicode_fsm_builder_action_missing",
+    )
+    property_name = classifier.attribute("property") or ""
+    property_id = _UNICODE_PROPERTY_ID.get(property_name)
+    if property_id is None:
+        _fail("unicode_fsm_property_unsupported", property_name)
+    state_count = int(transition.attribute("state_count") or "0")
+    transitions = decode_int_table(
+        transition.attribute("transitions") or "",
+        max_items=128,
+        maximum=state_count - 1,
+    )
+    actions = decode_int_table(
+        apply.attribute("actions") or "",
+        max_items=128,
+        maximum=4,
+    )
+    emissions = decode_int_table(
+        apply.attribute("emissions") or "",
+        max_items=128,
+    )
+    entry_edge = next(
+        edge
+        for edge in lowering.module.control_edges
+        if edge.source_block == "entry" and edge.kind == "jump"
+    )
+    backedge = next(
+        edge
+        for edge in lowering.module.control_edges
+        if edge.source_block == "body" and edge.kind == "jump"
+    )
+    initial_state = _constant_int(
+        scaffold.definitions,
+        entry_edge.arguments[2],
+        reason="unicode_fsm_initial_state_invalid",
+    )
+    if (
+        classifier.operands != (scaffold.item_value,)
+        or classifier.result_id is None
+        or transition.operands != (scaffold.state_value, classifier.result_id)
+        or transition.result_id is None
+        or apply.operands
+        != (
+            scaffold.builder_value,
+            scaffold.item_value,
+            scaffold.state_value,
+            classifier.result_id,
+        )
+        or apply.result_id is None
+        or apply.attribute("state_count") != str(state_count)
+        or apply.attribute("class_count") != "2"
+        or transition.attribute("class_count") != "2"
+        or backedge.arguments[1:] != (apply.result_id, transition.result_id)
+        or not 0 <= initial_state < state_count
+        or len(transitions) != state_count * 2
+        or len(actions) != len(transitions)
+        or len(emissions) != len(transitions)
+    ):
+        _fail("unicode_fsm_dataflow_invalid")
+    return _UnicodeFsmKernel(
+        scaffold,
+        property_name,
+        property_id,
+        initial_state,
+        state_count,
+        transitions,
+        actions,
+        emissions,
+    )
+
+
+def _codepoint_string(values: tuple[int, ...]) -> str:
+    return "".join(chr(value) for value in values)
+
+
+def _lower_unicode_sequence_physical(
+    lowering: TypedLoopLowering,
+    helper: object,
+    *,
+    scaffold: _SequenceTransformScaffold,
+    physical_operation: str,
+    helper_global: str,
+    helper_arguments: tuple[object, ...],
+    property_id: int | None,
+    physical_attributes: tuple[tuple[str, str], ...],
+) -> PhysicalTypedLoopLowering:
+    if not callable(helper):
+        _fail("unicode_sequence_helper_unavailable")
+    module = lowering.module
+    lowerer = _CanonicalLoopLowerer(module, lowering.analysis)
+    input_operation = scaffold.definitions[scaffold.input_value]
+    function_body: list[ast.stmt] = [
+        _stamp(
+            ast.If(
+                ast.Compare(
+                    ast.Call(
+                        ast.Name("type", ast.Load()),
+                        [ast.Name("arg0", ast.Load())],
+                        [],
+                    ),
+                    [ast.IsNot()],
+                    [ast.Name("_input_type_0", ast.Load())],
+                ),
+                [
+                    ast.Raise(
+                        ast.Call(
+                            ast.Name("_TypedGuardMiss", ast.Load()),
+                            [ast.Constant("exact_input_type_guard")],
+                            [],
+                        ),
+                        None,
+                    )
+                ],
+                [],
+            ),
+            900,
+        )  # type: ignore[list-item]
+    ]
+    function_body.extend(lowerer._operation_statements(input_operation))
+    helper_line = lowerer.next_line
+    lowerer.next_line += 1
+    function_body.append(
+        _stamp(
+            ast.Assign(
+                [lowerer._name(scaffold.result_value, ast.Store())],
+                ast.Call(
+                    ast.Name(helper_global, ast.Load()),
+                    [
+                        lowerer._name(scaffold.input_value, ast.Load()),
+                        *(ast.Constant(value) for value in helper_arguments),
+                    ],
+                    [],
+                ),
+            ),
+            helper_line,
+        )  # type: ignore[arg-type]
+    )
+    for operation_id in scaffold.collapsed_operation_ids:
+        lowerer.lines[operation_id] = helper_line
+    return_operation = next(
+        operation for operation in module.operations if operation.op == "return"
+    )
+    function_body.append(
+        lowerer._record(
+            return_operation,
+            ast.Return(lowerer._name(scaffold.result_value, ast.Load())),
+        )
+    )
+    missing = set(scaffold.operations) - set(lowerer.lines)
+    if missing:
+        _fail("unmapped_physical_operations", ",".join(sorted(missing)))
+    function_node = ast.FunctionDef(
+        name="_typed_region",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg="arg0")],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=function_body,
+        decorator_list=[],
+    )
+    module_node = ast.fix_missing_locations(
+        ast.Module(body=[function_node], type_ignores=[])
+    )
+    code = compile(
+        module_node,
+        f"<udfjit-physical-{module.semantic_hash[:16]}>",
+        "exec",
+    )
+    globals_namespace: dict[str, object] = {
+        "_TypedGuardMiss": TypedGuardMiss,
+        "_input_type_0": str,
+        helper_global: helper,
+        "__builtins__": __builtins__,
+    }
+    namespace: dict[str, object] = {}
+    exec(code, globals_namespace, namespace)
+    function = namespace["_typed_region"]
+    if not isinstance(function, types.FunctionType):
+        raise RuntimeError("physical lowering did not create a function")
+    function.__module__ = "python_udf_jit.generated"
+    function.__qualname__ = "_typed_region"
+    function.__dict__["__udf_jit_typed_region__"] = module.semantic_hash
+    function.__dict__["__udf_jit_physical_operation__"] = physical_operation
+    return PhysicalTypedLoopLowering(
+        module.semantic_hash,
+        lowering.plan.plan_hash,
+        physical_operation,
+        property_id,
+        function,
+        ast.unparse(module_node),
+        ast.dump(
+            module_node,
+            annotate_fields=True,
+            include_attributes=False,
+            indent=2,
+        ),
+        hashlib.sha256(marshal.dumps(function.__code__)).hexdigest(),
+        tuple(sorted(lowerer.lines.items())),
+        physical_attributes,
+    )
+
+
+def lower_unicode_map_physical(
+    lowering: TypedLoopLowering,
+    helper: object,
+) -> PhysicalTypedLoopLowering:
+    kernel = _match_unicode_map_kernel(lowering)
+    return _lower_unicode_sequence_physical(
+        lowering,
+        helper,
+        scaffold=kernel.scaffold,
+        physical_operation="unicode.map_sequence",
+        helper_global="_unicode_map_sequence",
+        helper_arguments=(
+            _codepoint_string(kernel.keys),
+            _codepoint_string(kernel.values),
+        ),
+        property_id=None,
+        physical_attributes=(
+            ("keys", encode_int_table(kernel.keys)),
+            ("values", encode_int_table(kernel.values)),
+        ),
+    )
+
+
+def lower_unicode_fsm_physical(
+    lowering: TypedLoopLowering,
+    helper: object,
+) -> PhysicalTypedLoopLowering:
+    kernel = _match_unicode_fsm_kernel(lowering)
+    return _lower_unicode_sequence_physical(
+        lowering,
+        helper,
+        scaffold=kernel.scaffold,
+        physical_operation="unicode.fsm_sequence",
+        helper_global="_unicode_fsm_sequence",
+        helper_arguments=(
+            kernel.property_id,
+            kernel.initial_state,
+            _codepoint_string(
+                kernel.transitions + kernel.actions + kernel.emissions
+            ),
+        ),
+        property_id=kernel.property_id,
+        physical_attributes=(
+            ("actions", encode_int_table(kernel.actions)),
+            ("emissions", encode_int_table(kernel.emissions)),
+            ("initial_state", str(kernel.initial_state)),
+            ("property", kernel.property_name),
+            ("state_count", str(kernel.state_count)),
+            (
+                "transitions",
+                encode_int_table(kernel.transitions),
+            ),
+        ),
+    )
+
+
 def _specialization_plan(
     module: TypedSemanticModule,
     analysis: TypedAnalysisBundle,
@@ -1277,16 +2074,29 @@ def _specialization_plan(
         _fail("typed_sequence_required")
     if input_type.exactness is not Exactness.EXACT:
         _fail("exact_sequence_required")
-    if len(analysis.patterns.loops) != 1 or len(analysis.patterns.reductions) != 1:
-        _fail("single_reduction_loop_required")
+    if len(analysis.patterns.loops) != 1 or len(analysis.patterns.reductions) > 1:
+        _fail("single_typed_loop_required")
     loop = analysis.patterns.loops[0]
-    reduction = analysis.patterns.reductions[0]
     blocks = {block.block_id: block for block in module.blocks}
-    accumulator_type = next(
-        argument.type
-        for argument in blocks[loop.header].arguments
-        if argument.value_id == reduction.accumulator
-    )
+    if analysis.patterns.reductions:
+        reduction = analysis.patterns.reductions[0]
+        accumulator_type = next(
+            argument.type
+            for argument in blocks[loop.header].arguments
+            if argument.value_id == reduction.accumulator
+        )
+        reduction_operation = reduction.operation
+        result_strategy = "scalar_reduction"
+    elif analysis.patterns.builder_operations:
+        accumulator_type = next(
+            argument.type
+            for argument in blocks[loop.header].arguments
+            if argument.type.kind is TypeKind.BUILDER
+        )
+        reduction_operation = "none"
+        result_strategy = "sequence_builder"
+    else:
+        _fail("typed_loop_result_strategy_unsupported")
     iterator_strategy = {
         "str": "unicode_storage",
         "list": "exact_list_elements",
@@ -1305,7 +2115,16 @@ def _specialization_plan(
             )
             for operation in module.operations
             if operation.op.startswith("compare.")
-            or operation.op in {"select", "unicode.property"}
+            or operation.op
+            in {"fsm.transition", "immutable.lookup", "select", "unicode.property"}
+        )
+    )
+    state_operations = tuple(
+        sorted(
+            operation.op
+            for operation in module.operations
+            if operation.op == "fsm.transition"
+            or operation.op.startswith("sequence.builder")
         )
     )
     guards = tuple(
@@ -1324,20 +2143,29 @@ def _specialization_plan(
         "cfg_phi",
         "exact_type_guard",
         "typed_sequence_iteration",
-        "unboxed_accumulator",
     }
-    if input_type.name == "str":
+    if analysis.patterns.reductions:
+        requirements.add("unboxed_accumulator")
+    if analysis.patterns.builder_operations:
+        requirements.add("sequence_builder")
+    if analysis.patterns.immutable_lookup_operations:
+        requirements.add("immutable_lookup")
+    if analysis.patterns.fsm_operations:
+        requirements.add("table_fsm")
+    if any(operation.op == "unicode.property" for operation in module.operations):
         requirements.add("unicode_property_primitive")
     provisional = TypedLoopSpecializationPlan(
-        1,
+        2,
         module.semantic_hash,
         analysis.analysis_hash,
         loop.kind,
         iterator_strategy,
         input_type.name,
         input_type.parameters[0].name,
-        reduction.operation,
+        reduction_operation,
         accumulator_type.name,
+        result_strategy,
+        state_operations,
         predicates,
         guards,
         tuple(sorted(requirements)),

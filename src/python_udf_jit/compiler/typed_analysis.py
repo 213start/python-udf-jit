@@ -15,7 +15,7 @@ from python_udf_jit.compiler.typed_ir import (
 from python_udf_jit.compiler.typed_verifier import verify_typed_module
 
 
-TYPED_ANALYSIS_VERSION = 1
+TYPED_ANALYSIS_VERSION = 2
 
 
 def _hash(prefix: bytes, document: object) -> str:
@@ -41,6 +41,7 @@ class WorkDimension(StrEnum):
 class BehaviorFamily(StrEnum):
     NUMERIC_LOOP = "numeric_loop"
     BRANCH_FSM = "branch_fsm"
+    SEQUENCE_TRANSFORM = "sequence_transform"
     OBJECT_MANIPULATOR = "object_manipulator"
     CALL_DISPATCHER = "call_dispatcher"
     ASYNC_STATE_MACHINE = "async_state_machine"
@@ -338,12 +339,14 @@ class PatternAnalysis:
     reductions: tuple[ReductionPattern, ...]
     immutable_lookup_operations: tuple[str, ...]
     builder_operations: tuple[str, ...]
+    fsm_operations: tuple[str, ...]
     pattern_hash: str
 
     def semantic_document(self) -> dict[str, object]:
         return {
             "builder_operations": list(self.builder_operations),
             "format_version": self.format_version,
+            "fsm_operations": list(self.fsm_operations),
             "immutable_lookup_operations": list(self.immutable_lookup_operations),
             "loops": [value.to_document() for value in self.loops],
             "module_hash": self.module_hash,
@@ -369,6 +372,7 @@ class PatternAnalysis:
         expected = {
             "builder_operations",
             "format_version",
+            "fsm_operations",
             "immutable_lookup_operations",
             "loops",
             "module_hash",
@@ -384,6 +388,7 @@ class PatternAnalysis:
                 not isinstance(document[name], list)
                 for name in (
                     "builder_operations",
+                    "fsm_operations",
                     "immutable_lookup_operations",
                     "loops",
                     "reductions",
@@ -402,12 +407,17 @@ class PatternAnalysis:
             ),
             tuple(document["immutable_lookup_operations"]),
             tuple(document["builder_operations"]),
+            tuple(document["fsm_operations"]),
             document["pattern_hash"],
         )
         if (
             any(
                 not isinstance(value, str)
-                for value in (*result.immutable_lookup_operations, *result.builder_operations)
+                for value in (
+                    *result.immutable_lookup_operations,
+                    *result.builder_operations,
+                    *result.fsm_operations,
+                )
             )
             or result.recompute_hash() != result.pattern_hash
         ):
@@ -678,6 +688,7 @@ def _operation_dimension(operation: TypedOperation) -> WorkDimension:
     if operation.op.startswith("sequence.builder") or operation.op in {
         "sequence.get",
         "mapping.lookup",
+        "immutable.lookup",
     }:
         return WorkDimension.OBJECT
     if operation.op == "argument" and operation.result_type is not None and operation.result_type.name == "object":
@@ -726,13 +737,19 @@ def _behavior_family(
     *,
     has_reductions: bool,
     has_loops: bool,
+    has_fsm: bool,
+    has_builders: bool,
     object_operations: int,
     operation_count: int,
 ) -> BehaviorFamily:
     if has_reductions:
         return BehaviorFamily.NUMERIC_LOOP
-    if has_loops:
+    if has_loops and has_fsm:
         return BehaviorFamily.BRANCH_FSM
+    if has_loops and has_builders:
+        return BehaviorFamily.SEQUENCE_TRANSFORM
+    if has_loops:
+        return BehaviorFamily.MIXED
     if object_operations:
         return BehaviorFamily.OBJECT_MANIPULATOR
     if operation_count <= 4:
@@ -762,6 +779,11 @@ def _analyze_verified_typed_module(
     family = _behavior_family(
         has_reductions=bool(reductions),
         has_loops=bool(loops),
+        has_fsm=any(operation.op == "fsm.transition" for operation in module.operations),
+        has_builders=any(
+            operation.op.startswith("sequence.builder")
+            for operation in module.operations
+        ),
         object_operations=counts[WorkDimension.OBJECT],
         operation_count=operation_count,
     )
@@ -803,12 +825,17 @@ def _analyze_verified_typed_module(
         tuple(
             operation.operation_id
             for operation in module.operations
-            if operation.op == "mapping.lookup"
+            if operation.op in {"mapping.lookup", "immutable.lookup"}
         ),
         tuple(
             operation.operation_id
             for operation in module.operations
             if operation.op.startswith("sequence.builder")
+        ),
+        tuple(
+            operation.operation_id
+            for operation in module.operations
+            if operation.op == "fsm.transition"
         ),
         "",
     )

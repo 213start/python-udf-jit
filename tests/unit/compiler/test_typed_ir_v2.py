@@ -315,6 +315,100 @@ class TypedSemanticIrV2Tests(unittest.TestCase):
         self.assertEqual(execute_typed_module(module, ([3, -1, 4],)), 6)
         self.assertEqual(execute_typed_module(module, ([],)), 0)
 
+    def test_unicode_builder_action_rejects_non_unicode_builder(self) -> None:
+        integer_builder = TypeSpec(
+            TypeKind.BUILDER,
+            "int64.builder",
+            (INT64,),
+            Exactness.UNKNOWN,
+            "internal",
+        )
+        integer_sequence = TypeSpec(
+            TypeKind.SEQUENCE,
+            "list",
+            (INT64,),
+            Exactness.EXACT,
+            "python_object",
+        )
+        with self.assertRaisesRegex(TypedVerificationError, "type_mismatch"):
+            build_typed_module(
+                function_id="e" * 64,
+                entry_block="entry",
+                input_types=(INT64,),
+                output_type=integer_sequence,
+                blocks=(
+                    TypedBlock(
+                        "entry",
+                        (),
+                        ("op0", "op1", "op2", "op3", "op4", "op5", "op6"),
+                    ),
+                ),
+                control_edges=(),
+                operations=(
+                    _op(
+                        "op0",
+                        "entry",
+                        "argument",
+                        result_id="%item",
+                        result_type=INT64,
+                        attributes=(("index", "0"),),
+                    ),
+                    _op(
+                        "op1",
+                        "entry",
+                        "sequence.builder.create",
+                        result_id="%builder",
+                        result_type=integer_builder,
+                        may_raise=True,
+                        exception_order=0,
+                    ),
+                    _op(
+                        "op2",
+                        "entry",
+                        "constant",
+                        result_id="%state",
+                        result_type=INT64,
+                        literal=SemanticLiteral.from_value(0),
+                    ),
+                    _op(
+                        "op3",
+                        "entry",
+                        "constant",
+                        result_id="%class",
+                        result_type=BOOL,
+                        literal=SemanticLiteral.from_value(False),
+                    ),
+                    _op(
+                        "op4",
+                        "entry",
+                        "sequence.builder.apply",
+                        ("%builder", "%item", "%state", "%class"),
+                        result_id="%next_builder",
+                        result_type=integer_builder,
+                        attributes=(
+                            ("actions", "[2,2]"),
+                            ("class_count", "2"),
+                            ("emissions", "[32,32]"),
+                            ("state_count", "1"),
+                        ),
+                        may_raise=True,
+                        exception_order=1,
+                    ),
+                    _op(
+                        "op5",
+                        "entry",
+                        "sequence.builder.finish",
+                        ("%next_builder",),
+                        result_id="%result",
+                        result_type=integer_sequence,
+                        may_raise=True,
+                        exception_order=2,
+                    ),
+                    _op("op6", "entry", "return", ("%result",)),
+                ),
+                return_operation_id="op6",
+            )
+
     def test_edge_arguments_must_match_target_block_types(self) -> None:
         module = _unicode_count_module()
         edges = list(module.control_edges)

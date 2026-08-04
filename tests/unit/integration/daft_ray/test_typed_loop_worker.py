@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import functools
+import os
+import re
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from python_udf_jit.integration.daft_ray.typed_loop_worker import (
     WorkerTypedLoopAdapter,
@@ -43,6 +47,40 @@ def _make_receiver_trampoline(function):
         return wrapped(*args, **kwargs)
 
     return method
+
+
+def _make_result_transforming_receiver(function):
+    wrapped = _make_framework_wrapper(function)
+
+    @functools.wraps(wrapped)
+    def method(_self, *args, **kwargs):
+        return not wrapped(*args, **kwargs)
+
+    return method
+
+
+def _make_authorizing_receiver(function):
+    wrapped = _make_framework_wrapper(function)
+
+    @functools.wraps(wrapped)
+    def method(_self, *args, **kwargs):
+        if not args or args[0] != "allowed":
+            raise PermissionError("receiver-denied")
+        return wrapped(*args, **kwargs)
+
+    return method
+
+
+def _remap_text(text: str) -> str:
+    table = str.maketrans({"α": "a", "β": "b", "→": ">"})
+    return text.translate(table)
+
+
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def _collapse_text(text: str) -> str:
+    return _SPACE_RUN.sub(" ", text).strip()
 
 
 class _Backend:
@@ -109,6 +147,45 @@ class WorkerTypedLoopAdapterTests(unittest.TestCase):
         self.assertTrue(outcome.handled)
         self.assertTrue(outcome.value)
 
+    def test_result_transforming_receiver_is_not_unwrapped(self) -> None:
+        predicate, _ = _make_filter(0.5)
+        receiver = _make_result_transforming_receiver(predicate)
+
+        resolved = resolve_typed_loop_callable(receiver)
+        adapter = WorkerTypedLoopAdapter(
+            receiver,
+            candidate_id="candidate-test",
+            call_threshold=1,
+            backend=_Backend(),
+        )
+        outcome = adapter.invoke((object(), "abc-"), {})
+
+        self.assertIs(resolved.function, receiver)
+        self.assertEqual(resolved.wrapper_depth, 0)
+        self.assertFalse(outcome.handled)
+        self.assertEqual(outcome.reason_code, "typed_loop_input_shape")
+        self.assertFalse(receiver(object(), "abc-"))
+
+    def test_authorizing_receiver_is_not_unwrapped(self) -> None:
+        predicate, _ = _make_filter(0.5)
+        receiver = _make_authorizing_receiver(predicate)
+
+        resolved = resolve_typed_loop_callable(receiver)
+        adapter = WorkerTypedLoopAdapter(
+            receiver,
+            candidate_id="candidate-test",
+            call_threshold=1,
+            backend=_Backend(),
+        )
+        outcome = adapter.invoke((object(), "abc-"), {})
+
+        self.assertIs(resolved.function, receiver)
+        self.assertEqual(resolved.wrapper_depth, 0)
+        self.assertFalse(outcome.handled)
+        self.assertEqual(outcome.reason_code, "typed_loop_input_shape")
+        with self.assertRaisesRegex(PermissionError, "receiver-denied"):
+            receiver(object(), "abc-")
+
     def test_empty_input_side_exits_to_the_original_callable(self) -> None:
         predicate, _ = _make_filter(0.5)
         adapter = WorkerTypedLoopAdapter(
@@ -160,6 +237,106 @@ class WorkerTypedLoopAdapterTests(unittest.TestCase):
         self.assertTrue(first.terminal)
         self.assertFalse(second.handled)
         self.assertTrue(second.terminal)
+
+    def test_worker_executes_lookup_and_fsm_sequence_patterns(self) -> None:
+        cases = (
+            (_remap_text, "  α→β  "),
+            (_collapse_text, "  α\t→\nβ  "),
+        )
+        for function, value in cases:
+            with self.subTest(function=function.__name__):
+                backend = _Backend()
+                adapter = WorkerTypedLoopAdapter(
+                    _make_framework_wrapper(function),
+                    candidate_id="candidate-transform-test",
+                    call_threshold=1,
+                    backend=backend,
+                )
+
+                result = adapter.invoke((value,), {})
+
+                self.assertTrue(result.handled)
+                self.assertEqual(result.value, function(value))
+                self.assertEqual(adapter.snapshot().compile_successes, 1)
+                self.assertEqual(backend.calls, 1)
+
+    def test_candidate_diagnostic_selector_does_not_match_a_prefix(self) -> None:
+        policy = SimpleNamespace(selector="candidate:candidate-test")
+        prefix_collision = WorkerTypedLoopAdapter(
+            _remap_text,
+            candidate_id="candidate-test-extra",
+            backend=_Backend(),
+        )
+        exact = WorkerTypedLoopAdapter(
+            _remap_text,
+            candidate_id="candidate-test",
+            backend=_Backend(),
+        )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"UDFJIT_DIAGNOSTICS": "full"},
+                clear=True,
+            ),
+            mock.patch(
+                "python_udf_jit.diagnostics.config.resolve_diagnostic_policy",
+                return_value=policy,
+            ),
+            mock.patch(
+                "python_udf_jit.diagnostics.worker_runtime.WorkerDiagnosticRuntime"
+            ) as runtime,
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.typed_loop_worker."
+                "atexit.register"
+            ),
+        ):
+            self.assertIsNone(prefix_collision._diagnostic_sink(_remap_text))
+            self.assertIs(exact._diagnostic_sink(_remap_text), runtime.return_value)
+
+        runtime.assert_called_once()
+
+    def test_invalid_explicit_diagnostics_propagates_from_adapter(self) -> None:
+        adapter = WorkerTypedLoopAdapter(
+            _remap_text,
+            candidate_id="candidate-test",
+            call_threshold=1,
+            backend=_Backend(),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"UDFJIT_DIAGNOSTICS": "full"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "typed_loop_diagnostics_initialize_failed:"
+                "DiagnosticConfigurationError:.*output_missing",
+            ):
+                adapter.invoke(("α→β",), {})
+
+    def test_explicit_diagnostics_finalization_failure_propagates(self) -> None:
+        class FailingDiagnosticRuntime:
+            def record_typed_runtime_summary(self, _document) -> None:
+                pass
+
+            def finalize(self) -> None:
+                raise OSError("diagnostic-output-unavailable")
+
+        adapter = WorkerTypedLoopAdapter(
+            _remap_text,
+            candidate_id="candidate-test",
+            backend=_Backend(),
+        )
+        adapter._diagnostic_runtime = FailingDiagnosticRuntime()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "typed_loop_diagnostics_finalize_failed:"
+            "OSError:diagnostic-output-unavailable",
+        ):
+            adapter._finalize_diagnostics()
 
 
 if __name__ == "__main__":

@@ -53,9 +53,49 @@ def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _redacted_attribute_value(value: str) -> str:
+    """Replace canonical descriptor collections with fixed-size metadata."""
+
+    try:
+        descriptor = json.loads(value)
+    except (TypeError, ValueError):
+        return value
+    if isinstance(descriptor, list):
+        kind = "sequence"
+        shape = [len(descriptor)]
+    elif isinstance(descriptor, dict):
+        kind = "mapping"
+        shape = [len(descriptor)]
+    else:
+        return value
+    return json.dumps(
+        {
+            "count": len(descriptor),
+            "kind": kind,
+            "shape": shape,
+            "sha256": _hash_text(value),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _redacted_attributes_document(
+    attributes: list[list[str]],
+) -> list[list[str]]:
+    return [
+        [name, _redacted_attribute_value(value)]
+        for name, value in attributes
+    ]
+
+
 def _redacted_typed_module_document(module) -> dict[str, object]:
     document = module.to_document()
     for operation in document["operations"]:
+        operation["attributes"] = _redacted_attributes_document(
+            operation["attributes"]
+        )
         literal = operation["literal"]
         if literal is None:
             continue
@@ -65,6 +105,14 @@ def _redacted_typed_module_document(module) -> dict[str, object]:
                 literal["encoded_value"].encode("utf-8")
             ).hexdigest(),
         }
+    return document
+
+
+def _redacted_physical_lowering_document(physical) -> dict[str, object]:
+    document = physical.to_document()
+    document["physical_attributes"] = _redacted_attributes_document(
+        document["physical_attributes"]
+    )
     return document
 
 
@@ -592,9 +640,13 @@ class WorkerDiagnosticRuntime:
                 )
                 chain["generic_lowering"] = "available"
                 chain["generated_bytecode"] = "available"
-                if dict(backend.hir_opcode_counts).get(
-                    "UnicodeCountProperty",
-                    0,
+                if any(
+                    dict(backend.hir_opcode_counts).get(opcode, 0)
+                    for opcode in (
+                        "UnicodeCountProperty",
+                        "UnicodeFsmSequence",
+                        "UnicodeMapSequence",
+                    )
                 ):
                     chain["cinderx_hir"] = "available_summary"
                 compile_instance_id = (
@@ -740,7 +792,14 @@ class WorkerDiagnosticRuntime:
                             (
                                 "typed/physical-lowering.json",
                                 "application/json",
-                                physical.to_document(),
+                                (
+                                    physical.to_document()
+                                    if self.policy.source_policy
+                                    is DiagnosticSourcePolicy.TEXT
+                                    else _redacted_physical_lowering_document(
+                                        physical
+                                    )
+                                ),
                                 "physical",
                             ),
                             (

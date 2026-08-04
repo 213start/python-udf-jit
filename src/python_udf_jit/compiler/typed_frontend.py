@@ -8,6 +8,7 @@ import functools
 import hashlib
 import inspect
 import json
+import re
 import sys
 import textwrap
 import types
@@ -26,8 +27,11 @@ from python_udf_jit.compiler.typed_analysis import (
 )
 from python_udf_jit.compiler.typed_ir import (
     BOOL,
+    EXACT_UNICODE,
     FLOAT64,
     INT64,
+    UNICODE_BUILDER,
+    UNICODE_SCALAR,
     TypeKind,
     TypeSpec,
     TypedBlock,
@@ -36,6 +40,7 @@ from python_udf_jit.compiler.typed_ir import (
     TypedOperation,
     TypedSemanticModule,
     build_typed_module,
+    encode_int_table,
 )
 
 
@@ -121,19 +126,24 @@ class _RuntimeDependency:
     identity: bool = False
     layout: tuple[str, ...] = ()
 
-    @property
-    def sha256(self) -> str:
-        expected = (
-            {
+    def _expected_document(self) -> object:
+        if self.kind == "code":
+            return {
                 "code": code_identity_from_code(self.expected).sha256,  # type: ignore[arg-type]
             }
-            if self.kind == "code"
-            else {"builtin": self.name}
-            if self.identity
-            else SemanticLiteral.from_value(self.expected).to_document()  # type: ignore[arg-type]
-        )
+        if self.kind == "global_regex":
+            return {
+                "flags": self.expected.flags,  # type: ignore[union-attr]
+                "pattern": self.expected.pattern,  # type: ignore[union-attr]
+            }
+        if self.identity:
+            return {"builtin": self.name}
+        return SemanticLiteral.from_value(self.expected).to_document()  # type: ignore[arg-type]
+
+    @property
+    def sha256(self) -> str:
         document = {
-            "expected": expected,
+            "expected": self._expected_document(),
             "index": self.index,
             "kind": self.kind,
             "layout": list(self.layout),
@@ -174,7 +184,7 @@ class _RuntimeDependency:
             if self.index is None or self.index >= len(closure):
                 raise LookupError(self.name)
             return closure[self.index].cell_contents
-        if self.kind == "global":
+        if self.kind in {"global", "global_regex"}:
             return function.__globals__[self.name]
         if self.kind == "builtin":
             if self.name in function.__globals__:
@@ -240,6 +250,40 @@ class _LoopPlan:
     predicate_source_line: int | None
     update_source_line: int
     return_source_line: int
+
+
+@dataclass(frozen=True)
+class _SequenceTransformPlan:
+    input_name: str
+    function_source_line: int
+    setup_source_line: int
+    loop_source_line: int
+    transform_source_line: int
+    return_source_line: int
+
+
+@dataclass(frozen=True)
+class _ImmutableLookupTransformPlan(_SequenceTransformPlan):
+    lookup_keys: tuple[int, ...]
+    lookup_values: tuple[int, ...]
+
+    @property
+    def kind(self) -> str:
+        return "immutable_lookup_builder"
+
+
+@dataclass(frozen=True)
+class _UnicodeFsmTransformPlan(_SequenceTransformPlan):
+    unicode_property: str
+    initial_state: int
+    state_count: int
+    transitions: tuple[int, ...]
+    actions: tuple[int, ...]
+    emissions: tuple[int, ...]
+
+    @property
+    def kind(self) -> str:
+        return "unicode_fsm_builder"
 
 
 @dataclass(frozen=True)
@@ -588,8 +632,17 @@ def _builtin_dependencies(
         for call in ast.walk(node)
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Name)
-        and call.func.id in {"len", "sum"}
+        and call.func.id in {"len", "sum", "str"}
     }
+    if any(
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "maketrans"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "str"
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+    ):
+        call_names.add("str")
     dependencies: list[_RuntimeDependency] = []
     local_names = {
         *function.__code__.co_varnames,
@@ -833,6 +886,220 @@ def _parse_explicit(
     )
 
 
+def _translation_table(call: ast.Call) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    if not (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "maketrans"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "str"
+        and len(call.args) == 1
+        and not call.keywords
+        and isinstance(call.args[0], ast.Dict)
+    ):
+        _fail("translation_table_unsupported")
+    entries: dict[int, int] = {}
+    for key_node, value_node in zip(
+        call.args[0].keys,
+        call.args[0].values,
+        strict=True,
+    ):
+        if (
+            key_node is None
+            or not isinstance(key_node, ast.Constant)
+            or type(key_node.value) is not str
+            or len(key_node.value) != 1
+        ):
+            _fail("translation_key_unsupported")
+        if (
+            not isinstance(value_node, ast.Constant)
+            or type(value_node.value) is not str
+            or len(value_node.value) != 1
+        ):
+            _fail("translation_value_unsupported")
+        entries[ord(key_node.value)] = ord(value_node.value)
+    ordered = tuple(sorted(entries.items()))
+    return (
+        tuple(key for key, _ in ordered),
+        tuple(value for _, value in ordered),
+    )
+
+
+def _translation_plan(
+    input_name: str,
+    statements: list[ast.stmt],
+    *,
+    function_source_line: int,
+) -> _SequenceTransformPlan | None:
+    table_call: ast.Call | None = None
+    table_name: str | None = None
+    setup_line: int | None = None
+    return_statement: ast.Return | None = None
+    if (
+        len(statements) == 2
+        and isinstance(statements[0], ast.Assign)
+        and len(statements[0].targets) == 1
+        and isinstance(statements[0].targets[0], ast.Name)
+        and isinstance(statements[0].value, ast.Call)
+        and isinstance(statements[1], ast.Return)
+        and statements[1].value is not None
+    ):
+        table_name = statements[0].targets[0].id
+        table_call = statements[0].value
+        setup_line = statements[0].lineno
+        return_statement = statements[1]
+    elif (
+        len(statements) == 1
+        and isinstance(statements[0], ast.Return)
+        and statements[0].value is not None
+    ):
+        return_statement = statements[0]
+    else:
+        return None
+
+    expression = return_statement.value
+    if not (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr == "translate"
+        and isinstance(expression.func.value, ast.Name)
+        and expression.func.value.id == input_name
+        and len(expression.args) == 1
+        and not expression.keywords
+    ):
+        return None
+    if table_call is not None and table_name == input_name:
+        _fail("translation_input_binding_rebound")
+    argument = expression.args[0]
+    if table_call is None:
+        if not isinstance(argument, ast.Call):
+            _fail("translation_table_unsupported")
+        table_call = argument
+        setup_line = argument.lineno
+    elif not (
+        isinstance(argument, ast.Name)
+        and argument.id == table_name
+    ):
+        _fail("translation_table_binding_mismatch")
+    keys, values = _translation_table(table_call)
+    assert setup_line is not None
+    return _ImmutableLookupTransformPlan(
+        input_name=input_name,
+        function_source_line=function_source_line,
+        setup_source_line=setup_line,
+        loop_source_line=expression.lineno,
+        transform_source_line=expression.lineno,
+        return_source_line=return_statement.lineno,
+        lookup_keys=keys,
+        lookup_values=values,
+    )
+
+
+def _regex_fsm_plan(
+    function: types.FunctionType,
+    input_name: str,
+    statements: list[ast.stmt],
+    *,
+    function_source_line: int,
+) -> tuple[_SequenceTransformPlan, _RuntimeDependency] | None:
+    if not (
+        len(statements) == 1
+        and isinstance(statements[0], ast.Return)
+        and statements[0].value is not None
+    ):
+        return None
+    return_statement = statements[0]
+    strip_call = return_statement.value
+    if not (
+        isinstance(strip_call, ast.Call)
+        and isinstance(strip_call.func, ast.Attribute)
+        and strip_call.func.attr == "strip"
+        and not strip_call.args
+        and not strip_call.keywords
+    ):
+        return None
+    sub_call = strip_call.func.value
+    if not (
+        isinstance(sub_call, ast.Call)
+        and isinstance(sub_call.func, ast.Attribute)
+        and sub_call.func.attr == "sub"
+        and isinstance(sub_call.func.value, ast.Name)
+        and len(sub_call.args) == 2
+        and not sub_call.keywords
+        and isinstance(sub_call.args[1], ast.Name)
+        and sub_call.args[1].id == input_name
+    ):
+        return None
+    regex_name = sub_call.func.value.id
+    regex = function.__globals__.get(regex_name)
+    if type(regex) is not re.Pattern:
+        return None
+    if regex.pattern != r"\s+" or regex.flags != re.UNICODE:
+        _fail("regex_language_unsupported")
+    replacement = sub_call.args[0]
+    if (
+        not isinstance(replacement, ast.Constant)
+        or type(replacement.value) is not str
+        or len(replacement.value) != 1
+        or not replacement.value.isspace()
+    ):
+        _fail("regex_replacement_unsupported")
+
+    # Boolean class 0 is non-space and class 1 is space.  The table describes
+    # leading, emitted, and pending-space states without naming an operator.
+    transitions = (1, 0, 1, 2, 1, 2)
+    actions = (1, 0, 1, 0, 3, 0)
+    emissions = (0, 0, 0, 0, ord(replacement.value), 0)
+    return (
+        _UnicodeFsmTransformPlan(
+            input_name=input_name,
+            function_source_line=function_source_line,
+            setup_source_line=sub_call.lineno,
+            loop_source_line=sub_call.lineno,
+            transform_source_line=sub_call.lineno,
+            return_source_line=return_statement.lineno,
+            unicode_property="space",
+            initial_state=0,
+            state_count=3,
+            transitions=transitions,
+            actions=actions,
+            emissions=emissions,
+        ),
+        _RuntimeDependency(
+            "global_regex",
+            regex_name,
+            None,
+            regex,
+            identity=True,
+        ),
+    )
+
+
+def _parse_sequence_transform(
+    function: types.FunctionType,
+    input_name: str,
+    statements: list[ast.stmt],
+    *,
+    function_source_line: int,
+) -> tuple[_SequenceTransformPlan, tuple[_RuntimeDependency, ...]] | None:
+    translation = _translation_plan(
+        input_name,
+        statements,
+        function_source_line=function_source_line,
+    )
+    if translation is not None:
+        return translation, ()
+    regex = _regex_fsm_plan(
+        function,
+        input_name,
+        statements,
+        function_source_line=function_source_line,
+    )
+    if regex is not None:
+        plan, dependency = regex
+        return plan, (dependency,)
+    return None
+
+
 def _literal_type(value: object) -> TypeSpec:
     if type(value) is bool:
         return BOOL
@@ -849,7 +1116,7 @@ class _ModuleBuilder:
         *,
         function_id: str,
         input_type: TypeSpec,
-        plan: _LoopPlan,
+        plan: _LoopPlan | _SequenceTransformPlan,
         constants: dict[str, object],
         source_first_line: int,
         runtime_dependency_hashes: tuple[str, ...],
@@ -1041,6 +1308,8 @@ class _ModuleBuilder:
         _fail("return_expression_unsupported", type(expression).__name__)
 
     def build(self) -> TypedSemanticModule:
+        if not isinstance(self.plan, _LoopPlan):
+            _fail("reduction_plan_required")
         if self.input_type.kind is not TypeKind.SEQUENCE:
             _fail("input_type_not_sequence")
         accumulator_type = _literal_type(self.plan.initial_value)
@@ -1268,6 +1537,233 @@ class _ModuleBuilder:
             runtime_dependency_hashes=self.runtime_dependency_hashes,
         )
 
+    def build_sequence_transform(self) -> TypedSemanticModule:
+        if not isinstance(self.plan, _SequenceTransformPlan):
+            _fail("sequence_transform_plan_required")
+        plan = self.plan
+        if self.input_type != EXACT_UNICODE:
+            _fail("exact_unicode_transform_required")
+        input_value = self.operation(
+            "entry",
+            "argument",
+            result_type=self.input_type,
+            attributes=(("index", "0"),),
+            source_offset=plan.function_source_line,
+        )
+        assert input_value is not None
+        zero = self.constant(0, source_offset=plan.loop_source_line)
+        one = self.constant(1, source_offset=plan.loop_source_line)
+        length = self.operation(
+            "entry",
+            "sequence.length",
+            (input_value,),
+            result_type=INT64,
+            source_offset=plan.loop_source_line,
+        )
+        builder = self.operation(
+            "entry",
+            "sequence.builder.create",
+            result_type=UNICODE_BUILDER,
+            may_raise=True,
+            source_offset=plan.setup_source_line,
+        )
+        assert length is not None and builder is not None
+        initial_state: str | None = None
+        if isinstance(plan, _UnicodeFsmTransformPlan):
+            initial_state = self.constant(
+                plan.initial_state,
+                source_offset=plan.setup_source_line,
+            )
+        self.operation(
+            "entry",
+            "jump",
+            attributes=(("target_block", "header"),),
+            source_offset=plan.loop_source_line,
+        )
+
+        continue_value = self.operation(
+            "header",
+            "compare.lt",
+            ("%index", length),
+            result_type=BOOL,
+            source_offset=plan.loop_source_line,
+        )
+        assert continue_value is not None
+        self.operation(
+            "header",
+            "branch",
+            (continue_value,),
+            attributes=(("false_block", "exit"), ("true_block", "body")),
+            source_offset=plan.loop_source_line,
+        )
+
+        item = self.operation(
+            "body",
+            "sequence.get",
+            (input_value, "%index"),
+            result_type=UNICODE_SCALAR,
+            may_raise=True,
+            source_offset=plan.loop_source_line,
+        )
+        assert item is not None
+        if isinstance(plan, _ImmutableLookupTransformPlan):
+            mapped = self.operation(
+                "body",
+                "immutable.lookup",
+                (item, item),
+                result_type=UNICODE_SCALAR,
+                attributes=(
+                    ("keys", encode_int_table(plan.lookup_keys)),
+                    ("values", encode_int_table(plan.lookup_values)),
+                ),
+                source_offset=plan.transform_source_line,
+            )
+            assert mapped is not None
+            next_builder = self.operation(
+                "body",
+                "sequence.builder.append",
+                ("%builder", mapped),
+                result_type=UNICODE_BUILDER,
+                may_raise=True,
+                source_offset=plan.transform_source_line,
+            )
+            next_state = None
+        elif isinstance(plan, _UnicodeFsmTransformPlan):
+            classification = self.operation(
+                "body",
+                "unicode.property",
+                (item,),
+                result_type=BOOL,
+                attributes=(("property", plan.unicode_property),),
+                source_offset=plan.transform_source_line,
+            )
+            assert classification is not None
+            transition_attributes = (
+                ("class_count", "2"),
+                ("state_count", str(plan.state_count)),
+                ("transitions", encode_int_table(plan.transitions)),
+            )
+            next_state = self.operation(
+                "body",
+                "fsm.transition",
+                ("%state", classification),
+                result_type=INT64,
+                attributes=transition_attributes,
+                source_offset=plan.transform_source_line,
+            )
+            next_builder = self.operation(
+                "body",
+                "sequence.builder.apply",
+                ("%builder", item, "%state", classification),
+                result_type=UNICODE_BUILDER,
+                attributes=(
+                    ("actions", encode_int_table(plan.actions)),
+                    ("class_count", "2"),
+                    ("emissions", encode_int_table(plan.emissions)),
+                    ("state_count", str(plan.state_count)),
+                ),
+                may_raise=True,
+                source_offset=plan.transform_source_line,
+            )
+        else:
+            _fail("sequence_transform_kind_unsupported", plan.kind)
+        next_index = self.operation(
+            "body",
+            "binary.add",
+            ("%index", one),
+            result_type=INT64,
+            source_offset=plan.loop_source_line,
+        )
+        assert next_builder is not None and next_index is not None
+        self.operation(
+            "body",
+            "jump",
+            attributes=(("target_block", "header"),),
+            source_offset=plan.loop_source_line,
+        )
+
+        result = self.operation(
+            "exit",
+            "sequence.builder.finish",
+            ("%result_builder",),
+            result_type=EXACT_UNICODE,
+            may_raise=True,
+            source_offset=plan.return_source_line,
+        )
+        assert result is not None
+        self.operation(
+            "exit",
+            "return",
+            (result,),
+            source_offset=plan.return_source_line,
+        )
+        header_arguments = [
+            TypedBlockArgument("%index", INT64),
+            TypedBlockArgument("%builder", UNICODE_BUILDER),
+        ]
+        entry_arguments = [zero, builder]
+        backedge_arguments = [next_index, next_builder]
+        if initial_state is not None:
+            assert next_state is not None
+            header_arguments.append(TypedBlockArgument("%state", INT64))
+            entry_arguments.append(initial_state)
+            backedge_arguments.append(next_state)
+        flat_operations = tuple(
+            operation
+            for block_id in ("entry", "header", "body", "exit")
+            for operation in self.operations[block_id]
+        )
+        blocks = tuple(
+            TypedBlock(
+                block_id,
+                arguments,
+                tuple(
+                    operation.operation_id
+                    for operation in self.operations[block_id]
+                ),
+            )
+            for block_id, arguments in (
+                ("entry", ()),
+                ("header", tuple(header_arguments)),
+                ("body", ()),
+                (
+                    "exit",
+                    (TypedBlockArgument("%result_builder", UNICODE_BUILDER),),
+                ),
+            )
+        )
+        return build_typed_module(
+            function_id=self.function_id,
+            entry_block="entry",
+            input_types=(self.input_type,),
+            output_type=EXACT_UNICODE,
+            blocks=blocks,
+            control_edges=(
+                TypedControlEdge(
+                    "entry",
+                    "header",
+                    "jump",
+                    tuple(entry_arguments),
+                ),
+                TypedControlEdge("header", "body", "branch_true"),
+                TypedControlEdge(
+                    "header",
+                    "exit",
+                    "branch_false",
+                    ("%builder",),
+                ),
+                TypedControlEdge(
+                    "body",
+                    "header",
+                    "jump",
+                    tuple(backedge_arguments),
+                ),
+            ),
+            operations=flat_operations,
+            return_operation_id=self.operations["exit"][-1].operation_id,
+            runtime_dependency_hashes=self.runtime_dependency_hashes,
+        )
+
 
 def capture_typed_loop(
     function: types.FunctionType,
@@ -1302,18 +1798,6 @@ def capture_typed_loop(
         layout,
         bound_arguments,
     )
-    dependencies = (
-        _RuntimeDependency(
-            "code",
-            "__code__",
-            None,
-            function.__code__,
-            True,
-        ),
-        *constant_dependencies,
-        *_builtin_dependencies(function, node),
-    )
-    runtime_guard = TypedRuntimeGuard(function, dependencies)
     statements = _strip_docstring(list(node.body))
     statements, entry_guard = _strip_non_empty_side_exit(
         statements,
@@ -1322,7 +1806,22 @@ def capture_typed_loop(
         allow_guarded_region=allow_guarded_region,
     )
     statements = _inline_single_reduction_binding(statements)
-    if len(statements) == 1 and isinstance(statements[0], ast.Return) and statements[0].value is not None:
+    transform = _parse_sequence_transform(
+        function,
+        input_name,
+        statements,
+        function_source_line=node.lineno,
+    )
+    transform_dependencies: tuple[_RuntimeDependency, ...] = ()
+    normalized_pattern = "iterator_reduction"
+    if transform is not None:
+        plan, transform_dependencies = transform
+        normalized_pattern = f"iterator_{plan.kind}"
+    elif (
+        len(statements) == 1
+        and isinstance(statements[0], ast.Return)
+        and statements[0].value is not None
+    ):
         plan = _parse_generator(
             input_name,
             statements[0].value,
@@ -1336,21 +1835,39 @@ def capture_typed_loop(
             constants,
             function_source_line=node.lineno,
         )
-    module = _ModuleBuilder(
+    dependencies = (
+        _RuntimeDependency(
+            "code",
+            "__code__",
+            None,
+            function.__code__,
+            True,
+        ),
+        *constant_dependencies,
+        *_builtin_dependencies(function, node),
+        *transform_dependencies,
+    )
+    runtime_guard = TypedRuntimeGuard(function, dependencies)
+    builder = _ModuleBuilder(
         function_id=identity.sha256,
         input_type=input_types[0],
         plan=plan,
         constants=constants,
         source_first_line=source_first_line,
         runtime_dependency_hashes=runtime_guard.dependency_hashes,
-    ).build()
+    )
+    module = (
+        builder.build_sequence_transform()
+        if isinstance(plan, _SequenceTransformPlan)
+        else builder.build()
+    )
     return TypedCaptureResult(
         module,
         analyze_typed_module(module),
         identity.sha256,
         hashlib.sha256(source.encode("utf-8")).hexdigest(),
         source_first_line,
-        "iterator_reduction",
+        normalized_pattern,
         runtime_guard.dependency_hashes,
         runtime_guard,
         entry_guard,

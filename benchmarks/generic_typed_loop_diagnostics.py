@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 import cinderx
@@ -45,16 +46,43 @@ def alnum_ratio(text: str, threshold: float = 0.72) -> bool:
     return sum(1 for character in text if character.isalnum()) / len(text) >= threshold
 
 
+def scalar_remap(text: str) -> str:
+    table = str.maketrans({"α": "a", "β": "b", "→": ">"})
+    return text.translate(table)
+
+
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def collapse_space_runs(text: str) -> str:
+    return _SPACE_RUN.sub(" ", text).strip()
+
+
+_PATTERNS = {
+    "reduction": (alnum_ratio, "CinderX 数据 123!"),
+    "mapping": (scalar_remap, "α→β and 中文"),
+    "fsm": (collapse_space_runs, "  CinderX\t数据  123! "),
+}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--pattern",
+        choices=tuple(_PATTERNS),
+        default="reduction",
+    )
     arguments = parser.parse_args()
+    function, sample = _PATTERNS[arguments.pattern]
     output = arguments.output.resolve()
     policy = resolve_diagnostic_policy(
         {
             "UDFJIT_DIAGNOSTICS": "full",
             "UDFJIT_DIAGNOSTIC_DIR": str(output),
-            "UDFJIT_DIAGNOSTIC_FILTER": "candidate:generic-typed-loop",
+            "UDFJIT_DIAGNOSTIC_FILTER": (
+                f"candidate:generic-typed-{arguments.pattern}"
+            ),
             "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
             "UDFJIT_DIAGNOSTIC_PERF": "off",
             "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
@@ -68,14 +96,14 @@ def main() -> int:
     )
     runtime = WorkerDiagnosticRuntime(
         policy,
-        run_id="generic-typed-loop-diagnostic",
+        run_id=f"generic-typed-{arguments.pattern}-diagnostic",
         runtime_mode="auto",
         process_key=f"worker-{os.getpid()}",
         process_id=os.getpid(),
-        user_function=alnum_ratio,
+        user_function=function,
     )
     captured = capture_typed_loop(
-        alnum_ratio,
+        function,
         input_types=(EXACT_UNICODE,),
     )
     decision = TypedRegionCompiler(
@@ -95,8 +123,7 @@ def main() -> int:
         raise RuntimeError(
             f"typed compilation failed: {decision.status}:{decision.reason_code}"
         )
-    sample = "CinderX 数据 123!"
-    if decision.variant(sample) != alnum_ratio(sample):
+    if decision.variant(sample) != function(sample):
         raise AssertionError("diagnostic variant changed the UDF result")
     bundle_reference = runtime.finalize()
     if bundle_reference is None:
@@ -116,6 +143,7 @@ def main() -> int:
         "cinderx_hir",
         "cinderx_lir",
         "machine",
+        "physical_lowering",
     )
     unavailable = {
         stage: chain.get(stage)
@@ -136,8 +164,16 @@ def main() -> int:
         "bundle_status": bundle.status.value,
         "chain": chain,
         "execution_mode": decision.variant.execution_mode,
+        "hir_opcode_counts": dict(decision.variant.backend.hir_opcode_counts),
         "linked_operations": linked_operations,
+        "normalized_pattern": captured.normalized_pattern,
         "operation_count": len(provenance["entries"]),
+        "pattern": arguments.pattern,
+        "physical_operation": (
+            decision.variant.backend.physical_lowering.physical_operation
+            if decision.variant.backend.physical_lowering is not None
+            else None
+        ),
         "semantic_hash": captured.module.semantic_hash,
     }
     print(json.dumps(document, sort_keys=True))

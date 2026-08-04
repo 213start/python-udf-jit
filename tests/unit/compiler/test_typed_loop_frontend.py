@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import inspect
+import re
 import unittest
 from unittest import mock
 
@@ -18,8 +20,13 @@ from python_udf_jit.compiler.typed_ir import (
     Exactness,
     TypeKind,
     TypeSpec,
+    rehash_typed_module,
 )
 from python_udf_jit.compiler.typed_reference import execute_typed_module
+from python_udf_jit.compiler.typed_verifier import (
+    TypedVerificationError,
+    verify_typed_module,
+)
 
 
 def generator_ratio(text: str, min_ratio: float = 0.5) -> bool:
@@ -159,6 +166,50 @@ def guarded_bound_ratio(text: str, *, minimum: float) -> bool:
     return accepted / len(text) >= minimum
 
 
+def punctuation_transform(text: str) -> str:
+    table = str.maketrans(
+        {
+            "\u201c": '"',
+            "\u201d": '"',
+            "\u2018": "'",
+            "\u2019": "'",
+            "\u2013": "-",
+            "\u2014": "-",
+        }
+    )
+    return text.translate(table)
+
+
+def unrelated_symbol_remap(payload: str) -> str:
+    substitutions = str.maketrans({"α": "a", "β": "b", "→": ">"})
+    return payload.translate(substitutions)
+
+
+def input_shadowing_translation(text: str) -> str:
+    text = str.maketrans({"α": "a"})
+    return text.translate(text)
+
+
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def whitespace_transform(text: str) -> str:
+    return _SPACE_RUN.sub(" ", text).strip()
+
+
+def unrelated_run_collapse(payload: str) -> str:
+    return _SPACE_RUN.sub("\u2003", payload).strip()
+
+
+def unsupported_expanding_translation(text: str) -> str:
+    table = str.maketrans({"…": "..."})
+    return text.translate(table)
+
+
+def unsupported_nonspace_replacement(text: str) -> str:
+    return _SPACE_RUN.sub("_", text).strip()
+
+
 class TypedLoopFrontendTests(unittest.TestCase):
     @staticmethod
     def _integer_sequence() -> TypeSpec:
@@ -202,6 +253,166 @@ class TypedLoopFrontendTests(unittest.TestCase):
                 execute_typed_module(explicit.module, (text,)),
                 explicit_ratio(text),
             )
+
+    def test_scalar_translation_normalizes_to_immutable_lookup_and_builder(
+        self,
+    ) -> None:
+        for function in (punctuation_transform, unrelated_symbol_remap):
+            with self.subTest(function=function.__name__):
+                captured = capture_typed_loop(
+                    function,
+                    input_types=(EXACT_UNICODE,),
+                )
+
+                operations = {operation.op for operation in captured.module.operations}
+                self.assertEqual(
+                    captured.normalized_pattern,
+                    "iterator_immutable_lookup_builder",
+                )
+                self.assertIn("immutable.lookup", operations)
+                self.assertIn("sequence.builder.append", operations)
+                self.assertIn("sequence.builder.finish", operations)
+                self.assertEqual(
+                    captured.analysis.behavior.family.value,
+                    "sequence_transform",
+                )
+                for value in ("", "plain ASCII", "“α—β” → ‘x’", "中文\u2003"):
+                    self.assertEqual(
+                        execute_typed_module(captured.module, (value,)),
+                        function(value),
+                    )
+
+        encoded = json.dumps(
+            capture_typed_loop(
+                punctuation_transform,
+                input_types=(EXACT_UNICODE,),
+            ).module.to_document(),
+            sort_keys=True,
+        ).lower()
+        self.assertNotIn("punctuation", encoded)
+
+    def test_translation_capture_proves_the_input_binding_is_not_rebound(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            TypedCaptureError,
+            "translation_input_binding_rebound",
+        ):
+            capture_typed_loop(
+                input_shadowing_translation,
+                input_types=(EXACT_UNICODE,),
+            )
+
+        captured = capture_typed_loop(
+            unrelated_symbol_remap,
+            input_types=(EXACT_UNICODE,),
+        )
+        self.assertEqual(
+            captured.normalized_pattern,
+            "iterator_immutable_lookup_builder",
+        )
+
+    def test_unicode_space_collapse_normalizes_to_fsm_and_builder(self) -> None:
+        for function in (whitespace_transform, unrelated_run_collapse):
+            with self.subTest(function=function.__name__):
+                captured = capture_typed_loop(
+                    function,
+                    input_types=(EXACT_UNICODE,),
+                )
+
+                operations = {operation.op for operation in captured.module.operations}
+                self.assertEqual(
+                    captured.normalized_pattern,
+                    "iterator_unicode_fsm_builder",
+                )
+                self.assertIn("unicode.property", operations)
+                self.assertIn("fsm.transition", operations)
+                self.assertIn("sequence.builder.apply", operations)
+                self.assertEqual(
+                    captured.analysis.behavior.family.value,
+                    "branch_fsm",
+                )
+                self.assertTrue(captured.analysis.patterns.fsm_operations)
+                for value in (
+                    "",
+                    "plain",
+                    "  a\t\nb  ",
+                    "\u2003中文\u2029  text\u3000",
+                    "\x1cA\x1fB\x85",
+                ):
+                    self.assertEqual(
+                        execute_typed_module(captured.module, (value,)),
+                        function(value),
+                    )
+
+    def test_transform_subset_rejects_semantics_it_cannot_preserve(self) -> None:
+        with self.assertRaisesRegex(
+            TypedCaptureError,
+            "translation_value_unsupported",
+        ):
+            capture_typed_loop(
+                unsupported_expanding_translation,
+                input_types=(EXACT_UNICODE,),
+            )
+        with self.assertRaisesRegex(
+            TypedCaptureError,
+            "regex_replacement_unsupported",
+        ):
+            capture_typed_loop(
+                unsupported_nonspace_replacement,
+                input_types=(EXACT_UNICODE,),
+            )
+
+    def test_regex_binding_is_part_of_the_runtime_guard(self) -> None:
+        global _SPACE_RUN
+        captured = capture_typed_loop(
+            whitespace_transform,
+            input_types=(EXACT_UNICODE,),
+        )
+        original = _SPACE_RUN
+        try:
+            _SPACE_RUN = re.compile(r"(?:\s)+")
+            self.assertFalse(captured.runtime_guard.matches())
+        finally:
+            _SPACE_RUN = original
+
+    def test_transform_descriptors_are_canonical_and_verified(self) -> None:
+        cases = (
+            (punctuation_transform, "immutable.lookup", "keys", "[8216, 8217]"),
+            (whitespace_transform, "fsm.transition", "transitions", "[1,0]"),
+        )
+        for function, op_name, attribute_name, invalid_value in cases:
+            with self.subTest(function=function.__name__):
+                module = capture_typed_loop(
+                    function,
+                    input_types=(EXACT_UNICODE,),
+                ).module
+                operations = tuple(
+                    dataclasses.replace(
+                        operation,
+                        attributes=tuple(
+                            sorted(
+                                (
+                                    key,
+                                    invalid_value if key == attribute_name else value,
+                                )
+                                for key, value in operation.attributes
+                            )
+                        ),
+                    )
+                    if operation.op == op_name
+                    else operation
+                    for operation in module.operations
+                )
+                invalid = rehash_typed_module(
+                    dataclasses.replace(module, operations=operations)
+                )
+
+                with self.assertRaisesRegex(
+                    TypedVerificationError,
+                    "invalid_attributes|type_mismatch",
+                ):
+                    verify_typed_module(invalid)
 
     def test_bound_argument_and_guarded_region_normalize_generically(self) -> None:
         captured = capture_typed_loop(

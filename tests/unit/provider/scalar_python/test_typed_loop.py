@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,8 @@ from python_udf_jit.provider.scalar_python.typed_loop import (
     TypedLoweringError,
     TypedRegionCompileRequest,
     TypedRegionCompiler,
+    lower_unicode_fsm_physical,
+    lower_unicode_map_physical,
     lower_unicode_count_physical,
     lower_typed_loop,
 )
@@ -77,6 +80,49 @@ def space_count(text: str) -> int:
         if character.isspace():
             accepted += 1
     return accepted
+
+
+def scalar_remap(text: str) -> str:
+    table = str.maketrans({"α": "a", "β": "b", "→": ">"})
+    return text.translate(table)
+
+
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def collapse_space_runs(text: str) -> str:
+    return _SPACE_RUN.sub(" ", text).strip()
+
+
+def _map_helper(text: str, keys: str, values: str) -> str:
+    return text.translate(str.maketrans(dict(zip(keys, values, strict=True))))
+
+
+def _fsm_helper(
+    text: str,
+    property_id: int,
+    initial_state: int,
+    descriptor: str,
+) -> str:
+    methods = ("isalnum", "isalpha", "isdecimal", "isdigit", "isnumeric", "isspace")
+    table_length = len(descriptor) // 3
+    transitions = descriptor[:table_length]
+    actions = descriptor[table_length : 2 * table_length]
+    emissions = descriptor[2 * table_length :]
+    state = initial_state
+    output: list[str] = []
+    for value in text:
+        table_index = state * 2 + int(getattr(value, methods[property_id])())
+        action = ord(actions[table_index])
+        emission = emissions[table_index]
+        if action in {2, 3}:
+            output.append(emission)
+        if action in {1, 3, 4}:
+            output.append(value)
+        if action == 4:
+            output.append(emission)
+        state = ord(transitions[table_index])
+    return "".join(output)
 
 
 class _StringSubclass(str):
@@ -261,6 +307,65 @@ class TypedLoopLoweringTests(unittest.TestCase):
 
         with self.assertRaises(TypedGuardMiss):
             physical.function(_StringSubclass("abc"))
+
+    def test_sequence_transforms_share_generic_loop_and_type_lowering(self) -> None:
+        cases = (scalar_remap, collapse_space_runs)
+        for function in cases:
+            with self.subTest(function=function.__name__):
+                lowering = lower_typed_loop(
+                    capture_typed_loop(
+                        function,
+                        input_types=(EXACT_UNICODE,),
+                    ).module
+                )
+
+                self.assertEqual(lowering.plan.result_strategy, "sequence_builder")
+                self.assertIn("sequence_builder", lowering.plan.backend_requirements)
+                self.assertNotIn(function.__name__, lowering.generated_source)
+                for text in ("", "  α\tβ  ", "x→y", "中文\u2003text"):
+                    self.assertEqual(lowering.function(text), function(text))
+
+    def test_immutable_lookup_builder_physicalizes_without_business_mapping(
+        self,
+    ) -> None:
+        captured = capture_typed_loop(
+            scalar_remap,
+            input_types=(EXACT_UNICODE,),
+        )
+        physical = lower_unicode_map_physical(
+            lower_typed_loop(captured.module),
+            _map_helper,
+        )
+
+        self.assertEqual(physical.physical_operation, "unicode.map_sequence")
+        self.assertIsNone(physical.property_id)
+        self.assertEqual(physical.function("α→β!"), "a>b!")
+        self.assertNotIn("while ", physical.generated_source)
+        self.assertEqual(
+            {operation.operation_id for operation in captured.module.operations},
+            {operation_id for operation_id, _ in physical.operation_lines},
+        )
+        with self.assertRaises(TypedGuardMiss):
+            physical.function(_StringSubclass("α"))
+
+    def test_unicode_classifier_fsm_builder_physicalizes_from_tables(self) -> None:
+        captured = capture_typed_loop(
+            collapse_space_runs,
+            input_types=(EXACT_UNICODE,),
+        )
+        physical = lower_unicode_fsm_physical(
+            lower_typed_loop(captured.module),
+            _fsm_helper,
+        )
+
+        self.assertEqual(physical.physical_operation, "unicode.fsm_sequence")
+        self.assertEqual(physical.property_id, 5)
+        for text in ("", "  a\t\nb  ", "\u2003中文\u2029 text\u3000"):
+            self.assertEqual(physical.function(text), collapse_space_runs(text))
+        attributes = dict(physical.physical_attributes)
+        self.assertEqual(attributes["property"], "space")
+        self.assertEqual(attributes["state_count"], "3")
+        self.assertNotIn("collapse_space_runs", physical.generated_source)
 
     def test_non_unicode_loop_does_not_enter_unicode_physicalization(self) -> None:
         sequence_type = TypeSpec(
@@ -620,6 +725,69 @@ class CinderXTypedLoopBackendTests(unittest.TestCase):
         self.assertTrue(result.jit_compiled)
         self.assertEqual(result.execution_mode, "cinderx_typed_hir_adapter")
         self.assertIsNone(result.physical_lowering)
+
+    def test_sequence_helpers_require_the_corresponding_generic_hir_opcode(
+        self,
+    ) -> None:
+        cases = (
+            (
+                scalar_remap,
+                "_udf_unicode_map_sequence",
+                _map_helper,
+                "UnicodeMapSequence",
+                "cinderx_unicode_map_hir",
+            ),
+            (
+                collapse_space_runs,
+                "_udf_unicode_fsm_sequence",
+                _fsm_helper,
+                "UnicodeFsmSequence",
+                "cinderx_unicode_fsm_hir",
+            ),
+        )
+        for function, helper_name, helper, opcode, mode in cases:
+            with self.subTest(function=function.__name__):
+                lowering = lower_typed_loop(
+                    capture_typed_loop(
+                        function,
+                        input_types=(EXACT_UNICODE,),
+                    ).module
+                )
+                jit_module = ModuleType("cinderx.jit")
+                setattr(jit_module, helper_name, helper)
+                jit_module.force_compile = lambda _function: True
+                jit_module.get_function_hir_opcode_counts = (
+                    lambda _function, opcode=opcode: {opcode: 1}
+                )
+                jit_module.is_jit_compiled = lambda _function: True
+
+                with mock.patch.dict(sys.modules, self._modules(jit_module)):
+                    result = CinderXTypedLoopBackend().compile(lowering)
+
+                self.assertTrue(result.jit_compiled)
+                self.assertEqual(result.execution_mode, mode)
+                self.assertIsNotNone(result.physical_lowering)
+
+    def test_builder_pattern_does_not_fall_back_to_quadratic_generic_code(
+        self,
+    ) -> None:
+        lowering = lower_typed_loop(
+            capture_typed_loop(
+                scalar_remap,
+                input_types=(EXACT_UNICODE,),
+            ).module
+        )
+        jit_module = ModuleType("cinderx.jit")
+        jit_module.compile_typed_region = lambda _function, _plan: True
+
+        with mock.patch.dict(sys.modules, self._modules(jit_module)):
+            result = CinderXTypedLoopBackend().compile(lowering)
+
+        self.assertFalse(result.jit_compiled)
+        self.assertEqual(
+            result.execution_mode,
+            "cinderx_sequence_transform_intrinsic",
+        )
 
     def test_backend_rejection_is_reported_without_claiming_jit_success(self) -> None:
         jit_module = ModuleType("cinderx.jit")

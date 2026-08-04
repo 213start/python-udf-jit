@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from typing import NoReturn
 
 from python_udf_jit.compiler.core_ir import (
     Determinism,
@@ -17,6 +18,7 @@ from python_udf_jit.compiler.typed_ir import (
     MAX_TYPED_BLOCKS,
     MAX_TYPED_OPERATIONS,
     TYPED_SEMANTIC_IR_VERSION,
+    UNICODE_BUILDER,
     UNICODE_SCALAR,
     TypeKind,
     TypeSpec,
@@ -24,6 +26,7 @@ from python_udf_jit.compiler.typed_ir import (
     TypedControlEdge,
     TypedOperation,
     TypedSemanticModule,
+    decode_int_table,
 )
 
 
@@ -50,9 +53,12 @@ _SUPPORTED = frozenset(
         "sequence.length",
         "sequence.get",
         "mapping.lookup",
+        "immutable.lookup",
         "unicode.property",
+        "fsm.transition",
         "sequence.builder.create",
         "sequence.builder.append",
+        "sequence.builder.apply",
         "sequence.builder.finish",
         "branch",
         "jump",
@@ -71,7 +77,7 @@ class TypedVerificationError(ValueError):
         super().__init__(reason_code if not detail else f"{reason_code}:{detail}")
 
 
-def _fail(reason_code: str, detail: str = "") -> None:
+def _fail(reason_code: str, detail: str = "") -> NoReturn:
     raise TypedVerificationError(reason_code, detail)
 
 
@@ -100,6 +106,49 @@ def _literal_type(literal: SemanticLiteral) -> TypeSpec | None:
         LiteralKind.STRING: None,
         LiteralKind.BYTES: None,
     }[literal.kind]
+
+
+def _exact_attributes(
+    operation: TypedOperation,
+    attributes: dict[str, str],
+    expected: set[str],
+) -> None:
+    if set(attributes) != expected:
+        _fail("invalid_attributes", operation.operation_id)
+
+
+def _positive_attribute(
+    operation: TypedOperation,
+    attributes: dict[str, str],
+    name: str,
+    *,
+    maximum: int,
+) -> int:
+    try:
+        value = int(attributes[name])
+    except (KeyError, ValueError):
+        _fail("invalid_attributes", operation.operation_id)
+    if not 1 <= value <= maximum or str(value) != attributes[name]:
+        _fail("invalid_attributes", operation.operation_id)
+    return value
+
+
+def _table_attribute(
+    operation: TypedOperation,
+    attributes: dict[str, str],
+    name: str,
+    *,
+    max_items: int,
+    maximum: int,
+) -> tuple[int, ...]:
+    try:
+        return decode_int_table(
+            attributes[name],
+            max_items=max_items,
+            maximum=maximum,
+        )
+    except (KeyError, ValueError):
+        _fail("invalid_attributes", operation.operation_id)
 
 
 def _verify_operation_schema(
@@ -199,10 +248,72 @@ def _verify_operation_schema(
             or operation.result_type != operand_types[0].parameters[1]
         ):
             _fail("type_mismatch", operation.operation_id)
+    elif operation.op == "immutable.lookup":
+        _exact_attributes(operation, attributes, {"keys", "values"})
+        keys = _table_attribute(
+            operation,
+            attributes,
+            "keys",
+            max_items=256,
+            maximum=0x10FFFF,
+        )
+        values = _table_attribute(
+            operation,
+            attributes,
+            "values",
+            max_items=256,
+            maximum=0x10FFFF,
+        )
+        if (
+            operand_types != (UNICODE_SCALAR, UNICODE_SCALAR)
+            or operation.result_type != UNICODE_SCALAR
+            or len(keys) != len(values)
+            or len(set(keys)) != len(keys)
+            or tuple(sorted(keys)) != keys
+        ):
+            _fail("type_mismatch", operation.operation_id)
+    elif operation.op == "fsm.transition":
+        _exact_attributes(
+            operation,
+            attributes,
+            {"class_count", "state_count", "transitions"},
+        )
+        state_count = _positive_attribute(
+            operation,
+            attributes,
+            "state_count",
+            maximum=64,
+        )
+        class_count = _positive_attribute(
+            operation,
+            attributes,
+            "class_count",
+            maximum=2,
+        )
+        transitions = _table_attribute(
+            operation,
+            attributes,
+            "transitions",
+            max_items=128,
+            maximum=state_count - 1,
+        )
+        if (
+            operand_types != (INT64, BOOL)
+            or operation.result_type != INT64
+            or class_count != 2
+            or len(transitions) != state_count * class_count
+        ):
+            _fail("type_mismatch", operation.operation_id)
     elif operation.op == "sequence.builder.create":
-        if operation.operands or operation.result_type is None or operation.result_type.kind is not TypeKind.BUILDER:
+        _exact_attributes(operation, attributes, set())
+        if (
+            operation.operands
+            or operation.result_type is None
+            or operation.result_type.kind is not TypeKind.BUILDER
+        ):
             _fail("type_mismatch", operation.operation_id)
     elif operation.op == "sequence.builder.append":
+        _exact_attributes(operation, attributes, set())
         if (
             len(operand_types) != 2
             or operand_types[0].kind is not TypeKind.BUILDER
@@ -210,7 +321,51 @@ def _verify_operation_schema(
             or operation.result_type != operand_types[0]
         ):
             _fail("type_mismatch", operation.operation_id)
+    elif operation.op == "sequence.builder.apply":
+        _exact_attributes(
+            operation,
+            attributes,
+            {"actions", "class_count", "emissions", "state_count"},
+        )
+        state_count = _positive_attribute(
+            operation,
+            attributes,
+            "state_count",
+            maximum=64,
+        )
+        class_count = _positive_attribute(
+            operation,
+            attributes,
+            "class_count",
+            maximum=2,
+        )
+        actions = _table_attribute(
+            operation,
+            attributes,
+            "actions",
+            max_items=128,
+            maximum=4,
+        )
+        emissions = _table_attribute(
+            operation,
+            attributes,
+            "emissions",
+            max_items=128,
+            maximum=0x10FFFF,
+        )
+        if (
+            len(operand_types) != 4
+            or operand_types[0] != UNICODE_BUILDER
+            or operand_types[1] != UNICODE_SCALAR
+            or operand_types[2:] != (INT64, BOOL)
+            or operation.result_type != UNICODE_BUILDER
+            or class_count != 2
+            or len(actions) != state_count * class_count
+            or len(emissions) != len(actions)
+        ):
+            _fail("type_mismatch", operation.operation_id)
     elif operation.op == "sequence.builder.finish":
+        _exact_attributes(operation, attributes, set())
         if (
             len(operand_types) != 1
             or operand_types[0].kind is not TypeKind.BUILDER

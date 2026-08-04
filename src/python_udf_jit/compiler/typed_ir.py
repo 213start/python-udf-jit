@@ -164,6 +164,58 @@ EXACT_UNICODE = TypeSpec(
     Exactness.EXACT,
     "python_object",
 )
+UNICODE_BUILDER = TypeSpec(
+    TypeKind.BUILDER,
+    "unicode.builder",
+    (UNICODE_SCALAR,),
+    Exactness.UNKNOWN,
+    "internal",
+)
+
+
+def encode_int_table(values: tuple[int, ...]) -> str:
+    """Encode a bounded semantic table in the IR's canonical JSON form."""
+
+    if any(type(value) is not int for value in values):
+        raise ValueError("typed integer table requires exact ints")
+    return _canonical_bytes(list(values)).decode("ascii")
+
+
+def decode_int_table(
+    encoded: str,
+    *,
+    max_items: int,
+    minimum: int = 0,
+    maximum: int = 0x10FFFF,
+) -> tuple[int, ...]:
+    """Decode and verify one canonical, bounded semantic table."""
+
+    if (
+        type(encoded) is not str
+        or type(max_items) is not int
+        or max_items < 0
+        or type(minimum) is not int
+        or type(maximum) is not int
+        or minimum > maximum
+    ):
+        raise ValueError("invalid typed integer table contract")
+    try:
+        document = json.loads(encoded)
+    except (TypeError, ValueError):
+        raise ValueError("invalid typed integer table") from None
+    if (
+        not isinstance(document, list)
+        or len(document) > max_items
+        or any(
+            type(value) is not int or not minimum <= value <= maximum
+            for value in document
+        )
+    ):
+        raise ValueError("invalid typed integer table")
+    result = tuple(document)
+    if encode_int_table(result) != encoded:
+        raise ValueError("noncanonical typed integer table")
+    return result
 
 
 def _canonical_bytes(document: object) -> bytes:
