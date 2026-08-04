@@ -1,0 +1,196 @@
+{
+  "schema_version": "1.0",
+  "created_at": "2026-08-03",
+  "workload": "pipeline_text_fineweb_full_min",
+  "experiment": "real_daft_ray_worker_integration_single_ab",
+  "classification": "directional_full_pipeline_ab",
+  "source": {
+    "udfjit_base_revision": "2ef2550",
+    "implementation_state": "current working tree on master",
+    "target_framework_revision": "56d3b6856895427a0519cbaa437d55443fcb578b",
+    "cinderx_upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
+    "runtime_image": "python-udf-jit:u13-20260729-071503-eb97ee8a",
+    "runtime_image_id": "sha256:675433528740ab426b9f336d8fa051f148eff0f428d6e9ad98647db5f673cc75"
+  },
+  "task": {
+    "source_task_id": "pipeline_text_fineweb_full_min@v0",
+    "execution_task_id": "pipeline_text_fineweb_full_min@v0__udfjit_synthetic_10k",
+    "task_sha256": "8839ef528b2fd3cabaf99bbc03cf2630d3386e2280ba64dba177dd3c4e9f0d64",
+    "input_rows": 10000,
+    "input_sha256": "7475aaa2659f66ee4ca085c6178173db37f95c9f22d02e7b9c340bf71012d8ca",
+    "business_stage_count": 13,
+    "business_stages_unchanged": true,
+    "input_adapter": "the exact 10K JSONL text values were passed through synthetic_text because the CinderX image has no Lance Python package",
+    "sink_policy": "the generated write_lance sink was removed; no business stage was removed",
+    "operator_policy": "stand-in text operators with official_text_ops=false and VOLC_REAL_TEXT_OPS=0",
+    "scope_caveat": "This is not a real-model Data-Juicer production result. fastText, SentencePiece, KenLM, Lance input, and Lance output are outside this run."
+  },
+  "environment": {
+    "host": "aarch64-lab-host",
+    "architecture": "aarch64",
+    "python": "3.14.3",
+    "daft": "0.7.2",
+    "ray": "2.55.0",
+    "cpu_affinity": "4-7",
+    "ray_num_cpus": 4,
+    "materialize_policy": "end",
+    "thread_limits": {
+      "OMP_NUM_THREADS": 1,
+      "MKL_NUM_THREADS": 1,
+      "OPENBLAS_NUM_THREADS": 1
+    }
+  },
+  "diagnostic_isolation": {
+    "performance_runs": {
+      "UDFJIT_DIAGNOSTICS": "off",
+      "PYTHONJITUDFDIAGNOSTICS": "0"
+    },
+    "diagnostic_run": {
+      "rows": 128,
+      "UDFJIT_DIAGNOSTICS": "full",
+      "PYTHONJITUDFDIAGNOSTICS": "1",
+      "source_policy": "ranges",
+      "perf_mode": "off",
+      "timing_used_for_performance_claim": false
+    }
+  },
+  "diagnostic_chain": {
+    "bundle_id": "diagnostic-fineweb-smoke-diag-r6-566cdbc42aa93a3b",
+    "bundle_status": "complete",
+    "validation_status": "valid",
+    "artifact_count": 29,
+    "manifest_sha256": "566cdbc42aa93a3b0081bd15a8f38db7a450062e1f60d8a0bf335e6d82ce1720",
+    "chain_status_sha256": "71bfd3873b3f15d80b0ccd1bd75bc4b98c0dd5e74248fdffc7cb5813f14d971c",
+    "backend_sha256": "53e1bab4e5cc213baba93336bb8b578b594fde009d33c4bfe2430823fc11e79b",
+    "hir_sha256": "b868e44a301e78909fa630b53cc7b6a5cf4601faf9869ad83f3a56daa546199c",
+    "lir_sha256": "277d7bf0b3d8d40c3c58b1396596062ef9b5efbbb678ffcc5bd93b7af89740fe",
+    "machine_ranges_sha256": "b0599660c28b2ff78d0adf968e90ca100973f76bcfcc7f0162c796c5f9ff1960",
+    "runtime_summary_sha256": "fa22c07a31a049d1e4d27228ed1ffdc528b0b604308b024ebe467bf06dc35f0e",
+    "chain": {
+      "source_ranges": "available",
+      "original_bytecode": "available",
+      "typed_semantic": "available",
+      "behavior": "available",
+      "type_evidence": "available",
+      "pattern_analysis": "available",
+      "generic_lowering": "available",
+      "physical_lowering": "available",
+      "generated_bytecode": "available",
+      "cinderx_hir": "available",
+      "cinderx_lir": "available",
+      "machine": "available"
+    },
+    "runtime": {
+      "calls": 23,
+      "compile_attempts": 1,
+      "compile_successes": 1,
+      "fallbacks_before_compile": 7,
+      "guard_misses": 0,
+      "machine_code_hits": 16,
+      "wrapper_depth": 3,
+      "semantic_hash": "c8ae4645facfc874fe4bdf9956e128f1dd188d3f3e280a04b618fcc258a656b2",
+      "execution_mode": "cinderx_unicode_property_hir"
+    },
+    "backend": {
+      "jit_compiled": true,
+      "UnicodeCountProperty_count": 1
+    },
+    "raw_bundle": "artifact://fineweb-pipeline-integration-20260803/diagnostics/bundle-566cdbc42aa93a3b"
+  },
+  "full_pipeline_ab": {
+    "protocol": "single serial A then B; same task, image, CinderX diagnostic-overlay build, CPU affinity, Ray resources, and thread limits; only UDFJIT_MODE changed",
+    "baseline": {
+      "mode": "off",
+      "elapsed_s": 33.70483130996581,
+      "ray_init_s": 7.282661080011167,
+      "pipeline_execute_s": 26.422170229954645,
+      "input_rows": 10000,
+      "output_rows": 9992,
+      "result": "artifact://fineweb-pipeline-integration-20260803/ab/off/result.json",
+      "log": "artifact://fineweb-pipeline-integration-20260803/ab/off/run.log"
+    },
+    "candidate": {
+      "mode": "auto",
+      "elapsed_s": 33.175593030056916,
+      "ray_init_s": 6.8928337200777605,
+      "pipeline_execute_s": 26.282759309979156,
+      "input_rows": 10000,
+      "output_rows": 9992,
+      "result": "artifact://fineweb-pipeline-integration-20260803/ab/auto/result.json",
+      "log": "artifact://fineweb-pipeline-integration-20260803/ab/auto/run.log"
+    },
+    "comparison": {
+      "elapsed_speedup": 1.0159526396236356,
+      "elapsed_reduction_percent": 1.5702148900902846,
+      "pipeline_execute_speedup": 1.0053042725967725,
+      "pipeline_execute_reduction_percent": 0.5276285738914819,
+      "samples_per_arm": 1,
+      "confidence_interval": null
+    },
+    "verdict": "integration_pass_performance_target_fail",
+    "interpretation": "The result is directionally positive after terminal-fallback bypass, but far below the greater-than-10-percent combination target and too small for a formal claim."
+  },
+  "alphanumeric_attribution_ab": {
+    "purpose": "diagnose whether the compiled intrinsic works inside the real Daft Worker; not a pipeline optimization result",
+    "baseline_pipeline_execute_s": 4.48471182002686,
+    "candidate_pipeline_execute_s": 3.041332449996844,
+    "pipeline_execute_speedup": 1.4745878307488265,
+    "pipeline_execute_reduction_percent": 32.18443966866462,
+    "baseline_elapsed_s": 11.790227350080386,
+    "candidate_elapsed_s": 9.942134849959984,
+    "elapsed_speedup": 1.1858848756339126,
+    "input_rows": 10000,
+    "output_rows_both": 10000
+  },
+  "correctness": {
+    "materialization": "full output values via to_pydict; not used for timing",
+    "baseline_output_rows": 9992,
+    "candidate_output_rows": 9992,
+    "baseline_output_column": "_text_chunk_mapper_12_out",
+    "candidate_output_column": "_text_chunk_mapper_12_out",
+    "baseline_multiset_sha256": "0b3c525fe120a66cf6b6bb41085e51f14df5860bfc433a9659e3c603427090de",
+    "candidate_multiset_sha256": "0b3c525fe120a66cf6b6bb41085e51f14df5860bfc433a9659e3c603427090de",
+    "baseline_ordered_sha256": "7849166715284abade1002d9cc11bdbf933ff65ade0090a7130d16862c17d2ac",
+    "candidate_ordered_sha256": "d9f914889eb5eb3b569e999643e40ad0a3cf4271fef5d64ca7a1a6440abfca32",
+    "multiset_equal": true,
+    "ordered_equal": false,
+    "ordering_contract": "document_deduplicator uses Daft distinct(), whose output ordering is unspecified",
+    "verdict": "unordered_value_semantics_equal"
+  },
+  "implementation": {
+    "generic_worker_integration": [
+      "recursively devirtualize framework and closure thin wrappers",
+      "bind portable constants into typed semantic identity and runtime guards",
+      "compile lazily once per Worker after a call threshold",
+      "side-exit guarded empty-input regions before machine-code entry",
+      "cache successful variants and permanently bypass terminal unsupported candidates"
+    ],
+    "diagnostics": [
+      "select typed Worker sessions by leaf UDF code hash",
+      "record runtime compile and hit summary",
+      "keep diagnostics off for all timing runs"
+    ],
+    "business_specific_production_rules": false
+  },
+  "validation": {
+    "compileall": "pass",
+    "git_diff_check": "pass",
+    "unit": "442 passed, 412 subtests passed",
+    "integration_without_unavailable_local_cinderjit_extension": "51 passed, 9 skipped, 17 subtests passed",
+    "e2e_system_fuzz": "13 passed, 10 skipped, 5 subtests passed",
+    "combined_suite_observation": "505 passed and 19 skipped before two environment/order failures: local cinderjit is unavailable, and that partial CinderX import contaminates a later pre-bootstrap test",
+    "remote_pipeline_smoke": "128 input rows, 128 output rows, status ok",
+    "remote_full_pipeline": "10000 input rows, 9992 output rows, both arms status ok",
+    "diagnostic_bundle_validation": "valid and complete"
+  },
+  "conclusion": {
+    "integration_complete": true,
+    "correctness_complete_for_unordered_dedup_contract": true,
+    "performance_goal_met": false,
+    "next_backend_patterns": [
+      "immutable lookup plus Unicode sequence builder for punctuation normalization",
+      "Unicode whitespace classification plus branch FSM plus sequence builder",
+      "constant regex automata only after stage-level profiling proves remaining cleaner share"
+    ]
+  }
+}
