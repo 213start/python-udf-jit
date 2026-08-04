@@ -869,6 +869,228 @@ class WorkerDiagnosticRuntime:
             layer="runtime",
         )
 
+    def record_cache_compilation(
+        self,
+        *,
+        cache_kind: str,
+        function: FunctionType,
+        proof_document: dict[str, object],
+        backend: object,
+        compile_instance_id: str,
+        generated_code_hash: str,
+    ) -> bool:
+        """Record the semantic-proof to CinderX machine-code cache path."""
+
+        if (
+            not self._selected
+            or self.policy.profile is not DiagnosticProfile.FULL
+        ):
+            return False
+        if cache_kind not in {"invariant", "value"}:
+            raise ValueError("cache_diagnostic_kind_invalid")
+        base = f"typed/cache/{cache_kind}"
+        try:
+            from cinderx import jit as jit_module
+
+            bytecode = build_bytecode_artifacts(
+                function.__code__,
+                code_hash=generated_code_hash,
+            )
+            source = build_original_provenance(
+                function.__code__,
+                code_hash=generated_code_hash,
+            )
+            diagnostics = collect_cinderx_compilation_diagnostics(
+                jit_module,
+                function,
+                compile_instance_id=compile_instance_id,
+                generated_code_hash=generated_code_hash,
+            )
+            cinderx = build_cinderx_artifacts(diagnostics)
+            hir_by_offset: dict[int, list[str]] = {}
+            for node in diagnostics.hir_nodes:
+                if node.bytecode_offset is not None:
+                    hir_by_offset.setdefault(node.bytecode_offset, []).append(
+                        node.hir_id
+                    )
+            lir_by_hir: dict[str, set[str]] = {}
+            for node in diagnostics.lir_nodes:
+                for hir_id in node.hir_ids:
+                    lir_by_hir.setdefault(hir_id, set()).add(node.lir_id)
+            ranges_by_hir: dict[str, set[str]] = {}
+            ranges_by_lir: dict[str, set[str]] = {}
+            for item in diagnostics.machine_ranges:
+                for hir_id in item.hir_ids:
+                    ranges_by_hir.setdefault(hir_id, set()).add(item.range_id)
+                for lir_id in item.lir_ids:
+                    ranges_by_lir.setdefault(lir_id, set()).add(item.range_id)
+            provenance_entries: list[dict[str, object]] = []
+            for instruction in bytecode.json_document["instructions"]:
+                offset = instruction["offset"]
+                hir_ids = sorted(set(hir_by_offset.get(offset, ())), key=int)
+                lir_ids = sorted(
+                    {
+                        lir_id
+                        for hir_id in hir_ids
+                        for lir_id in lir_by_hir.get(hir_id, ())
+                    },
+                    key=int,
+                )
+                range_ids = sorted(
+                    {
+                        range_id
+                        for hir_id in hir_ids
+                        for range_id in ranges_by_hir.get(hir_id, ())
+                    }
+                    | {
+                        range_id
+                        for lir_id in lir_ids
+                        for range_id in ranges_by_lir.get(lir_id, ())
+                    },
+                    key=int,
+                )
+                provenance_entries.append(
+                    {
+                        "bytecode_offset": offset,
+                        "hir_ids": hir_ids,
+                        "line": instruction["position"]["line"],
+                        "lir_ids": lir_ids,
+                        "machine_range_ids": range_ids,
+                    }
+                )
+            available = diagnostics.status.value == "available"
+            artifacts: tuple[tuple[str, str, object, str], ...] = (
+                (
+                    f"{base}/source-ranges.json",
+                    "application/json",
+                    program_source_map_document(source),
+                    "source",
+                ),
+                (
+                    f"{base}/bytecode-input.json",
+                    "application/json",
+                    bytecode.json_document,
+                    "bytecode",
+                ),
+                (
+                    f"{base}/bytecode-input.dis",
+                    "text/plain",
+                    bytecode.disassembly,
+                    "bytecode",
+                ),
+                (
+                    f"{base}/semantic-proof.json",
+                    "application/json",
+                    proof_document,
+                    "semantic",
+                ),
+                (
+                    f"{base}/backend.json",
+                    "application/json",
+                    {
+                        "execution_mode": getattr(backend, "execution_mode", ""),
+                        "hir_opcode_counts": [
+                            list(value)
+                            for value in getattr(
+                                backend,
+                                "hir_opcode_counts",
+                                (),
+                            )
+                        ],
+                        "jit_compiled": bool(
+                            getattr(backend, "jit_compiled", False)
+                        ),
+                        "reason_code": getattr(backend, "reason_code", ""),
+                        "schema_version": 1,
+                    },
+                    "backend",
+                ),
+                (
+                    f"{base}/cinderx/hir.final.json",
+                    "application/json",
+                    cinderx.hir_json,
+                    "hir",
+                ),
+                (
+                    f"{base}/cinderx/hir.final.txt",
+                    "text/plain",
+                    cinderx.hir_text,
+                    "hir",
+                ),
+                (
+                    f"{base}/cinderx/lir-origin.json",
+                    "application/json",
+                    cinderx.lir_json,
+                    "lir",
+                ),
+                (
+                    f"{base}/cinderx/lir.txt",
+                    "text/plain",
+                    cinderx.lir_text,
+                    "lir",
+                ),
+                (
+                    f"{base}/cinderx/machine-ranges.json",
+                    "application/json",
+                    cinderx.machine_ranges_json,
+                    "machine",
+                ),
+                (
+                    f"{base}/cinderx/machine-ranges.txt",
+                    "text/plain",
+                    cinderx.machine_ranges_text,
+                    "machine",
+                ),
+                (
+                    f"{base}/cinderx/compile-stats.json",
+                    "application/json",
+                    cinderx.compile_stats_json,
+                    "cinderx",
+                ),
+                (
+                    f"{base}/operation-provenance.json",
+                    "application/json",
+                    {
+                        "entries": provenance_entries,
+                        "generated_code_hash": generated_code_hash,
+                        "schema_version": 1,
+                    },
+                    "provenance",
+                ),
+                (
+                    f"{base}/chain-status.json",
+                    "application/json",
+                    {
+                        "bytecode": "available",
+                        "cinderx_hir": (
+                            "available" if available else "unavailable"
+                        ),
+                        "cinderx_lir": (
+                            "available" if available else "unavailable"
+                        ),
+                        "machine": (
+                            "available" if available else "unavailable"
+                        ),
+                        "provenance": "available",
+                        "schema_version": 1,
+                        "semantic_proof": "available",
+                        "source_ranges": "available",
+                        "udf_physical_lowering": "not_applicable_backend_owned",
+                    },
+                    "reports",
+                ),
+            )
+            emitted = True
+            for path, media_type, payload, layer in artifacts:
+                emitted = (
+                    self._artifact(path, media_type, payload, layer=layer)
+                    and emitted
+                )
+            return emitted
+        except Exception:
+            self.mark_partial()
+            return False
+
     def record_compilation(
         self,
         jit_module: object,
