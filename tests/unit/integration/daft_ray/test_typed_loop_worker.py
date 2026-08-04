@@ -4,12 +4,19 @@ import functools
 import os
 import re
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from python_udf_jit.compiler.typed_frontend import TypedCaptureError
 from python_udf_jit.integration.daft_ray.typed_loop_worker import (
     WorkerTypedLoopAdapter,
     resolve_typed_loop_callable,
+)
+from python_udf_jit.provider.scalar_python.invariant_calls import (
+    INVARIANT_CACHE_EXECUTION_MODE,
+    VALUE_CACHE_EXECUTION_MODE,
+    InvariantBackendCompilation,
 )
 from python_udf_jit.provider.scalar_python.typed_loop import BackendCompilation
 
@@ -83,6 +90,27 @@ def _collapse_text(text: str) -> str:
     return _SPACE_RUN.sub(" ", text).strip()
 
 
+def _select_location(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    direct = os.environ.get("UDFJIT_WORKER_DIRECT", "").strip()
+    if direct:
+        return direct
+    base = os.environ.get("UDFJIT_WORKER_BASE", "").strip()
+    if base:
+        return str(Path(base) / "frozen" / "dataset")
+    return ""
+
+
+def _uses_location(
+    row: str,
+    *,
+    location: str | None = None,
+    **_extras,
+) -> str:
+    return _select_location(location) + row
+
+
 class _Backend:
     adapter_version = "typed-loop-worker-test-v1"
 
@@ -94,7 +122,135 @@ class _Backend:
         return BackendCompilation(True, "test_typed_loop")
 
 
+class _InvariantBackend:
+    def __init__(self) -> None:
+        self.plans = []
+
+    def compile(self, plan) -> InvariantBackendCompilation:
+        self.plans.append(plan)
+        return InvariantBackendCompilation(
+            True,
+            INVARIANT_CACHE_EXECUTION_MODE,
+            "cinderx_invariant_cache_compiled",
+        )
+
+
+class _ValueBackend:
+    def __init__(self) -> None:
+        self.plans = []
+
+    def compile(self, plan) -> InvariantBackendCompilation:
+        self.plans.append(plan)
+        return InvariantBackendCompilation(
+            True,
+            VALUE_CACHE_EXECUTION_MODE,
+            "cinderx_value_cache_compiled",
+        )
+
+
 class WorkerTypedLoopAdapterTests(unittest.TestCase):
+    def test_value_cache_backend_supersedes_invariant_helper_backend(self) -> None:
+        invariant_backend = _InvariantBackend()
+        value_backend = _ValueBackend()
+        value_plan = SimpleNamespace(function=_uses_location)
+        adapter = WorkerTypedLoopAdapter(
+            _uses_location,
+            candidate_id="candidate-value-cache-test",
+            call_threshold=1,
+            backend=_Backend(),
+            invariant_backend=invariant_backend,
+            value_cache_backend=value_backend,
+        )
+
+        with (
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.typed_loop_worker."
+                "capture_typed_loop",
+                side_effect=TypedCaptureError("function_signature_unsupported"),
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.typed_loop_worker."
+                "analyze_value_cache",
+                return_value=value_plan,
+            ),
+        ):
+            outcome = adapter.invoke(("row",), {})
+
+        self.assertTrue(outcome.handled)
+        self.assertFalse(outcome.terminal)
+        self.assertEqual(outcome.value, _uses_location("row"))
+        self.assertEqual(len(invariant_backend.plans), 1)
+        self.assertEqual(value_backend.plans, [value_plan])
+        self.assertEqual(
+            adapter.snapshot().execution_mode,
+            VALUE_CACHE_EXECUTION_MODE,
+        )
+
+    def test_value_cache_executes_the_resolved_target_with_bound_arguments(
+        self,
+    ) -> None:
+        def target(row: str, *, suffix: str = "") -> str:
+            return row + suffix
+
+        def framework_wrapper(row: str) -> str:
+            return target(row, suffix="-bound")
+
+        value_backend = _ValueBackend()
+        value_plan = SimpleNamespace(function=target)
+        adapter = WorkerTypedLoopAdapter(
+            framework_wrapper,
+            candidate_id="candidate-value-cache-bound-test",
+            call_threshold=1,
+            backend=_Backend(),
+            value_cache_backend=value_backend,
+        )
+
+        with (
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.typed_loop_worker."
+                "capture_typed_loop",
+                side_effect=TypedCaptureError("function_signature_unsupported"),
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.typed_loop_worker."
+                "analyze_value_cache",
+                return_value=value_plan,
+            ),
+        ):
+            outcome = adapter.invoke(("row",), {})
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.value, "row-bound")
+        self.assertEqual(value_backend.plans, [value_plan])
+
+    def test_capture_failure_transfers_invariant_proof_to_backend(self) -> None:
+        invariant_backend = _InvariantBackend()
+        adapter = WorkerTypedLoopAdapter(
+            _uses_location,
+            candidate_id="candidate-invariant-test",
+            call_threshold=1,
+            backend=_Backend(),
+            invariant_backend=invariant_backend,
+        )
+
+        with mock.patch(
+            "python_udf_jit.integration.daft_ray.typed_loop_worker."
+            "capture_typed_loop",
+            side_effect=TypedCaptureError("function_signature_unsupported"),
+        ):
+            first = adapter.invoke(("row",), {})
+            second = adapter.invoke(("row",), {})
+
+        self.assertFalse(first.handled)
+        self.assertTrue(first.terminal)
+        self.assertFalse(second.handled)
+        self.assertEqual(len(invariant_backend.plans), 1)
+        self.assertIs(invariant_backend.plans[0].function, _select_location)
+        stats = adapter.snapshot()
+        self.assertEqual(stats.compile_attempts, 1)
+        self.assertEqual(stats.compile_successes, 1)
+        self.assertEqual(stats.execution_mode, INVARIANT_CACHE_EXECUTION_MODE)
+
     def test_recursive_wrapper_resolution_binds_portable_constants(self) -> None:
         predicate, _ = _make_filter(0.5)
         wrapped = _make_framework_wrapper(predicate)

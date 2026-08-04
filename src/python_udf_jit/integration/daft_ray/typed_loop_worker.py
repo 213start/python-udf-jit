@@ -8,27 +8,37 @@ import inspect
 import os
 import textwrap
 import types
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from python_udf_jit.compiler.identity import code_identity
+from python_udf_jit.compiler.invariant_calls import (
+    analyze_invariant_calls,
+    analyze_value_cache,
+)
 from python_udf_jit.compiler.typed_frontend import (
     TypedCaptureError,
     TypedEntryGuard,
     capture_typed_loop,
 )
 from python_udf_jit.compiler.typed_ir import EXACT_UNICODE
+from python_udf_jit.provider.scalar_python.invariant_calls import (
+    CinderXInvariantCallBackend,
+    CinderXValueCacheBackend,
+    InvariantCallBackend,
+    ValueCacheBackend,
+)
 from python_udf_jit.provider.scalar_python.typed_loop import (
     CinderXTypedLoopBackend,
     CompileStatus,
     RuntimeFeedback,
     TypedGuardMiss,
     TypedLoopBackend,
-    TypedRegionCompileRequest,
     TypedRegionCompiler,
+    TypedRegionCompileRequest,
 )
-
 
 _PORTABLE_CONSTANT_TYPES = {type(None), bool, int, float, str, bytes}
 _INPUT = object()
@@ -69,6 +79,28 @@ class TypedLoopRuntimeStats:
             "semantic_hash": self.semantic_hash,
             "wrapper_depth": self.wrapper_depth,
         }
+
+
+def _cache_proof_document(plan: object, *, cache_kind: str) -> dict[str, object]:
+    watcher_counts: dict[str, int] = {}
+    for watcher in getattr(plan, "watchers", ()):
+        kind = str(getattr(watcher, "kind", "unsupported"))
+        watcher_counts[kind] = watcher_counts.get(kind, 0) + 1
+    argument_modes = tuple(getattr(plan, "argument_modes", ()))
+    if not argument_modes and hasattr(plan, "argument_mode"):
+        argument_modes = (str(getattr(plan, "argument_mode")),)
+    return {
+        "argument_modes": list(argument_modes),
+        "behavior_patterns": list(
+            getattr(plan, "behavior_patterns", ())
+        ),
+        "cache_kind": cache_kind,
+        "capacity": getattr(plan, "capacity", 1),
+        "input_type": getattr(plan, "input_type", "invariant_identity"),
+        "result_type": getattr(plan, "result_type", ""),
+        "schema_version": 1,
+        "watcher_counts": watcher_counts,
+    }
 
 
 @dataclass(frozen=True)
@@ -517,6 +549,8 @@ class WorkerTypedLoopAdapter:
         candidate_id: str,
         call_threshold: int = 8,
         backend: TypedLoopBackend | None = None,
+        invariant_backend: InvariantCallBackend | None = None,
+        value_cache_backend: ValueCacheBackend | None = None,
     ) -> None:
         if call_threshold <= 0:
             raise ValueError("typed_loop_call_threshold_invalid")
@@ -525,6 +559,12 @@ class WorkerTypedLoopAdapter:
         self._candidate_id = candidate_id
         self._call_threshold = call_threshold
         self._backend = backend or CinderXTypedLoopBackend()
+        self._invariant_backend = (
+            invariant_backend or CinderXInvariantCallBackend()
+        )
+        self._value_cache_backend = (
+            value_cache_backend or CinderXValueCacheBackend()
+        )
         self._has_receiver_trampoline = (
             isinstance(original_callable, types.FunctionType)
             and _receiver_trampoline_bindings(original_callable) is not None
@@ -542,6 +582,8 @@ class WorkerTypedLoopAdapter:
         self._execution_mode = ""
         self._terminal = False
         self._variant = None
+        self._backend_entry: Callable[..., object] | None = None
+        self._backend_bound_arguments: dict[str, object] = {}
         self._entry_guard: TypedEntryGuard | None = None
         self._wrapper_guard = _WrapperGuard(())
         self._diagnostic_runtime = None
@@ -633,15 +675,16 @@ class WorkerTypedLoopAdapter:
 
     def _compile_locked(self) -> None:
         self._compile_attempts += 1
+        resolved: ResolvedTypedLoopCallable | None = None
         try:
             resolved = resolve_typed_loop_callable(self._original_callable)
+            diagnostic_sink = self._diagnostic_sink(resolved.function)
             captured = capture_typed_loop(
                 resolved.function,
                 input_types=(EXACT_UNICODE,),
                 bound_arguments=resolved.bound_arguments,
                 allow_guarded_region=True,
             )
-            diagnostic_sink = self._diagnostic_sink(resolved.function)
             decision = TypedRegionCompiler(
                 self._backend,
                 call_threshold=self._call_threshold,
@@ -658,6 +701,119 @@ class WorkerTypedLoopAdapter:
         except _TypedLoopDiagnosticError:
             raise
         except TypedCaptureError as error:
+            invariant = None
+            if resolved is not None:
+                plans = analyze_invariant_calls(
+                    resolved.function,
+                    bound_arguments=resolved.bound_arguments,
+                )
+                if len(plans) == 1:
+                    invariant_hash = code_identity(plans[0].function).sha256
+                    invariant_compile_id = ""
+                    if self._diagnostic_runtime is not None:
+                        invariant_compile_id = (
+                            self._diagnostic_runtime.prepare_typed_compilation(
+                                plans[0].function,
+                                invariant_hash,
+                                tuple(
+                                    (
+                                        f"invariant.{pattern}",
+                                        plans[0].function.__code__.co_firstlineno,
+                                    )
+                                    for pattern in plans[0].behavior_patterns
+                                ),
+                            )
+                        )
+                    try:
+                        invariant = self._invariant_backend.compile(plans[0])
+                    except Exception:
+                        invariant = None
+                    if (
+                        invariant is not None
+                        and invariant_compile_id
+                        and self._diagnostic_runtime is not None
+                    ):
+                        self._diagnostic_runtime.record_cache_compilation(
+                            cache_kind="invariant",
+                            function=plans[0].function,
+                            proof_document=_cache_proof_document(
+                                plans[0], cache_kind="invariant"
+                            ),
+                            backend=invariant,
+                            compile_instance_id=invariant_compile_id,
+                            generated_code_hash=invariant_hash,
+                        )
+                value_plan = analyze_value_cache(resolved.function)
+                if value_plan is not None:
+                    value_hash = code_identity(value_plan.function).sha256
+                    value_compile_id = ""
+                    if self._diagnostic_runtime is not None:
+                        value_compile_id = (
+                            self._diagnostic_runtime.prepare_typed_compilation(
+                                value_plan.function,
+                                value_hash,
+                                tuple(
+                                    (
+                                        f"value.{pattern}",
+                                        value_plan.function.__code__.co_firstlineno,
+                                    )
+                                    for pattern in value_plan.behavior_patterns
+                                ),
+                            )
+                        )
+                    try:
+                        value_cache = self._value_cache_backend.compile(
+                            value_plan
+                        )
+                    except Exception:
+                        value_cache = None
+                    if (
+                        value_cache is not None
+                        and value_compile_id
+                        and self._diagnostic_runtime is not None
+                    ):
+                        self._diagnostic_runtime.record_cache_compilation(
+                            cache_kind="value",
+                            function=value_plan.function,
+                            proof_document=_cache_proof_document(
+                                value_plan, cache_kind="value"
+                            ),
+                            backend=value_cache,
+                            compile_instance_id=value_compile_id,
+                            generated_code_hash=value_hash,
+                        )
+                    if value_cache is not None and value_cache.jit_compiled:
+                        self._wrapper_depth = resolved.wrapper_depth
+                        self._semantic_hash = code_identity(
+                            value_plan.function
+                        ).sha256
+                        self._compile_successes += 1
+                        self._execution_mode = value_cache.execution_mode
+                        self._reason_code = value_cache.reason_code
+                        # Execute the exact function object whose value-cache
+                        # descriptor CinderX just compiled.  The structurally
+                        # proven thin wrappers remain protected by their live
+                        # binding guard; they do not own the backend cache.
+                        self._backend_entry = value_plan.function
+                        self._backend_bound_arguments = dict(
+                            resolved.bound_arguments
+                        )
+                        self._wrapper_guard = resolved.wrapper_guard
+                        if self._diagnostic_runtime is not None:
+                            self._finalize_diagnostics()
+                        return
+                if invariant is not None and invariant.jit_compiled:
+                    self._wrapper_depth = resolved.wrapper_depth
+                    self._semantic_hash = code_identity(
+                        plans[0].function
+                    ).sha256
+                    self._compile_successes += 1
+                    self._execution_mode = invariant.execution_mode
+                    self._reason_code = invariant.reason_code
+                    self._terminal = True
+                    if self._diagnostic_runtime is not None:
+                        self._finalize_diagnostics()
+                    return
             self._reason_code = error.reason_code
             self._terminal = True
             return
@@ -705,7 +861,11 @@ class WorkerTypedLoopAdapter:
             return self._fallback("typed_loop_input_shape")
         with self._lock:
             self._calls += 1
-            if self._variant is None and not self._terminal:
+            if (
+                self._variant is None
+                and self._backend_entry is None
+                and not self._terminal
+            ):
                 if self._calls >= self._call_threshold:
                     self._compile_locked()
                 else:
@@ -716,10 +876,12 @@ class WorkerTypedLoopAdapter:
                         reason_code="runtime_call_threshold",
                     )
             variant = self._variant
+            backend_entry = self._backend_entry
+            backend_bound_arguments = self._backend_bound_arguments
             entry_guard = self._entry_guard
             wrapper_guard = self._wrapper_guard
             terminal_reason = self._reason_code
-        if variant is None:
+        if variant is None and backend_entry is None:
             return self._fallback(
                 terminal_reason,
                 terminal=self._terminal,
@@ -733,7 +895,13 @@ class WorkerTypedLoopAdapter:
                 self._guard_misses += 1
             return self._fallback("typed_entry_guard_miss")
         try:
-            value = variant(*logical_inputs)
+            if backend_entry is not None:
+                value = backend_entry(
+                    *logical_inputs,
+                    **backend_bound_arguments,
+                )
+            else:
+                value = variant(*logical_inputs)
         except TypedGuardMiss:
             with self._lock:
                 self._guard_misses += 1
