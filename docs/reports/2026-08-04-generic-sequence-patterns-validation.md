@@ -105,14 +105,15 @@ CinderX generic HIR。每个 case 的 checksum 完全一致。
 
 - UDF JIT typed/worker/diagnostics 相关单元测试：85 passed；
 - CinderX 定向 Python 测试：13 passed；跨仓诊断集成：1 passed；
-- CinderX 定向 RuntimeTest：2 passed；
+- CinderX 定向 RuntimeTest：5 passed（2 个新增后端用例、3 个受影响 OSR 用例）；
+- 完整 `runtime_tests` 目标：构建通过；整套执行 1312 项中 1311 passed；
 - clean `_cinderx` 构建、import/init/force-compile smoke：通过；
 - 三类诊断 bundle：全部 complete，Source→Machine 链完整；
 - `git diff --check`、Python compile/test 和 C++ 构建在提交前复核。
 
-完整 `runtime_tests` 目标仍被候选基线中无关的
-`osr_loop_header_secondary_entry_test.cpp` 重复定义阻塞；本轮使用排除该文件的已编译对象重链定向
-RuntimeTest，不把完整目标记为通过。
+复核时发现基础补丁曾重复加入 3 个 OSR 异常表用例；重复块已移除，完整目标随后成功构建，
+相关 5 项定向测试全部通过。整套执行唯一失败为差异外既有用例
+`BehaviorClassifierRuntimeTest.RoiBackoffUncompilesDeoptStorm`，因此不把整套 RuntimeTests 记为全绿。
 
 结构化证据见
 `docs/reports/evidence/2026-08-04-generic-sequence-patterns-ab.json`。
