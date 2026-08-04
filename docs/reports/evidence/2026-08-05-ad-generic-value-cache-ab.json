@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "candidate": {
+    "cinderx_binary_sha256": "b3b1cf5b79563138008bd735ca1a90f023f2c10d3ba5f9f0a99c41831b595985",
+    "diagnostic_counter_code_present": false,
+    "name": "generic-exact-unicode-value-cache-entry-guard-v3",
+    "provider_business_name_matching": false
+  },
+  "environment": {
+    "host": "blue-53",
+    "image": "python-udf-jit-volc:u13-46f8c726",
+    "physical_cpus": "32,34,36,38",
+    "python": "3.14.3",
+    "serial_ab": true,
+    "switches": {
+      "PYTHONJITUDFDIAGNOSTICS": "0",
+      "UDFJIT_DIAGNOSTICS": "off"
+    }
+  },
+  "functional": {
+    "dataset": "nuscenes_cam_front_10k",
+    "host": "blue-98",
+    "ordered_output_equal": true,
+    "output_rows_auto": 10000,
+    "output_rows_off": 10000,
+    "schema_equal": true
+  },
+  "runtime_diagnostic": {
+    "align_cache_hits": 489968,
+    "align_cache_inserts": 10000,
+    "align_cache_lookups": 499990,
+    "dataset": "nuscenes_cam_front_500k_calibration",
+    "dependency_disables": 0,
+    "separate_from_timing": true
+  },
+  "calibration": {
+    "auto_execute_seconds": 20.227883039973676,
+    "auto_total_seconds": 26.498712050030008,
+    "dataset": "nuscenes_cam_front_500k_calibration",
+    "execute_speedup": 1.283274060792884,
+    "multiset_digest_auto": "c6a257cbaae62be3415c9de148183c7f35b74e729095abb4c73b886cd7ed944e",
+    "multiset_digest_off": "c6a257cbaae62be3415c9de148183c7f35b74e729095abb4c73b886cd7ed944e",
+    "multiset_equal": true,
+    "off_execute_seconds": 25.957917609950528,
+    "off_total_seconds": 33.58948381990194,
+    "output_rows_auto": 500000,
+    "output_rows_off": 500000,
+    "total_speedup": 1.2675892985472064,
+    "unique_outputs": 10000
+  },
+  "formal": {
+    "auto_execute_seconds": 177.04544608015567,
+    "auto_total_seconds": 185.57812359998934,
+    "dataset": "nuscenes_cam_front_5m",
+    "execute_reduction_percent": 24.367566641708883,
+    "execute_speedup": 1.3221840890173822,
+    "multiset_digest_auto": "7e818d03debdd633032186759372b496c05ba4cf34caada85beb4981baf13b87",
+    "multiset_digest_off": "7e818d03debdd633032186759372b496c05ba4cf34caada85beb4981baf13b87",
+    "multiset_equal": true,
+    "off_execute_seconds": 234.08667184016667,
+    "off_total_seconds": 242.8759950203821,
+    "output_rows_auto": 5000000,
+    "output_rows_off": 5000000,
+    "schema_equal": true,
+    "total_reduction_percent": 23.591409853239853,
+    "total_speedup": 1.3087533719432223,
+    "unique_outputs": 10000
+  },
+  "fineweb_reference": {
+    "auto_execute_seconds": 301.388061,
+    "dataset_rows": 200000,
+    "execute_speedup": 1.2920738655271418,
+    "off_execute_seconds": 389.415637,
+    "output_rows_auto": 199765,
+    "output_rows_off": 199765
+  }
+}
