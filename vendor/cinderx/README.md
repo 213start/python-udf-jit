@@ -22,6 +22,14 @@ HIR：前端只在确认“精确字符串 + 通用迭代循环 + 整数计数�
 运行时直接遍历 Unicode 存储；属性编号覆盖 alnum、alpha、decimal、digit、
 numeric 和 space，不包含 pipeline、算子或 UDF 名称。
 
+第六个补丁补充同一通用模型下的序列构造能力：`UnicodeMapSequence` 对有界、
+有序且不可变的 Unicode 标量查表执行一次原生扫描；`UnicodeFsmSequence` 将
+Unicode 分类、有限状态转移和序列构造合并为一个受描述符约束的原生操作。
+两个内核均用单遍 Unicode writer 构造规范宽度结果，避免重复查表、分类和状态
+转移。
+两者只接受精确字符串和经校验的常量描述符，不包含 punctuation、whitespace、
+pipeline、算子或 UDF 名称。
+
 RFC-013 的结构化 HIR/LIR/机器区间导出位于 `diagnostics/`，作为 dedicated
 diagnostic worker 的额外 overlay 单独锁定。它不属于本生产候选补丁系列，
 不得应用到 `diagnostics=off` 的正式性能或生产镜像。
@@ -38,6 +46,7 @@ patch --batch -p1 < 0002-primitive-data-intrinsics.patch
 patch --batch -p1 < 0003-continuation-deopt.patch
 patch --batch -p1 < 0004-wx-dual-mapping.patch
 patch --batch -p1 < 0005-generic-typed-loop-specialization.patch
+patch --batch -p1 < 0006-generic-sequence-patterns.patch
 ```
 
 正式验收逐个校验补丁 SHA-256，并按清单顺序拼接补丁原始字节后计算补丁系列

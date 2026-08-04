@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "base_upstream_commit": "ac09c68527153b43cc8b4f16f36d9245cb861d12",
-  "base_candidate_patch_series_sha256": "4445776e936e146260ef6ba19bdc6dcdc50d1f76b4f78e37d506acd9d63ec2d5",
+  "base_candidate_patch_series_sha256": "4cb5b1c3d8fdef334d70c4f3c1a1baf9ef14424713985f15049eefeba8eeae32",
   "patches": [
     {
       "path": "patches/0001-structured-origin-export.patch",
-      "sha256": "438f4e89a223a14deecef46f025a37effc282f0b6ad6bd8ff959cd6c53bf34a1",
+      "sha256": "cb8272c298a576551695ef2b62a51be3fea91f66f7380c0557c43af829cc800a",
       "changed_file_count": 11
     }
   ],
-  "patch_series_sha256": "438f4e89a223a14deecef46f025a37effc282f0b6ad6bd8ff959cd6c53bf34a1",
+  "patch_series_sha256": "cb8272c298a576551695ef2b62a51be3fea91f66f7380c0557c43af829cc800a",
   "changed_file_count": 11,
   "diagnostic_abi": {
     "version": 1,

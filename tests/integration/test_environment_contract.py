@@ -142,6 +142,7 @@ class EnvironmentContractTests(unittest.TestCase):
                 "0003-continuation-deopt.patch",
                 "0004-wx-dual-mapping.patch",
                 "0005-generic-typed-loop-specialization.patch",
+                "0006-generic-sequence-patterns.patch",
             ],
         )
         for entry in patches:
@@ -202,6 +203,16 @@ class EnvironmentContractTests(unittest.TestCase):
         )
         self.assertIn(
             "cinderx/Jit/code_patcher.cpp",
+            all_changed,
+        )
+        self.assertIn(
+            "cinderx/PythonLib/test_cinderx/"
+            "test_udf_typed_sequence_intrinsic.py",
+            all_changed,
+        )
+        self.assertIn(
+            "cinderx/RuntimeTests/"
+            "udf_typed_sequence_intrinsic_test.cpp",
             all_changed,
         )
         self.assertEqual(

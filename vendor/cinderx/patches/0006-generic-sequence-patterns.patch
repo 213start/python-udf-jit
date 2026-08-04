@@ -1,0 +1,916 @@
+diff --git a/cinderx/Jit/hir/hir.cpp b/cinderx/Jit/hir/hir.cpp
+index 5c9cd4d..633fcef 100644
+--- a/cinderx/Jit/hir/hir.cpp
++++ b/cinderx/Jit/hir/hir.cpp
+@@ -428,6 +428,8 @@ bool Instr::isReplayable() const {
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
+     case Opcode::kUnicodeCountProperty:
++    case Opcode::kUnicodeFsmSequence:
++    case Opcode::kUnicodeMapSequence:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUseType:
+     case Opcode::kWaitHandleLoadCoroOrResult:
+@@ -857,6 +859,8 @@ bool isPassthrough(const Instr& instr) {
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
+     case Opcode::kUnicodeCountProperty:
++    case Opcode::kUnicodeFsmSequence:
++    case Opcode::kUnicodeMapSequence:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUnpackExToTuple:
+diff --git a/cinderx/Jit/hir/hir.h b/cinderx/Jit/hir/hir.h
+index 7e369c9..c124e11 100644
+--- a/cinderx/Jit/hir/hir.h
++++ b/cinderx/Jit/hir/hir.h
+@@ -1205,6 +1205,25 @@ DEFINE_SIMPLE_INSTR(
+     HasOutput,
+     Operands<2>);
+ 
++// Apply a compile-time immutable scalar-to-scalar table while constructing a
++// new exact Unicode sequence.  Descriptor operands remain explicit constants
++// so the operation is independent of any particular mapping.
++DEFINE_SIMPLE_INSTR(
++    UnicodeMapSequence,
++    (TUnicodeExact, TUnicodeExact, TUnicodeExact),
++    HasOutput,
++    Operands<3>,
++    DeoptBase);
++
++// Execute a boolean Unicode-property classifier and table-driven finite state
++// transducer while constructing a new exact Unicode sequence.
++DEFINE_SIMPLE_INSTR(
++    UnicodeFsmSequence,
++    (TUnicodeExact, TCInt64, TCInt64, TUnicodeExact),
++    HasOutput,
++    Operands<4>,
++    DeoptBase);
++
+ // Invokes a function with a static entry point, where we can
+ // directly provide the arguments using the x64 calling convention.
+ class INSTR_CLASS(
+diff --git a/cinderx/Jit/hir/hir_ops.h b/cinderx/Jit/hir/hir_ops.h
+index 6b8dbe5..a23d4d1 100644
+--- a/cinderx/Jit/hir/hir_ops.h
++++ b/cinderx/Jit/hir/hir_ops.h
+@@ -190,6 +190,8 @@ namespace jit::hir {
+   V(UnicodeCompare)                \
+   V(UnicodeConcat)                 \
+   V(UnicodeCountProperty)          \
++  V(UnicodeFsmSequence)            \
++  V(UnicodeMapSequence)            \
+   V(UnicodeRepeat)                 \
+   V(UnicodeSubscr)                 \
+   V(UnpackExToTuple)               \
+diff --git a/cinderx/Jit/hir/instr_effects.cpp b/cinderx/Jit/hir/instr_effects.cpp
+index 65bf516..b519648 100644
+--- a/cinderx/Jit/hir/instr_effects.cpp
++++ b/cinderx/Jit/hir/instr_effects.cpp
+@@ -72,6 +72,8 @@ MemoryEffects memoryEffects(const Instr& inst) {
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
+     case Opcode::kUnicodeCountProperty:
++    case Opcode::kUnicodeFsmSequence:
++    case Opcode::kUnicodeMapSequence:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUnreachable:
+@@ -493,6 +495,8 @@ bool hasArbitraryExecution(const Instr& inst) {
+     case Opcode::kUnicodeCompare:
+     case Opcode::kUnicodeConcat:
+     case Opcode::kUnicodeCountProperty:
++    case Opcode::kUnicodeFsmSequence:
++    case Opcode::kUnicodeMapSequence:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUnreachable:
+diff --git a/cinderx/Jit/hir/parser.cpp b/cinderx/Jit/hir/parser.cpp
+index de7b41f..124346f 100644
+--- a/cinderx/Jit/hir/parser.cpp
++++ b/cinderx/Jit/hir/parser.cpp
+@@ -828,6 +828,28 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
+       NEW_INSTR(UnicodeCountProperty, dst, text, property);
+       break;
+     }
++    case Opcode::kUnicodeMapSequence: {
++      auto text = ParseRegister();
++      auto keys = ParseRegister();
++      auto values = ParseRegister();
++      NEW_INSTR(UnicodeMapSequence, dst, text, keys, values, FrameState{});
++      break;
++    }
++    case Opcode::kUnicodeFsmSequence: {
++      auto text = ParseRegister();
++      auto property = ParseRegister();
++      auto initial_state = ParseRegister();
++      auto descriptor = ParseRegister();
++      NEW_INSTR(
++          UnicodeFsmSequence,
++          dst,
++          text,
++          property,
++          initial_state,
++          descriptor,
++          FrameState{});
++      break;
++    }
+     case Opcode::kPhi: {
+       expect("<");
+       PhiInfo info{dst};
+diff --git a/cinderx/Jit/hir/pass.cpp b/cinderx/Jit/hir/pass.cpp
+index 78d724e..d67b351 100644
+--- a/cinderx/Jit/hir/pass.cpp
++++ b/cinderx/Jit/hir/pass.cpp
+@@ -486,7 +486,6 @@ Type outputType(
+     case Opcode::kUnicodeCountProperty: {
+       return TCInt64;
+     }
+-
+     // Check opcodes return a copy of their input that is statically known to
+     // not be null.
+     case Opcode::kCheckExc:
+@@ -527,6 +526,8 @@ Type outputType(
+     }
+ 
+     case Opcode::kUnicodeConcat:
++    case Opcode::kUnicodeFsmSequence:
++    case Opcode::kUnicodeMapSequence:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr: {
+       return TUnicodeExact;
+diff --git a/cinderx/Jit/hir/printer.cpp b/cinderx/Jit/hir/printer.cpp
+index 7a3b85e..b02b364 100644
+--- a/cinderx/Jit/hir/printer.cpp
++++ b/cinderx/Jit/hir/printer.cpp
+@@ -322,6 +322,8 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
+     case Opcode::kXIncref:
+     case Opcode::kUnicodeConcat:
+     case Opcode::kUnicodeCountProperty:
++    case Opcode::kUnicodeFsmSequence:
++    case Opcode::kUnicodeMapSequence:
+     case Opcode::kUnicodeRepeat:
+     case Opcode::kUnicodeSubscr:
+     case Opcode::kUnreachable:
+diff --git a/cinderx/Jit/hir/simplify.cpp b/cinderx/Jit/hir/simplify.cpp
+index ae7ff5c..47406ce 100644
+--- a/cinderx/Jit/hir/simplify.cpp
++++ b/cinderx/Jit/hir/simplify.cpp
+@@ -2169,6 +2169,100 @@ bool isExactUdfScalarHelper(Register* callable, PyCFunction expected) {
+   return isExactPyCFunction(callable, expected);
+ }
+ 
++bool getExactLongConstant(Register* value, long* result) {
++  Type type = value->type();
++  if (!type.hasObjectSpec() || !PyLong_CheckExact(type.objectSpec())) {
++    return false;
++  }
++  int overflow = 0;
++  *result = PyLong_AsLongAndOverflow(type.objectSpec(), &overflow);
++  if (overflow != 0) {
++    PyErr_Clear();
++    return false;
++  }
++  return true;
++}
++
++PyObject* getExactUnicodeConstant(Register* value) {
++  Type type = value->type();
++  if (!type.hasObjectSpec() || !PyUnicode_CheckExact(type.objectSpec())) {
++    return nullptr;
++  }
++  return type.objectSpec();
++}
++
++Register* trySimplifyUdfUnicodeMapSequence(
++    Env& env,
++    const VectorCall* instr) {
++  if (instr->frameState() == nullptr || instr->flags() != CallFlags::None ||
++      instr->numArgs() != 3 ||
++      !isExactPyCFunction(
++          instr->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfUnicodeMapSequence))) {
++    return nullptr;
++  }
++  PyObject* keys = getExactUnicodeConstant(instr->arg(1));
++  PyObject* values = getExactUnicodeConstant(instr->arg(2));
++  if (keys == nullptr || values == nullptr ||
++      !JITRT_IsValidUnicodeMapDescriptor(keys, values)) {
++    return nullptr;
++  }
++
++  env.emit<UseType>(instr->func(), instr->func()->type());
++  env.emit<UseType>(instr->arg(1), instr->arg(1)->type());
++  env.emit<UseType>(instr->arg(2), instr->arg(2)->type());
++  Register* text =
++      env.emit<GuardType>(TUnicodeExact, instr->arg(0), *instr->frameState());
++  env.emit<UseType>(text, TUnicodeExact);
++  return env.emit<UnicodeMapSequence>(
++      text,
++      instr->arg(1),
++      instr->arg(2),
++      *instr->frameState());
++}
++
++Register* trySimplifyUdfUnicodeFsmSequence(
++    Env& env,
++    const VectorCall* instr) {
++  if (instr->frameState() == nullptr || instr->flags() != CallFlags::None ||
++      instr->numArgs() != 4 ||
++      !isExactPyCFunction(
++          instr->func(),
++          reinterpret_cast<PyCFunction>(JITRT_UdfUnicodeFsmSequence))) {
++    return nullptr;
++  }
++  long property = 0;
++  long initial_state = 0;
++  PyObject* descriptor = getExactUnicodeConstant(instr->arg(3));
++  if (!getExactLongConstant(instr->arg(1), &property) ||
++      !getExactLongConstant(instr->arg(2), &initial_state) ||
++      descriptor == nullptr ||
++      !JITRT_IsValidUnicodeFsmDescriptor(
++          property,
++          initial_state,
++          descriptor)) {
++    return nullptr;
++  }
++
++  env.emit<UseType>(instr->func(), instr->func()->type());
++  for (std::size_t index = 1; index < instr->numArgs(); index++) {
++    env.emit<UseType>(instr->arg(index), instr->arg(index)->type());
++  }
++  Register* text =
++      env.emit<GuardType>(TUnicodeExact, instr->arg(0), *instr->frameState());
++  env.emit<UseType>(text, TUnicodeExact);
++  Register* property_id =
++      env.emit<LoadConst>(Type::fromCInt(property, TCInt64));
++  Register* initial_state_id =
++      env.emit<LoadConst>(Type::fromCInt(initial_state, TCInt64));
++  return env.emit<UnicodeFsmSequence>(
++      text,
++      property_id,
++      initial_state_id,
++      instr->arg(3),
++      *instr->frameState());
++}
++
+ Register* trySimplifyUdfUnicodeCountProperty(
+     Env& env,
+     const VectorCall* instr) {
+@@ -2526,6 +2620,12 @@ std::optional<std::pair<Instr*, std::vector<Instr*>>> isVectorCallIfIsInstance(
+ }
+ 
+ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
++  if (Register* result = trySimplifyUdfUnicodeMapSequence(env, instr)) {
++    return result;
++  }
++  if (Register* result = trySimplifyUdfUnicodeFsmSequence(env, instr)) {
++    return result;
++  }
+   if (Register* result = trySimplifyUdfUnicodeCountProperty(env, instr)) {
+     return result;
+   }
+diff --git a/cinderx/Jit/jit_rt.cpp b/cinderx/Jit/jit_rt.cpp
+index 9a2c52a..ea04310 100644
+--- a/cinderx/Jit/jit_rt.cpp
++++ b/cinderx/Jit/jit_rt.cpp
+@@ -629,6 +629,97 @@ bool isValidUnicodeProperty(int64_t property) {
+       property <= kUdfUnicodePropertyMax;
+ }
+ 
++bool unicodePropertyMatches(Py_UCS4 ch, int64_t property) {
++  switch (static_cast<UdfUnicodeProperty>(property)) {
++    case UdfUnicodeProperty::kAlnum:
++      return Py_UNICODE_ISALNUM(ch);
++    case UdfUnicodeProperty::kAlpha:
++      return Py_UNICODE_ISALPHA(ch);
++    case UdfUnicodeProperty::kDecimal:
++      return Py_UNICODE_ISDECIMAL(ch);
++    case UdfUnicodeProperty::kDigit:
++      return Py_UNICODE_ISDIGIT(ch);
++    case UdfUnicodeProperty::kNumeric:
++      return Py_UNICODE_ISNUMERIC(ch);
++    case UdfUnicodeProperty::kSpace:
++      return Py_UNICODE_ISSPACE(ch);
++  }
++  JIT_ABORT("unreachable Unicode property id {}", property);
++}
++
++Py_UCS4 unicodeAt(PyObject* value, Py_ssize_t index) {
++  return PyUnicode_READ(
++      PyUnicode_KIND(value), PyUnicode_DATA(value), index);
++}
++
++bool isValidUnicodeMapDescriptor(PyObject* keys, PyObject* values) {
++  if (!PyUnicode_CheckExact(keys) || !PyUnicode_CheckExact(values)) {
++    return false;
++  }
++  const Py_ssize_t length = PyUnicode_GET_LENGTH(keys);
++  if (length != PyUnicode_GET_LENGTH(values) || length > 256) {
++    return false;
++  }
++  for (Py_ssize_t index = 1; index < length; index++) {
++    if (unicodeAt(keys, index - 1) >= unicodeAt(keys, index)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool isValidUnicodeFsmDescriptor(
++    int64_t property,
++    int64_t initial_state,
++    PyObject* descriptor) {
++  if (!isValidUnicodeProperty(property) ||
++      !PyUnicode_CheckExact(descriptor)) {
++    return false;
++  }
++  const Py_ssize_t descriptor_length = PyUnicode_GET_LENGTH(descriptor);
++  if (descriptor_length == 0 || descriptor_length % 3 != 0) {
++    return false;
++  }
++  const Py_ssize_t table_length = descriptor_length / 3;
++  if (table_length > 128 || table_length % 2 != 0) {
++    return false;
++  }
++  const Py_ssize_t state_count = table_length / 2;
++  if (state_count > 64 || initial_state < 0 || initial_state >= state_count) {
++    return false;
++  }
++  for (Py_ssize_t index = 0; index < table_length; index++) {
++    if (unicodeAt(descriptor, index) >= state_count ||
++        unicodeAt(descriptor, table_length + index) > 4) {
++      return false;
++    }
++  }
++  return true;
++}
++
++Py_UCS4 mapUnicodeScalar(Py_UCS4 ch, PyObject* keys, PyObject* values) {
++  const Py_ssize_t table_length = PyUnicode_GET_LENGTH(keys);
++  if (table_length == 0 || ch < unicodeAt(keys, 0) ||
++      ch > unicodeAt(keys, table_length - 1)) {
++    return ch;
++  }
++  Py_ssize_t left = 0;
++  Py_ssize_t right = table_length;
++  while (left < right) {
++    const Py_ssize_t middle = left + (right - left) / 2;
++    const Py_UCS4 key = unicodeAt(keys, middle);
++    if (key < ch) {
++      left = middle + 1;
++    } else {
++      right = middle;
++    }
++  }
++  if (left < table_length && unicodeAt(keys, left) == ch) {
++    return unicodeAt(values, left);
++  }
++  return ch;
++}
++
+ } // namespace
+ 
+ int64_t JITRT_UnicodeCountProperty(PyObject* text, int64_t property) {
+@@ -660,6 +751,87 @@ int64_t JITRT_UnicodeCountProperty(PyObject* text, int64_t property) {
+   JIT_ABORT("unreachable Unicode property id {}", property);
+ }
+ 
++bool JITRT_IsValidUnicodeMapDescriptor(PyObject* keys, PyObject* values) {
++  return isValidUnicodeMapDescriptor(keys, values);
++}
++
++bool JITRT_IsValidUnicodeFsmDescriptor(
++    int64_t property,
++    int64_t initial_state,
++    PyObject* descriptor) {
++  return isValidUnicodeFsmDescriptor(
++      property,
++      initial_state,
++      descriptor);
++}
++
++PyObject* JITRT_UnicodeMapSequence(
++    PyObject* text,
++    PyObject* keys,
++    PyObject* values) {
++  JIT_DCHECK(
++      PyUnicode_CheckExact(text), "UnicodeMapSequence requires an exact str");
++  JIT_DCHECK(
++      isValidUnicodeMapDescriptor(keys, values),
++      "UnicodeMapSequence received an invalid descriptor");
++  const Py_ssize_t length = PyUnicode_GET_LENGTH(text);
++  PyUnicodeWriter* writer = PyUnicodeWriter_Create(length);
++  if (writer == nullptr) {
++    return nullptr;
++  }
++  for (Py_ssize_t index = 0; index < length; index++) {
++    if (PyUnicodeWriter_WriteChar(
++            writer,
++            mapUnicodeScalar(unicodeAt(text, index), keys, values)) < 0) {
++      PyUnicodeWriter_Discard(writer);
++      return nullptr;
++    }
++  }
++  return PyUnicodeWriter_Finish(writer);
++}
++
++PyObject* JITRT_UnicodeFsmSequence(
++    PyObject* text,
++    int64_t property,
++    int64_t initial_state,
++    PyObject* descriptor) {
++  JIT_DCHECK(
++      PyUnicode_CheckExact(text), "UnicodeFsmSequence requires an exact str");
++  JIT_DCHECK(
++      isValidUnicodeFsmDescriptor(
++          property,
++          initial_state,
++          descriptor),
++      "UnicodeFsmSequence received an invalid descriptor");
++  const Py_ssize_t input_length = PyUnicode_GET_LENGTH(text);
++  const Py_ssize_t table_length = PyUnicode_GET_LENGTH(descriptor) / 3;
++  PyUnicodeWriter* writer = PyUnicodeWriter_Create(input_length);
++  if (writer == nullptr) {
++    return nullptr;
++  }
++  int64_t state = initial_state;
++  for (Py_ssize_t index = 0; index < input_length; index++) {
++    const Py_UCS4 ch = unicodeAt(text, index);
++    const Py_ssize_t table_index =
++        state * 2 + unicodePropertyMatches(ch, property);
++    const Py_UCS4 action =
++        unicodeAt(descriptor, table_length + table_index);
++    const Py_UCS4 emission =
++        unicodeAt(descriptor, 2 * table_length + table_index);
++    if (((action == 2 || action == 3) &&
++         PyUnicodeWriter_WriteChar(writer, emission) < 0) ||
++        ((action == 1 || action == 3 || action == 4) &&
++         PyUnicodeWriter_WriteChar(writer, ch) < 0) ||
++        (action == 4 &&
++         PyUnicodeWriter_WriteChar(writer, emission) < 0)) {
++      PyUnicodeWriter_Discard(writer);
++      return nullptr;
++    }
++    state = unicodeAt(descriptor, table_index);
++  }
++  return PyUnicodeWriter_Finish(writer);
++}
++
+ PyObject* JITRT_UdfUnicodeCountProperty(PyObject*, PyObject* args) {
+   PyObject* text;
+   PyObject* property_obj;
+@@ -685,6 +857,69 @@ PyObject* JITRT_UdfUnicodeCountProperty(PyObject*, PyObject* args) {
+   return PyLong_FromLongLong(JITRT_UnicodeCountProperty(text, property));
+ }
+ 
++PyObject* JITRT_UdfUnicodeMapSequence(PyObject*, PyObject* args) {
++  PyObject* text;
++  PyObject* keys;
++  PyObject* values;
++  if (!PyArg_ParseTuple(args, "OOO", &text, &keys, &values)) {
++    return nullptr;
++  }
++  if (!PyUnicode_CheckExact(text) || !PyUnicode_CheckExact(keys) ||
++      !PyUnicode_CheckExact(values)) {
++    PyErr_SetString(
++        PyExc_TypeError, "Unicode map helper expects exact str arguments");
++    return nullptr;
++  }
++  if (!isValidUnicodeMapDescriptor(keys, values)) {
++    PyErr_SetString(PyExc_ValueError, "invalid Unicode map descriptor");
++    return nullptr;
++  }
++  return JITRT_UnicodeMapSequence(text, keys, values);
++}
++
++PyObject* JITRT_UdfUnicodeFsmSequence(PyObject*, PyObject* args) {
++  PyObject* text;
++  PyObject* property_obj;
++  PyObject* initial_state_obj;
++  PyObject* descriptor;
++  if (!PyArg_ParseTuple(
++          args,
++          "OOOO",
++          &text,
++          &property_obj,
++          &initial_state_obj,
++          &descriptor)) {
++    return nullptr;
++  }
++  if (!PyUnicode_CheckExact(text) || !PyLong_CheckExact(property_obj) ||
++      !PyLong_CheckExact(initial_state_obj) ||
++      !PyUnicode_CheckExact(descriptor)) {
++    PyErr_SetString(
++        PyExc_TypeError,
++        "Unicode FSM helper expects exact str and int arguments");
++    return nullptr;
++  }
++  int property_overflow = 0;
++  int state_overflow = 0;
++  const long property =
++      PyLong_AsLongAndOverflow(property_obj, &property_overflow);
++  const long initial_state =
++      PyLong_AsLongAndOverflow(initial_state_obj, &state_overflow);
++  if (property_overflow != 0 || state_overflow != 0 ||
++      !isValidUnicodeFsmDescriptor(
++          property,
++          initial_state,
++          descriptor)) {
++    PyErr_SetString(PyExc_ValueError, "invalid Unicode FSM descriptor");
++    return nullptr;
++  }
++  return JITRT_UnicodeFsmSequence(
++      text,
++      property,
++      initial_state,
++      descriptor);
++}
++
+ bool JITRT_IsUdfDataNullUnchecked(PyObject* capsule) {
+   std::lock_guard<std::mutex> lock{g_udf_scalar_slots_mutex};
+   auto it = g_udf_scalar_slots.find(capsule);
+diff --git a/cinderx/Jit/jit_rt.h b/cinderx/Jit/jit_rt.h
+index 73a59ca..39c5d98 100644
+--- a/cinderx/Jit/jit_rt.h
++++ b/cinderx/Jit/jit_rt.h
+@@ -64,6 +64,8 @@ PyObject* JITRT_UdfDataStoreF32(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfDataStoreF64(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfDataStoreNull(PyObject* module, PyObject* capsule);
+ PyObject* JITRT_UdfUnicodeCountProperty(PyObject* module, PyObject* args);
++PyObject* JITRT_UdfUnicodeMapSequence(PyObject* module, PyObject* args);
++PyObject* JITRT_UdfUnicodeFsmSequence(PyObject* module, PyObject* args);
+ PyObject* JITRT_UdfRegisterContinuationCode(
+     PyObject* module,
+     PyObject* target);
+@@ -81,6 +83,20 @@ void JITRT_StoreUdfDataF32Unchecked(PyObject* capsule, double value);
+ void JITRT_StoreUdfDataF64Unchecked(PyObject* capsule, double value);
+ void JITRT_StoreUdfDataNullUnchecked(PyObject* capsule);
+ int64_t JITRT_UnicodeCountProperty(PyObject* text, int64_t property);
++PyObject* JITRT_UnicodeMapSequence(
++    PyObject* text,
++    PyObject* keys,
++    PyObject* values);
++PyObject* JITRT_UnicodeFsmSequence(
++    PyObject* text,
++    int64_t property,
++    int64_t initial_state,
++    PyObject* descriptor);
++bool JITRT_IsValidUnicodeMapDescriptor(PyObject* keys, PyObject* values);
++bool JITRT_IsValidUnicodeFsmDescriptor(
++    int64_t property,
++    int64_t initial_state,
++    PyObject* descriptor);
+ 
+ PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Debug(
+     PyFunctionObject* func,
+diff --git a/cinderx/Jit/lir/generator.cpp b/cinderx/Jit/lir/generator.cpp
+index c75c0b5..b0a04ea 100644
+--- a/cinderx/Jit/lir/generator.cpp
++++ b/cinderx/Jit/lir/generator.cpp
+@@ -2883,6 +2883,29 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
+             instr->GetOperand(1));
+         break;
+       }
++      case Opcode::kUnicodeMapSequence: {
++        auto instr = static_cast<const UnicodeMapSequence*>(&i);
++
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_UnicodeMapSequence,
++            instr->GetOperand(0),
++            instr->GetOperand(1),
++            instr->GetOperand(2));
++        break;
++      }
++      case Opcode::kUnicodeFsmSequence: {
++        auto instr = static_cast<const UnicodeFsmSequence*>(&i);
++
++        bbb.appendCallInstruction(
++            instr->output(),
++            JITRT_UnicodeFsmSequence,
++            instr->GetOperand(0),
++            instr->GetOperand(1),
++            instr->GetOperand(2),
++            instr->GetOperand(3));
++        break;
++      }
+       case Opcode::kUnicodeRepeat: {
+         auto instr = static_cast<const UnicodeRepeat*>(&i);
+ 
+diff --git a/cinderx/Jit/pyjit.cpp b/cinderx/Jit/pyjit.cpp
+index ce84e57..b9e6b2e 100644
+--- a/cinderx/Jit/pyjit.cpp
++++ b/cinderx/Jit/pyjit.cpp
+@@ -3556,6 +3556,14 @@ PyMethodDef jit_methods[] = {
+      JITRT_UdfUnicodeCountProperty,
+      METH_VARARGS,
+      PyDoc_STR("Count exact-str code points matching a Unicode property id.")},
++    {"_udf_unicode_map_sequence",
++     JITRT_UdfUnicodeMapSequence,
++     METH_VARARGS,
++     PyDoc_STR("Construct an exact str through an immutable scalar map.")},
++    {"_udf_unicode_fsm_sequence",
++     JITRT_UdfUnicodeFsmSequence,
++     METH_VARARGS,
++     PyDoc_STR("Construct an exact str through a Unicode classifier FSM.")},
+     {"disable",
+      reinterpret_cast<PyCFunction>(disable_jit),
+      METH_VARARGS | METH_KEYWORDS,
+diff --git a/cinderx/PythonLib/cinderx/jit.py b/cinderx/PythonLib/cinderx/jit.py
+index bf921a9..f7008ac 100644
+--- a/cinderx/PythonLib/cinderx/jit.py
++++ b/cinderx/PythonLib/cinderx/jit.py
+@@ -17,6 +17,8 @@ try:
+     from cinderjit import (
+         _deopt_gen,
+         _udf_unicode_count_property,
++        _udf_unicode_fsm_sequence,
++        _udf_unicode_map_sequence,
+         append_jit_list,
+         auto,
+         clear_runtime_stats,
+@@ -69,6 +71,8 @@ except ImportError:
+     TDeoptGenReturn = TypeVar("TDeoptGenReturn")
+ 
+     _udf_unicode_count_property = None
++    _udf_unicode_fsm_sequence = None
++    _udf_unicode_map_sequence = None
+ 
+     def _deopt_gen(
+         gen: Generator[TDeoptGenYield, TDeoptGenSend, TDeoptGenReturn]
+diff --git a/cinderx/PythonLib/test_cinderx/test_udf_typed_sequence_intrinsic.py b/cinderx/PythonLib/test_cinderx/test_udf_typed_sequence_intrinsic.py
+new file mode 100644
+index 0000000..2342359
+--- /dev/null
++++ b/cinderx/PythonLib/test_cinderx/test_udf_typed_sequence_intrinsic.py
+@@ -0,0 +1,121 @@
++"""Tests for generic typed sequence-construction specialization."""
++
++import re
++import unittest
++
++import cinderx.jit
++
++try:
++    from cinderjit import (
++        _udf_unicode_fsm_sequence,
++        _udf_unicode_map_sequence,
++    )
++except ImportError:
++    _udf_unicode_fsm_sequence = None
++    _udf_unicode_map_sequence = None
++
++
++def map_greek(text):
++    return _udf_unicode_map_sequence(text, "αβ→", "ab>")
++
++
++def collapse_whitespace_runs(text):
++    return _udf_unicode_fsm_sequence(
++        text,
++        5,
++        0,
++        "\x01\x00\x01\x02\x01\x02"
++        "\x01\x00\x01\x00\x03\x00"
++        "\x00\x00\x00\x00 \x00",
++    )
++
++
++@unittest.skipUnless(
++    cinderx.jit.is_enabled()
++    and _udf_unicode_map_sequence is not None
++    and _udf_unicode_fsm_sequence is not None,
++    "requires CinderX JIT typed-sequence helpers",
++)
++class UdfTypedSequenceIntrinsicTests(unittest.TestCase):
++    def test_public_map_helper_accepts_arbitrary_scalar_tables(self):
++        cases = (
++            ("α→β and 中文", "αβ→", "ab>", "a>b and 中文"),
++            ("cab", "abc", "123", "312"),
++            ("🙂a🙂", "🙂", "x", "xax"),
++            ("", "", "", ""),
++        )
++        for text, keys, values, expected in cases:
++            with self.subTest(text=text, keys=keys):
++                self.assertEqual(
++                    _udf_unicode_map_sequence(text, keys, values),
++                    expected,
++                )
++
++    def test_public_fsm_helper_matches_unicode_regex_collapse(self):
++        samples = (
++            "",
++            "plain",
++            "  a\t\nb  ",
++            "\u2003中文\u2029 text\u3000",
++            "\x1cA\x1fB\x85",
++        )
++        for text in samples:
++            with self.subTest(text=text):
++                self.assertEqual(
++                    collapse_whitespace_runs(text),
++                    re.sub(r"\s+", " ", text).strip(),
++                )
++
++    def test_public_helpers_reject_unproven_descriptors_and_subclasses(self):
++        class TextSubclass(str):
++            pass
++
++        with self.assertRaises(TypeError):
++            _udf_unicode_map_sequence(TextSubclass("a"), "a", "b")
++        with self.assertRaises(ValueError):
++            _udf_unicode_map_sequence("a", "aa", "bc")
++        with self.assertRaises(ValueError):
++            _udf_unicode_map_sequence("a", "ba", "12")
++        with self.assertRaises(ValueError):
++            _udf_unicode_map_sequence("a", "ab", "x")
++        with self.assertRaises(TypeError):
++            _udf_unicode_fsm_sequence(
++                "a", True, 0, "\x00\x00\x01\x00\x00\x00"
++            )
++        with self.assertRaises(ValueError):
++            _udf_unicode_fsm_sequence(
++                "a", 5, 0, "\x02\x00\x01\x00\x00\x00"
++            )
++
++    def test_generic_helpers_lower_to_distinct_typed_hir_operations(self):
++        cases = (
++            (map_greek, "UnicodeMapSequence", "α→β", "a>b"),
++            (
++                collapse_whitespace_runs,
++                "UnicodeFsmSequence",
++                "  a\t\nb  ",
++                "a b",
++            ),
++        )
++        for function, opcode, value, expected in cases:
++            with self.subTest(opcode=opcode):
++                self.assertTrue(cinderx.jit.force_compile(function))
++                counts = cinderx.jit.get_function_hir_opcode_counts(function)
++                self.assertEqual(counts.get(opcode, 0), 1, counts)
++                self.assertEqual(function(value), expected)
++
++    def test_unrelated_python_calls_are_not_specialized(self):
++        def fake_map(text, keys, values):
++            return text + keys + values
++
++        def wrapper(text):
++            return fake_map(text, "a", "b")
++
++        self.assertTrue(cinderx.jit.force_compile(wrapper))
++        counts = cinderx.jit.get_function_hir_opcode_counts(wrapper)
++        self.assertEqual(counts.get("UnicodeMapSequence", 0), 0, counts)
++        self.assertEqual(wrapper("x"), "xab")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/cinderx/RuntimeTests/udf_typed_sequence_intrinsic_test.cpp b/cinderx/RuntimeTests/udf_typed_sequence_intrinsic_test.cpp
+new file mode 100644
+index 0000000..f9e377a
+--- /dev/null
++++ b/cinderx/RuntimeTests/udf_typed_sequence_intrinsic_test.cpp
+@@ -0,0 +1,124 @@
++// Copyright (c) Meta Platforms, Inc. and affiliates.
++
++#include "cinderx/Jit/code_runtime.h"
++#include "cinderx/Jit/codegen/environ.h"
++#include "cinderx/Jit/compiler.h"
++#include "cinderx/Jit/context.h"
++#include "cinderx/Jit/hir/instr_effects.h"
++#include "cinderx/Jit/hir/parser.h"
++#include "cinderx/Jit/hir/pass.h"
++#include "cinderx/Jit/jit_rt.h"
++#include "cinderx/Jit/lir/generator.h"
++#include "cinderx/Jit/lir/printer.h"
++#include "cinderx/RuntimeTests/fixtures.h"
++
++#include <fmt/format.h>
++
++#include <sstream>
++#include <string>
++
++using UdfTypedSequenceIntrinsicTest = RuntimeTest;
++
++namespace {
++
++std::unique_ptr<jit::hir::Function> parseUnicodeMapFunction() {
++  return jit::hir::HIRParser{}.ParseHIR(R"(
++fun test {
++  bb 0 {
++    v0 = LoadArg<0>
++    v1 = RefineType<UnicodeExact> v0
++    v2 = LoadArg<1>
++    v3 = RefineType<UnicodeExact> v2
++    v4 = LoadArg<2>
++    v5 = RefineType<UnicodeExact> v4
++    v6 = UnicodeMapSequence v1 v3 v5
++    Return v6
++  }
++}
++)");
++}
++
++std::unique_ptr<jit::hir::Function> parseUnicodeFsmFunction() {
++  return jit::hir::HIRParser{}.ParseHIR(R"(
++fun test {
++  bb 0 {
++    v0 = LoadArg<0>
++    v1 = RefineType<UnicodeExact> v0
++    v2 = LoadConst<CInt64[5]>
++    v3 = LoadConst<CInt64[0]>
++    v4 = LoadArg<1>
++    v5 = RefineType<UnicodeExact> v4
++    v6 = UnicodeFsmSequence v1 v2 v3 v5
++    Return v6
++  }
++}
++)");
++}
++
++const jit::hir::Instr* findSequenceInstruction(
++    const jit::hir::Function& function) {
++  for (const auto& block : function.cfg.blocks) {
++    for (const auto& instr : block) {
++      if (instr.IsUnicodeMapSequence() || instr.IsUnicodeFsmSequence()) {
++        return &instr;
++      }
++    }
++  }
++  return nullptr;
++}
++
++std::string lowerToLir(jit::hir::Function& function) {
++  jit::Compiler::runPasses(
++      function,
++      static_cast<jit::PassConfig>(
++          jit::PassConfig::kAllExceptInliner &
++          ~jit::PassConfig::kInsertUpdatePrevInstr));
++  jit::codegen::Environ env;
++  env.ctx = jit::getContext();
++  jit::CodeRuntime code_runtime{
++      function.code, function.builtins, function.globals};
++  env.code_rt = &code_runtime;
++  jit::lir::LIRGenerator generator{&function, &env};
++  auto lir = generator.TranslateFunction();
++  lir->sortBasicBlocks();
++  std::stringstream stream;
++  stream << *lir;
++  return stream.str();
++}
++
++} // namespace
++
++TEST_F(UdfTypedSequenceIntrinsicTest, HIRMetadataIsTypedAndReplayable) {
++  auto map = parseUnicodeMapFunction();
++  auto fsm = parseUnicodeFsmFunction();
++  ASSERT_NE(map, nullptr);
++  ASSERT_NE(fsm, nullptr);
++  for (const auto* function : {map.get(), fsm.get()}) {
++    const jit::hir::Instr* sequence = findSequenceInstruction(*function);
++    ASSERT_NE(sequence, nullptr);
++    EXPECT_EQ(jit::hir::outputType(*sequence), jit::hir::TUnicodeExact);
++    EXPECT_TRUE(sequence->isReplayable());
++    EXPECT_FALSE(jit::hir::isPassthrough(*sequence));
++    EXPECT_FALSE(jit::hir::hasArbitraryExecution(*sequence));
++    EXPECT_EQ(jit::hir::memoryEffects(*sequence).may_store, jit::hir::AEmpty);
++  }
++}
++
++TEST_F(UdfTypedSequenceIntrinsicTest, LIRCallsGenericRuntimeHelpers) {
++  auto map = parseUnicodeMapFunction();
++  auto fsm = parseUnicodeFsmFunction();
++  ASSERT_NE(map, nullptr);
++  ASSERT_NE(fsm, nullptr);
++  const std::string map_lir = lowerToLir(*map);
++  const std::string fsm_lir = lowerToLir(*fsm);
++  EXPECT_NE(
++      map_lir.find(fmt::format(
++          "{}", reinterpret_cast<uint64_t>(JITRT_UnicodeMapSequence))),
++      std::string::npos)
++      << map_lir;
++  EXPECT_NE(
++      fsm_lir.find(fmt::format(
++          "{}", reinterpret_cast<uint64_t>(JITRT_UnicodeFsmSequence))),
++      std::string::npos)
++      << fsm_lir;
++}
+diff --git a/cinderx/cinderjit.pyi b/cinderx/cinderjit.pyi
+index b6c6c83..f3295ad 100644
+--- a/cinderx/cinderjit.pyi
++++ b/cinderx/cinderjit.pyi
+@@ -19,6 +19,13 @@ def _deopt_gen(
+     ),
+ ) -> bool: ...
+ def _udf_unicode_count_property(text: str, property_id: int) -> int: ...
++def _udf_unicode_map_sequence(text: str, keys: str, values: str) -> str: ...
++def _udf_unicode_fsm_sequence(
++    text: str,
++    property_id: int,
++    initial_state: int,
++    descriptor: str,
++) -> str: ...
+ def append_jit_list(entry: str) -> None: ...
+ def auto() -> None: ...
+ def clear_runtime_stats() -> None: ...

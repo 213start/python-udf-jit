@@ -149,10 +149,10 @@ index 70d494d..7152095 100644
  
    std::string disassembleSection(
 diff --git a/cinderx/Jit/codegen/gen_asm.cpp b/cinderx/Jit/codegen/gen_asm.cpp
-index fa4caac..d85445e 100644
+index d7d3ea2..e765267 100644
 --- a/cinderx/Jit/codegen/gen_asm.cpp
 +++ b/cinderx/Jit/codegen/gen_asm.cpp
-@@ -1857,6 +1857,7 @@ void NativeGenerator::generateCode(
+@@ -1858,6 +1858,7 @@ void NativeGenerator::generateCode(
  #ifndef WIN32
    perf::registerFunction(code_sections, func->fullname, prefix);
  #endif
@@ -160,7 +160,7 @@ index fa4caac..d85445e 100644
  }
  
  #ifdef __ASM_DEBUG
-@@ -1869,6 +1870,68 @@ void NativeGenerator::generateAssemblyBody(const asmjit::CodeHolder& code) {
+@@ -1870,6 +1871,68 @@ void NativeGenerator::generateAssemblyBody(const asmjit::CodeHolder& code) {
    emitLIRBlocks(&env_, lir_func_.get(), &code, &metadata_);
  }
  
@@ -322,10 +322,10 @@ index 994ec39..a62853b 100644
    // multiple_code_sections is enabled. Defaults to false (regular pages).
    bool cold_code_huge_pages{false};
 diff --git a/cinderx/Jit/pyjit.cpp b/cinderx/Jit/pyjit.cpp
-index f7aed9f..9b49320 100644
+index b9e6b2e..a724590 100644
 --- a/cinderx/Jit/pyjit.cpp
 +++ b/cinderx/Jit/pyjit.cpp
-@@ -921,6 +921,13 @@ FlagProcessor initFlagProcessor() {
+@@ -922,6 +922,13 @@ FlagProcessor initFlagProcessor() {
            "Log the final compiled code, annotated with HIR instructions")
        .withDebugMessageOverride("Dump asm of JITed functions");
  
@@ -339,7 +339,7 @@ index f7aed9f..9b49320 100644
    flag_processor.addOption(
        "jit-enable-inline-cache-stats-collection",
        "PYTHONJITCOLLECTINLINECACHESTATS",
-@@ -2842,6 +2849,278 @@ PyObject* get_function_hir_opcode_counts(PyObject* /* self */, PyObject* arg) {
+@@ -2844,6 +2851,278 @@ PyObject* get_function_hir_opcode_counts(PyObject* /* self */, PyObject* arg) {
    return dict.release();
  }
  
@@ -618,7 +618,7 @@ index f7aed9f..9b49320 100644
  PyObject* mlock_profiler_dependencies(PyObject* /* self */, PyObject*) {
    if (jitCtx() == nullptr) {
      Py_RETURN_NONE;
-@@ -3727,6 +4006,11 @@ PyMethodDef jit_methods[] = {
+@@ -3824,6 +4103,11 @@ PyMethodDef jit_methods[] = {
       PyDoc_STR(
           "Return a map from HIR opcode name to the count of that opcode in the "
           "JIT-compiled version of this function.")},
@@ -686,10 +686,10 @@ index 0000000..52b88dc
 +
 +} // namespace jit
 diff --git a/cinderx/PythonLib/cinderx/jit.py b/cinderx/PythonLib/cinderx/jit.py
-index 6c919e3..3d0d185 100644
+index f7008ac..a659728 100644
 --- a/cinderx/PythonLib/cinderx/jit.py
 +++ b/cinderx/PythonLib/cinderx/jit.py
-@@ -43,6 +43,7 @@ try:
+@@ -46,6 +46,7 @@ try:
          get_compiled_stack_size,
          get_function_compilation_time,
          get_function_hir_opcode_counts,
@@ -697,7 +697,7 @@ index 6c919e3..3d0d185 100644
          get_inlined_functions_stats,
          get_jit_list,
          get_num_inlined_functions,
-@@ -159,6 +160,12 @@ except ImportError:
+@@ -166,6 +167,12 @@ except ImportError:
      def get_function_hir_opcode_counts(func: FuncAny) -> dict[str, int] | None:
          return {}
  
