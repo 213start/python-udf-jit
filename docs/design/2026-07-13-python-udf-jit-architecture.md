@@ -5,11 +5,11 @@
 | 项目 | 内容 |
 |---|---|
 | 产品/方案 | Python Data UDF JIT Compiler & Runtime |
-| 文档版本 | 0.8 |
+| 文档版本 | 0.9 |
 | 方案阶段 | 架构草案 |
 | 密级 | 内部技术设计 |
 | 本期目标 | Daft 0.7.2 + Ray 2.55.0（Flotilla）集群；Lance 7.0.0 数据源基线 |
-| 本期交付路径 | Ray Job Driver + Daft Swordfish Ray Actor；打通 Scalar Python Execution Provider，保留 Host Columnar/Vector Provider 扩展边界 |
+| 本期交付路径 | Ray Job Driver + Daft Swordfish Ray Actor；打通 CinderX Provider 与 CPython fallback，保留 Vectorized、PyTorch、Native Kernel Provider 扩展边界 |
 
 ## 0.2 拟制信息
 
@@ -31,16 +31,19 @@
 | 0.6 | 2026-07-13 | 总体架构抽象为跨框架分层结构；逻辑接口集中到上下文模型；构建清单恢复产物视角；Daft/Ray 交付收敛为单 Wheel 与独立 CLI 二进制 | Codex |
 | 0.7 | 2026-07-17 | 将 Region Formation 下移为 Capture 后的 Core IR Pass；明确 Daft 0.7.2 无源码修改的 `.pth`/运行时 Hook 接入；以标量 Python 与主机列式/向量 Execution Provider 重构后端及 Fallback 边界 | Codex |
 | 0.8 | 2026-07-17 | 迁入独立 Python UDF JIT 项目；建立 RFC-001～012 特性设计索引；统一主线 `1.15x`、高阶增量 `0.15`、最终原始基线 `1.30x` 的加法验收口径 | Codex |
+| 0.9 | 2026-08-06 | 以多后端信息归属专项架构修正 Provider SPI、Guard 责任和 CinderX 对接路径：CinderX callable-first，Semantic Region 可选，穿刺期专用入口不作为上游公共 API | Codex |
 
 ## 0.4 Keywords 关键词
 
-Python UDF、Daft、PySpark、PyFlink、Framework Adapter、Ray、JIT、CinderX、Graph Capture、Core UDF IR、Schema、Data Layout、Arrow、Guard、Graph Break、Portable Artifact、Worker Specialization
+Python UDF、Daft、PySpark、PyFlink、Framework Adapter、Ray、JIT、CinderX、Vectorization、PyTorch、Native Kernel、Graph Capture、Core UDF IR、Schema、Data Layout、Guard、Graph Break、Portable Artifact、Worker Specialization
 
 ## 0.5 Abstract 摘要
 
 本文设计一套面向数据工程框架的 Python UDF JIT 编译与运行系统。系统通过 Framework Adapter 在框架公开 API 和版本专用兼容 Hook 可见的边界采集 UDF 候选、Schema 与使用上下文，形成 `CaptureRequest`；Capture Frontend 生成 IR，Core IR Pass 再识别可联合优化的 UDF Region。控制端生成 Portable UDF Artifact，Worker 侧结合真实数据布局、CPU 能力和运行库版本完成目标特化。
 
-总体采用“框架前端与编译/运行核心分离、控制端/Worker 两阶段编译、多层 IR、能力与成本驱动的多执行域、始终可续接原语义”架构。Framework Adapter SPI 为 Daft、PySpark、PyFlink 及后续框架提供稳定接入边界；本期只交付 Daft + Ray Adapter，并把 Worker Runtime 直接加载到既有 Swordfish Actor 进程。CinderX JIT 与 CPython 解释执行共同属于标量 Python Execution Provider：Guard Miss、Graph Break 或 Deopt 在同一 CPython 运行时内续接解释执行，而不是切换到另一个后端，因此不要求用户改写现有 UDF。
+总体采用“框架前端与编译/运行核心分离、控制端/Worker 两阶段编译、多层 IR、能力与成本驱动的多执行域、始终可续接原语义”架构。Framework Adapter SPI 为 Daft、PySpark、PyFlink 及后续框架提供稳定接入边界；本期只交付 Daft + Ray Adapter，并把 Worker Runtime 直接加载到既有 Swordfish Actor 进程。目标 Provider SPI 同时支持 CinderX、Vectorized、PyTorch 和 Native Kernel；CinderX Provider 内的 Guard Miss、Graph Break 或 Deopt 在同一 CPython 运行时续接解释执行，因此不要求用户改写现有 UDF。
+
+信息来源、Guard 正确性责任、Provider-neutral SPI 和 CinderX 上游边界以[多后端信息归属与接入架构](2026-08-06-multi-provider-information-ownership-architecture.md)为准：UDF JIT 只把后端无法自行恢复的框架合同、跨算子语义和外部条件作为稳定输入；类型、行为分类、调用目标以及后端代码 Guard 由具备原生前端的 Provider 自行分析和闭环。
 
 ## 0.6 List of abbreviations 缩略语清单
 
@@ -91,7 +94,7 @@ Daft、Spark、Flink 等框架能够优化 LogicalPlan、表达式、分区和�
 - 标量 UDF、Pandas/向量 UDF 以及可从标量 UDF 自动提升的批处理区域。
 - 单 UDF 与连续 UDF/算子区域的捕获和优化。
 - Ray Head、Ray Job Driver、Flotilla Scheduler、Ray Worker Node、Swordfish Actor 和 Ray Object Store 的部署关系。
-- 标量 Python Execution Provider（CinderX JIT + CPython 解释续接）与主机列式/向量 Execution Provider（Arrow/Native、NumPy/Pandas）。
+- CinderX Execution Provider（CinderX JIT + CPython fallback）、Vectorized、PyTorch 与 Native Kernel Provider。
 - Schema、Null、数据布局、Buffer 所有权、物化和 IPC 边界。
 - 多版本特化、缓存、失效、回退、可观测性、安全和可靠性。
 
@@ -177,8 +180,10 @@ flowchart TB
             BINDER["Target Plan Binder"]
             VARIANT["Variant and Guard Manager"]
             EXECUTOR["Region Executor and Memory Manager"]
-            SCALAR["Scalar Python Execution Provider<br/>CinderX JIT ⇄ CPython Interpreter"]
-            COLUMNAR["Host Columnar/Vector Execution Provider<br/>Arrow/Native · NumPy/Pandas"]
+            SCALAR["CinderX Execution Provider<br/>CinderX JIT ⇄ CPython Interpreter"]
+            COLUMNAR["Vectorized Execution Provider<br/>Arrow · SIMD · NumPy/Pandas"]
+            TORCH["PyTorch Execution Provider<br/>Tensor Graph · CPU/GPU"]
+            NATIVE["Native Kernel Execution Provider<br/>LLVM/Native · Registered Kernel"]
             ATELEMETRY["Runtime Telemetry Client"]
             WORKER --> LOADER
             LOADER --> PHYSICALIZER
@@ -187,6 +192,8 @@ flowchart TB
             VARIANT --> EXECUTOR
             EXECUTOR --> SCALAR
             EXECUTOR --> COLUMNAR
+            EXECUTOR --> TORCH
+            EXECUTOR --> NATIVE
             EXECUTOR -.-> ATELEMETRY
     end
 
@@ -222,7 +229,7 @@ Framework/UDF 事件 → `CaptureRequest` → Capture IR → Core UDF IR → Reg
 
 Framework Batch → Layout Binding → Guard Dispatch → 标量 Python/主机列式 Region → Framework Output。
 
-执行链不依赖中心编译服务；Worker 进程可命中本地 Variant Cache。未命中、不支持或 Deopt 时，由标量 Python Execution Provider 在同一 CPython 进程内调用原始 UDF 或从 CinderX JIT 续接解释执行。
+执行链不依赖中心编译服务；Worker 进程可命中本地 Variant Cache。未命中、不支持或 Deopt 时，由 CinderX Provider 在同一 CPython 进程内调用原始 UDF 或从 CinderX JIT 续接解释执行。
 
 ### 2.3.3 反馈治理链
 
@@ -238,9 +245,10 @@ Compile/Execute Metrics → Worker/Job 聚合 → Cost/Policy Update → 下一�
 | Framework Adapter | 在框架可见边界采集 UDF 候选、Schema/用途，接入 Worker Batch 和任务产物承载 | 假设可以读取框架未暴露的完整优化计划，或在通用核心中保留框架私有对象 |
 | UDF JIT Portable Compiler Component | Python 捕获、Core UDF IR、语义分析、候选 Region 分区、Portable Artifact | 重建框架 Planner 或 Scheduler |
 | UDF JIT Worker Runtime Component | 布局绑定、Guard、多版本、Region 调度、Buffer/GIL/对象生命周期 | 改变框架的分区、重试和异常语义 |
-| 标量 Python Execution Provider | 在 CPython 内统一承载 CinderX JIT、解释续接、普通 Python/C Extension 调用和原始 UDF | 列式布局规划和批量 Kernel 调度 |
-| 主机列式/向量 Execution Provider | Arrow/Native Kernel、SIMD、NumPy/Pandas 批量调用 | 承诺任意 Python 副作用、对象身份或异常顺序都可向量化 |
-| 未来 Accelerator Execution Provider | GPU/异构设备内存、传输、Stream 与目标编译 | 首期交付；也不接管 Ray/框架的分布式调度 |
+| CinderX Execution Provider | 在 CPython 内统一承载 CinderX JIT、解释续接、普通 Python/C Extension 调用和原始 UDF | 列式/Tensor/Native 布局规划和批量 Kernel 调度 |
+| Vectorized Execution Provider | Arrow/SIMD、NumPy/Pandas 批量调用 | 承诺任意 Python 副作用、对象身份或异常顺序都可向量化 |
+| PyTorch Execution Provider | Tensor Graph、Shape/DType Guard 与 CPU/GPU Runtime | 承诺任意 Python 对象可以无损 Tensor 化 |
+| Native Kernel Execution Provider | Verified Region、Buffer Contract、LLVM/native codegen 或注册内核 | 猜测 Bounds、Alias、Ownership 或目标 ABI |
 
 ## 2.5 关键架构决策
 
@@ -253,9 +261,9 @@ Compile/Execute Metrics → Worker/Job 聚合 → Cost/Policy Update → 下一�
 | Runtime 加载到既有 Swordfish Actor | 保留 Daft 数据路径、Ray Actor 故障语义和 Arrow Buffer 所有权 |
 | Artifact 复用 Daft UDF Wrapper/Expression 序列化与 Ray Object Reference | Daft 0.7.2 无 Task Metadata 扩展 SPI；Artifact Handle 随生成的 UDF Wrapper/Expression 进入既有计划与闭包序列化链，本期不增加独立 Registry 或 Compile Service |
 | 使用多层 IR 和原子 Pass | 每层只保留自身优化所需信息，明确语义优化与布局特化边界 |
-| CinderX JIT 与 CPython 解释执行归入同一标量 Python Execution Provider | 二者共享 CPython 对象、Frame、异常和 Deopt 语义；Fallback 是域内执行路径，不是独立后端 |
-| 当前只实现标量 Python 与主机列式/向量两个执行域 | 外部库按调用形态落入其中之一；异步、有状态和副作用是约束而非后端；GPU/异构设备因拥有独立内存与调度模型，后续可扩展为第三类 Provider |
-| 首期以专用 Bytecode/Intrinsic 接入 CinderX | 复用现有 Bytecode→HIR→LIR 管线并控制改动范围 |
+| CinderX JIT 与 CPython 解释执行归入同一 CinderX Execution Provider | 二者共享 CPython 对象、Frame、异常和 Deopt 语义；Fallback 是 Provider 内执行路径，不是独立后端 |
+| Provider 按可独立探测、编译、执行和失效的能力边界划分 | 目标支持 CinderX、Vectorized、PyTorch、Native Kernel；CPython 解释执行是 CinderX Provider 的 fallback，不是第五个 Provider |
+| CinderX callable-first，外部 Semantic Region 为可选输入 | 普通 Python 函数复用 CinderX 原生 Bytecode→HIR→LIR、Guard 和 Deopt；只有跨算子或已脱离 bytecode 的 Region 才经过版本绑定的 Provider Plugin bridge |
 
 # 3 架构和关键质量属性目标
 
@@ -265,7 +273,7 @@ Compile/Execute Metrics → Worker/Job 聚合 → Cost/Policy Update → 下一�
 2. **框架原生集成**：通过 Adapter 复用框架既有 Plan、任务调度、Worker 生命周期和数据通道；本期映射到 Daft/Flotilla/Swordfish/Ray Object Store。
 3. **语义安全**：不能证明等价时不优化；任意编译、Guard 或 Provider 失败均可续接原始 Python。
 4. **改变执行模型**：不仅优化单个 Python 函数，还支持跨 UDF Region、列式执行和 Python 对象物化消除。
-5. **可演进**：从 Worker 内 Scalar Python Provider 演进到 Host Columnar/Vector、多 Provider 和 Planner 协同，无需推翻前期产物协议。
+5. **可演进**：从 Worker 内 CinderX Provider 演进到 Vectorized、PyTorch、Native Kernel 与 Planner 混合协同，无需推翻前期产物协议。
 6. **可运维**：可解释 Graph Break、分区、Guard Miss、Deopt、Fallback、复制成本和实际收益。
 7. **可量化**：主线相对原始 Daft UDF 基线达到 `1.15x`；高阶能力在同一原始基线上再增加 `0.15`，最终达到 `1.30x`，不采用阶段倍率相乘。
 
@@ -278,8 +286,8 @@ Compile/Execute Metrics → Worker/Job 聚合 → Cost/Policy Update → 下一�
 | 默认不修改用户 UDF | `.pth` 自动引导 + 延迟 Post-import Hook + Ray Runtime Environment；注解仅作可选 Hint |
 | 支持动态 Python | Guard、Graph Break、Python Region、Fallback Continuation |
 | 保留 Data Layout 信息 | Core IR 保留逻辑 Schema；Actor Descriptor 绑定 Arrow Buffer、Offset 和 Validity |
-| 控制 CinderX 改动范围 | 首期专用 Bytecode/Intrinsic + Descriptor Table；后续可选直接 HIR Builder |
-| 支持多执行域 | Execution Provider Capability Contract + Region Partitioner + Region Executor；首期为 Scalar Python 与 Host Columnar/Vector |
+| 控制 CinderX 改动范围 | 通用缺陷修复和原生 callable 优化进入 CinderX 候选；UDF/框架专用 external-region 与 Descriptor bridge 隔离在 CinderX Provider Plugin |
+| 支持多执行域 | Provider-neutral Capability/Compile/Execute/Invalidate/Diagnostics SPI + Region Partitioner + Runtime Dispatcher；目标为 CinderX、Vectorized、PyTorch、Native Kernel |
 | 避免数据转换抵消收益 | 显式 Value/Layout Contract + 转换成本模型 |
 | 编译不阻塞分区执行 | 热度阈值、后台编译、Singleflight、编译预算和负缓存 |
 | 适应异构 Worker | 多版本 Guard Cache + ABI、依赖和 CPU 指纹 |
@@ -310,7 +318,7 @@ Compile/Execute Metrics → Worker/Job 聚合 → Cost/Policy Update → 下一�
 1. **语义先于物理实现**：Core UDF IR 只表达逻辑数据计算；具体布局在 Worker Physicalization 阶段绑定。
 2. **先通用、后分区、再 Provider 优化**：Provider-independent Pass 在分区前执行；布局和 Provider-specific Pass 在分区后执行。
 3. **原子 Pass，而非巨型优化器**：Graph Optimizer 和 DLS 分解为可组合 Pass/Analysis Pipeline。
-4. **Fallback 是标量域内一等执行路径**：Python Region 在 Region Plan 中显式存在并有完整 Source Map，但由 Scalar Python Execution Provider 的解释模式承载，不注册独立 CPython Backend。
+4. **Fallback 是 CinderX Provider 内一等执行路径**：Python Region 在 Region Plan 中显式存在并有完整 Source Map，但由 CinderX Provider 的 CPython fallback 承载，不注册独立 CPython Provider。
 5. **不在控制端执行任意 UDF**：Portable Compiler 优先使用 Bytecode 分析和符号执行；需要真实执行的动态捕获在 Worker 内受控发生。
 6. **不新增业务数据通道**：Artifact 复用框架任务元数据，Partition/Batch 继续走框架既有数据路径；本期对应 Daft/Ray 通道。
 7. **能力与成本共同决定执行域**：Execution Provider 支持某个 Region 不等于应该选择该 Provider。
@@ -357,7 +365,7 @@ flowchart TB
             BINDER["Target Plan Binder"]
             VARIANT["Variant and Guard Manager"]
             EXECUTOR["Region Executor and Memory Manager"]
-            PROVIDERS["Scalar Python · Host Columnar/Vector<br/>Execution Providers"]
+            PROVIDERS["CinderX · Vectorized · PyTorch · Native Kernel<br/>Execution Providers"]
             RTELEMETRY["Runtime Telemetry Client"]
             WADAPTER -->|"IF-ARTIFACT-LOAD-API"| LOADER
             LOADER -->|"IF-PHYSICALIZE-API"| PHYSICALIZER
@@ -429,10 +437,10 @@ flowchart TB
 | `IF-TARGET-BIND-API` | Target Plan Binder | Schema and Layout Physicalizer | Physical Region + Worker Capability → Bound Region Plan |
 | `IF-BOUND-PLAN-REGISTER-API` | Variant and Guard Manager | Target Plan Binder | 注册 Bound Region Plan、Guard Template 与 Compatibility Key |
 | `IF-REGION-EXECUTE-API` | Region Executor and Memory Manager | Framework Worker Adapter | Region Handle + BatchView + Output Contract → Framework Result / Exception |
-| `IF-VARIANT-RESOLVE-API` | Variant and Guard Manager | Region Executor and Memory Manager | Runtime Context → Variant Hit、Compile Ticket 或 Scalar Interpreter Continuation |
-| `IF-EP-CAPABILITY-API` | Scalar Python/Host Columnar Execution Provider | Target Plan Binder | 算子、类型、Null、Effect、布局、Guard、转换和成本能力 |
-| `IF-EP-COMPILE-API` | Scalar Python/Host Columnar Execution Provider | Variant and Guard Manager | Physical Region + Compile Context → Executable Region；解释 Region 可返回无需编译的 Continuation Handle |
-| `IF-EP-EXECUTE-API` | Scalar Python/Host Columnar Execution Provider | Region Executor and Memory Manager | Executable/Interpreter Region + Value Contract → Region Result / Side Exit；CinderX Deopt 在 Scalar Python Provider 内处理 |
+| `IF-VARIANT-RESOLVE-API` | Variant and Guard Manager | Region Executor and Memory Manager | Runtime Context → Variant Hit、Compile Ticket 或 CinderX/CPython Fallback Continuation |
+| `IF-EP-CAPABILITY-API` | CinderX/Vectorized/PyTorch/Native Kernel Provider | Target Plan Binder | 输入模式、操作、类型、Null、Effect、布局、Assumption、转换和成本能力 |
+| `IF-EP-COMPILE-API` | CinderX/Vectorized/PyTorch/Native Kernel Provider | Variant and Guard Manager | CompileRequest → CompiledVariant/Reject + GuardCoverage；CinderX 解释 Region 可返回 Continuation Handle |
+| `IF-EP-EXECUTE-API` | CinderX/Vectorized/PyTorch/Native Kernel Provider | Region Executor and Memory Manager | Variant + Value Contract → Region Result / Side Exit；Provider 内部 Guard/Deopt 由自身处理 |
 | `IF-TELEMETRY-EVENT-API` | Compile/Runtime Telemetry Client | IR/Publisher/Variant/Executor | 非阻塞 Compile/Runtime Event |
 | `IF-POLICY-BUILD-API` | Policy Builder | Profile Aggregator | Profile Summary + 管理员约束 → Policy Snapshot |
 
@@ -484,13 +492,13 @@ Daft 与 Ray 仍负责计划、Wrapper/闭包序列化、调度和数据传输�
 2. `Func.__call__` 只登记 UDF 候选；DataFrame 操作 Hook 取得 `self.schema()` 和 Filter/Projection 用途，形成 `CaptureRequest`。
 3. Capture Frontend 生成 IR，Region Formation Pass 在 Core IR 上识别可联合优化的区域，Compiler 发布 Portable Artifact。
 4. Adapter 生成携带 Artifact Handle 的标量或 Batch UDF Wrapper/Expression；Daft/Ray 按既有计划与闭包序列化链把它调度到 Worker，较大 Artifact 可由 Ray ObjectRef 间接承载。
-5. Actor 命中 Guard 后执行优化版本；否则由 Scalar Python Execution Provider 调用原始 UDF/解释续接。
+5. Actor 命中 Guard 后执行优化版本；否则由 CinderX Provider 调用原始 UDF/解释续接。
 
 ### 5.3.2 需求编号：UC-02 混合执行域
 
 #### 5.3.2.1 关键系统用例
 
-同一 UDF Region 包含可列式执行表达式、批量科学计算调用、标量 Python 逻辑和无法编译的 Python 片段。系统在 Scalar Python 与 Host Columnar/Vector 两个 Execution Provider 之间按能力和成本分区，并显式处理区域间数据转换。
+同一 UDF Region 包含可列式表达式、Tensor 计算、Native 聚合、标量 Python 逻辑和无法编译的 Python 片段。系统在 CinderX、Vectorized、PyTorch 和 Native Kernel Provider 之间按能力和成本分区，并显式处理对象/Arrow/Tensor/Buffer 转换。
 
 #### 5.3.2.2 交互场景
 
@@ -574,19 +582,20 @@ Execution Provider 统一返回：
 
 ```text
 CapabilityResult {
-  supported
-  supported_ops
-  type_constraints
-  null_semantics
-  effect_constraints
+  provider_id
+  accepted_input_modes
+  supported_region
+  type_null_effect_constraints
   required_input_layouts
   produced_output_layout
-  required_guards
-  estimated_compute_cost
-  estimated_compile_cost
-  estimated_conversion_cost
+  required_assumptions
+  side_exit_capabilities
+  cost_envelope
+  reject_reason
 }
 ```
+
+Capability 只声明待满足条件，不把 `required_assumptions` 当作已实现 Guard。Provider 编译结果必须返回 `GuardCoverage`；公共 Schema/Layout/Epoch Guard 由 Runtime Dispatcher 持有，Provider 代码依赖的类型、调用目标、Shape 或 Buffer 条件由对应 Provider 自己以 Guard/Watcher/Deopt 闭环。
 
 分区分为两次决策：
 
@@ -628,71 +637,71 @@ LayoutDescriptor[42] = {
 }
 ```
 
-因此专用 Bytecode 只需要携带稳定 `access_id`：
+因此 provider-neutral Physical Region 只携带稳定 `access_id` 和逻辑访问合同：
 
 ```text
-GUARD_LAYOUT_DESC 3       ; 校验 Descriptor Set 的 ABI/Epoch
-IS_DATA_NULL     17       ; 17 -> field_id=42 的有效位图
-LOAD_DATA_F64    17       ; 17 -> 已验证的 Float64 values/offset/stride
-STORE_DATA_F64    4       ; 4  -> 输出列 Descriptor
+access[17] = {
+  field_id: 42,
+  logical_type: Nullable<Float64>,
+  mode: read,
+  accepted_representation: scalar-or-column
+}
 ```
 
-`access_id` 不是裸字段编号。Portable Artifact 同时携带不可变的逻辑签名，例如 `17 -> {field_id:42, logical_type:Nullable<Float64>, access:read, accepted_representation:column-or-scalar}`；Worker Physicalizer 再生成 `17 -> {ArrowColumn, values_buffer, validity_buffer, offset, stride, ownership}` 的 Descriptor。Verifier 校验两者的类型、Null、读写权限和表示约束，Guard 保护 Descriptor ABI/Epoch，CinderX Frontend 在校验后把 `LOAD_DATA_F64 17` Lower 到具体 HIR Load。信息由“专用 Opcode + 逻辑 Access Spec + Worker Descriptor”三者共同传递，而不是试图把 Buffer 地址硬编码进 Bytecode。
+`access_id` 不是裸字段编号。Worker Physicalizer 再生成 `17 -> {ArrowColumn, values_buffer, validity_buffer, offset, stride, ownership}` 的 Descriptor。Verifier 校验两者的类型、Null、读写权限和表示约束，Runtime Dispatcher Guard 保护 Descriptor ABI/Epoch。Vectorized、PyTorch 和 Native Kernel Provider 分别把同一合同绑定到自己的列、Tensor 或 Buffer 表示；CinderX callable 路径继续接收普通 Python 参数。若 external scalar Region 需要直接数据访问，只能由 CinderX Provider Plugin 通过版本绑定的私有 Descriptor bridge 实现，不能把专用 Bytecode/Intrinsic 写入 Portable Artifact 或 Provider SPI。
 
-该设计把信息损失控制在显式 Lowering 边界：上层保留字段语义和合法布局约束，下层补充真实布局；任何不能由 Descriptor 证明的属性都会导致 Capability 拒绝或进入标量解释路径，而不是猜测默认布局。
+该设计把信息损失控制在显式 Lowering 边界：上层保留字段语义和合法布局约束，下层补充真实布局；任何不能由 Descriptor 和 Provider GuardCoverage 证明的属性都会导致 Capability 拒绝或进入原始语义路径，而不是猜测默认布局。
 
 ## 6.5 执行域划分与 CinderX 对接方案
 
-Execution Provider 按执行模型、数据表示和资源域划分，而不是按库名称划分：
+Execution Provider 按可独立探测、编译、执行、失效和诊断的能力边界划分，而不是按业务算子名称划分：
 
 | Execution Provider | 当前状态 | 执行模型 | 内部实现/执行方式 |
 |---|---|---|---|
-| Scalar Python | 本期 | 单值/逐行，保留 Python 对象、Frame、异常、副作用和 GIL 语义 | CinderX JIT Variant；CPython Interpreter Continuation；普通 Python/C Extension 调用 |
-| Host Columnar/Vector | 本期 | Micro-batch/Column-at-a-time，使用主机内存上的 Arrow/数组布局 | Arrow Compute、Native Fused Loop/SIMD、NumPy/Pandas Batch Adapter |
-| Accelerator | 未来可选 | 设备批处理，具有独立设备内存、传输、Stream 和目标代码 | GPU/其他异构 Kernel、Device Runtime |
+| CinderX | 已有穿刺 | Python callable/标量对象，保留 Frame、异常、副作用和 GIL 语义 | CinderX Bytecode/HIR/LIR/JIT；CPython Interpreter Continuation 为 Provider 内 fallback |
+| Vectorized | 后续 | Micro-batch/Column-at-a-time，使用 Arrow/数组布局 | Arrow Compute、SIMD、批量库适配 |
+| PyTorch | 后续 | Tensor Graph 与 CPU/GPU Device 执行 | Export/Compile、Shape/DType Guard、Device Runtime |
+| Native Kernel | 后续 | 已验证 Region 到原生 Buffer/目标代码 | Native Loop、LLVM/MLIR、预注册 Kernel |
 
 因此：
 
-- CinderX 与 CPython 不是两个后端，而是 Scalar Python Provider 内的 JIT 与解释两级执行方式；CinderX Guard/Deopt 失败后可在同一 CPython 运行时续接解释执行。
-- 已知且可批量调用的 NumPy/Pandas/科学计算库落入 Host Columnar/Vector Provider；普通标量或不透明 Python/C Extension 调用留在 Scalar Python Provider，不因“外部调用”单列第三个后端。
-- 异步、生成器、有状态逻辑、副作用和对象身份是 Capability/Effect 约束，通常迫使 Region 留在 Scalar Python Provider；它们不是执行后端。
-- 稀疏 Side Exit、Graph Break 和混合 Region DAG 是两个 Provider 之间的控制转移机制，不形成新的 Provider；等价语义回写发生在控制端并把 UDF 替换为框架 Native Expression，也不是 Worker 执行后端。
-- Ray 远程调度、Object Store 和存储 I/O 属于框架数据面，不是 UDF Execution Provider。只有 GPU 等拥有独立内存与调度模型的目标，才值得形成新的 Provider。
+- CinderX 与 CPython 解释执行不是两个 Provider；后者是 CinderX Provider 的原始语义 fallback。
+- Arrow、NumPy/Pandas、PyTorch 和 Native codegen 可以共享输入语义，但各自拥有数据表示、Guard、代码/图缓存和 Side Exit，因此不通过 CinderX 专属接口接入。
+- 异步、生成器、有状态逻辑、副作用和对象身份是 Capability/Effect 约束，不形成 Provider。
+- 稀疏 Side Exit、Graph Break、转换节点和混合 Region DAG 是 Provider 之间的控制/数据边，不形成新的 Provider。
+- Ray 调度、Object Store 和存储 I/O 属于框架数据面，不是 Execution Provider。
 
-### 6.5.1 首期低侵入路径
+### 6.5.1 CinderX callable-first 路径
 
 ```mermaid
 flowchart LR
-    PHYSICAL["Physical UDF Region"]
-    BYTECODE["专用 Bytecode / Intrinsic<br/>+ Descriptor Table"]
-    FRONTEND["CinderX Bytecode Frontend"]
-    HIR["Data-aware HIR Nodes"]
-    PIPELINE["现有 HIR Pass · SSA · LIR<br/>Codegen · Deopt"]
+    CALLABLE["Worker-local Python callable"]
+    FRONTEND["CinderX Native Bytecode Frontend"]
+    ANALYSIS["AutoJIT · Type · Target · Effect Analysis"]
+    HIR["Generic CinderX HIR Passes"]
+    PIPELINE["Guard · Deopt · LIR · Codegen"]
+    FALLBACK["CPython Interpreter Continuation"]
 
-    PHYSICAL -->|"Lowering"| BYTECODE
-    BYTECODE -->|"Bytecode Builder 映射"| FRONTEND
-    FRONTEND -->|"构建"| HIR
-    HIR -->|"复用"| PIPELINE
+    CALLABLE --> FRONTEND --> ANALYSIS --> HIR --> PIPELINE
+    ANALYSIS -->|"reject/defer"| FALLBACK
+    PIPELINE -->|"guard miss/deopt"| FALLBACK
 ```
 
-主要新增：
+这条路径是普通 Python UDF 的首选。Bytecode、CFG、行为分类、exact type、closure/global、调用目标和代码 Guard 均由 CinderX 自行分析；UDF JIT 提供的同类内容至多作为可丢弃 Hint。generator lowering、失败负缓存、closure target inline、Unicode/lookup/builder 等能力若要进入 CinderX Core，必须能由该原生路径在零 UDF JIT 环境触发。
 
-- 少量专用 Opcode/Intrinsic；
-- Descriptor Table ABI；
-- Bytecode Builder 到 Data-aware HIR Node 的映射；
-- HIR 类型、Load/Null/Result 节点及必要的 Lowering；
-- Guard/Deopt 元数据和 Source Map 对接。
+### 6.5.2 可选 external Semantic Region 路径
 
-### 6.5.2 长期直接 HIR 路径
+对跨 UDF/算子、已由框架融合或没有等价 Python bytecode 的 Region，CinderX Provider 可以选择接收 verified provider-neutral Semantic Region。该路径通过统一 `CompileRequest` 进入 Provider Plugin，由 Plugin 负责版本绑定、二次验证、HIR 构造、GuardCoverage 和 fallback；CinderX HIR/LIR 仍不进入 Portable Artifact。
 
-对已经完全物理化、无通用 Python Bytecode 需求的标量 Region，可提供受控的 `Physical UDF IR → CinderX HIR Builder` 接口。该接口只存在于 Scalar Python Execution Provider 的 CinderX JIT 实现内部，不成为 Portable Artifact 格式。
+当前 `compile_typed_region(function, semantic, plan)`、`__udf_jit_typed_region__`、`__udfjit_value_cache__` 和 `JITRT_Udf*` 仅视为穿刺期私有接口。除非出现多个非 UDF producer 并证明通用 external-region API 的必要性，否则不把这些接口原样上游到 CinderX。完整信息归属、Provider SPI 和上游门禁见[多后端信息归属与接入架构](2026-08-06-multi-provider-information-ownership-architecture.md)。
 
 ## 6.6 Guard、Graph Break、Fallback 与 Deopt 方案
 
 - **Graph Break**：Capture 时把不支持操作切成显式 Python Region，而不是使整个 UDF 失败。
-- **Guard Template（控制端）**：Capture/IR Pass 记录代码 Hash、逻辑 Schema、闭包/全局版本、Effect 与依赖假设，但不引用 Worker 地址或真实 Buffer。
-- **Concrete Guard（Worker）**：Physicalizer/Variant Manager 把模板补全为 Layout、Descriptor Epoch、Adapter/CPython/CinderX ABI、CPU Feature 和依赖库版本检查；CinderX 自身的类型 Guard/Deopt 仍封装在 Scalar Python Provider 内。
-- **Interpreter Continuation/Fallback**：Python Region 是 Region DAG 的合法节点，由 Scalar Python Execution Provider 复用框架 Adapter 保留的原始 UDF 调用路径；不经过另一个 CPython Backend。
+- **External Assumption（控制端）**：Capture/IR Pass 只记录 Provider 无法自行恢复、且有明确来源和失效方式的外部条件；Assumption 不是可执行 Guard。
+- **Framework Guard（Worker）**：Physicalizer/Runtime Dispatcher 负责 Schema、Null、字段绑定、Layout、Descriptor Epoch 和任务 Epoch 等公共合同。
+- **Provider Guard/Deopt**：CinderX exact type/closure/global、PyTorch Shape/DType、Native Bounds/Alias 等条件由对应 Provider 自行闭环，并在 Variant 中返回 GuardCoverage。
+- **Interpreter Continuation/Fallback**：Python Region 是 Region DAG 的合法节点；CinderX Provider 复用框架 Adapter 保留的原始 UDF 调用路径，不注册独立 CPython Provider。
 - **Deopt**：单函数标量 Region 优先复用 CinderX Frame/Deopt；跨 UDF 或批量 Region 使用 Region/Row/Batch Side Exit 和必要的重放机制。
 - **异常语义**：只有 Effect 和 `may_raise` 顺序可证明等价时才能跨边界融合、重排或通过 Framework Planner Bridge 回填原框架。
 
@@ -793,7 +802,7 @@ sequenceDiagram
         P-->>V: Specialized Artifact / Interpreter Handle
         V-->>E: 原子发布新 Variant
     else 超预算或不支持
-        V-->>E: Scalar Interpreter Plan
+        V-->>E: CinderX/CPython Fallback Plan
     end
     E->>P: 执行各 Region
     P-->>E: Region Results / Side Exit
@@ -803,7 +812,7 @@ sequenceDiagram
 
 ### 7.2.3 用例设计3：Guard Miss 与异步再编译
 
-当前批次走已有泛化版本或 Scalar Python Provider 的解释路径；Actor 内的后台编译线程池按新 Guard Key 生成 Variant。发布采用原子替换，UDF 执行线程不等待远端服务。超过版本、时间或内存预算时进入负缓存和熔断状态。
+当前批次走已有泛化版本或 CinderX Provider 的 CPython fallback；Actor 内的后台编译线程池按新 Guard Key 生成 Variant。发布采用原子替换，UDF 执行线程不等待远端服务。超过版本、时间或内存预算时进入负缓存和熔断状态。
 
 ## 7.3 数据模型
 
@@ -882,19 +891,19 @@ RuntimeVariant {
 | 数据 | 所有者 | 使用方式 |
 |---|---|---|
 | Framework Input/Output Batch | 框架 Worker；本期为 Swordfish Actor | Worker Runtime 通过 BatchView 借用，必须持有框架提供的 Keepalive |
-| UDF Function/Fallback Payload | Framework Adapter；本期为 Daft/Ray Adapter Extension | Portable Compiler 读取；Scalar Python Provider 的解释路径调用 |
+| UDF Function/Fallback Payload | Framework Adapter；本期为 Daft/Ray Adapter Extension | Portable Compiler 读取；CinderX Provider 的 CPython fallback 路径调用 |
 | Core IR/Portable Artifact | 框架控制端；本期为 Ray Job Driver | 不可变、内容寻址；Handle 通过生成的 Daft UDF Wrapper/Expression 分发，大 Blob 可使用 Ray ObjectRef |
 | Layout Descriptor | Worker Runtime | Worker-local，不跨不兼容 ABI |
 | Native Temporary Buffer | Memory Manager | Region 生命周期内拥有，可池化 |
 | Python Object | CPython/CinderX | 遵守引用计数、GC 和 GIL 约束 |
-| JIT Code Memory | Scalar Python/Host Columnar Provider Runtime | W^X、按 Variant 生命周期释放 |
+| JIT/Kernel/Graph Artifact | 对应 CinderX/Vectorized/PyTorch/Native Kernel Provider | Provider-local，按 Variant 生命周期和目标 ABI 释放 |
 
 ## 7.4 逻辑元素清单
 
 | 组件 | 运行主体 | 内部模块 | 核心职责 |
 |---|---|---|---|
 | UDF JIT Portable Compiler Component | 框架控制端进程；本期为 Ray Job Driver | Framework Control Adapter、Capture Frontend、IR and Pass Manager、Framework Planner Bridge、Candidate Partitioner、Portable Artifact Publisher、Compile Telemetry Client | 从框架可见事件形成 CaptureRequest，在 Capture 后识别 Region，并生成可验证、可分发且不绑定 Worker 目标的 Portable Artifact |
-| UDF JIT Worker Runtime Component | 框架 Worker 进程；本期为 Swordfish Ray Actor | Framework Worker Adapter、Artifact Loader and Validator、Schema and Layout Physicalizer、Target Plan Binder、Variant and Guard Manager、Region Executor and Memory Manager、Scalar Python Execution Provider、Host Columnar/Vector Execution Provider、Runtime Telemetry Client | 使用真实 Schema/Layout/ABI/CPU 绑定并执行 Region，管理多版本、内存、GIL、异常与标量解释续接 |
+| UDF JIT Worker Runtime Component | 框架 Worker 进程；本期为 Swordfish Ray Actor | Framework Worker Adapter、Artifact Loader and Validator、Schema and Layout Physicalizer、Target Plan Binder、Variant and Guard Manager、Region Executor and Memory Manager、CinderX/Vectorized/PyTorch/Native Kernel Provider、Runtime Telemetry Client | 使用真实 Schema/Layout/ABI/Target 绑定并执行 Region，管理多版本、转换、内存、异常与原始语义续接 |
 | UDF JIT Ops Tooling Component | CI / 运维进程 | Explain、Compatibility Checker、Profile Aggregator、Policy Builder | 离线检查产物兼容性、解释编译决策并生成版本化运行策略；不进入批数据热路径 |
 
 # 8 组件/模块设计与边界
@@ -953,26 +962,30 @@ RuntimeVariant {
 | Target Plan Binder | 结合真实 Provider Capability 和成本选择最终 Region DAG | Physical Region + Worker Capability → Bound Region Plan | 不放宽 Effect、Null 或异常约束 |
 | Variant and Guard Manager | 管理 Guard Key、Singleflight 编译、多版本、负缓存和原子发布 | Bound Plan + Runtime Context → Runtime Variant / Interpreter Continuation | 不在执行线程进行无上限同步编译 |
 | Region Executor and Memory Manager | 调度 Region DAG 并管理 Buffer、Python Object、GIL、异常和 Side Exit | Runtime Variant + BatchView → Framework Result / Exception | 不绕过 Value/Layout Contract 共享内存 |
-| Scalar Python Execution Provider | 在一个 CPython 执行域内承载 CinderX JIT Variant、Deopt/解释续接、原始 UDF 和普通 Python/C Extension 调用 | Scalar/Python Physical Region → JIT Executable 或 Interpreter Continuation | CinderX 与 CPython 不作为两个 Provider；不负责列式布局规划和 Batch Kernel |
-| Host Columnar/Vector Execution Provider | 承载 Arrow/Native Kernel 与 NumPy/Pandas 批量适配 | Columnar/Batch Library Region → Host Vector Executable | 不声称任意 Python 对象、副作用、异常顺序或 Null 语义可向量化 |
+| CinderX Execution Provider | callable-first 承载 CinderX JIT Variant、Deopt/解释续接、原始 UDF 和普通 Python/C Extension 调用 | Python callable 或可选 Semantic Region → JIT Executable/Interpreter Continuation | CinderX 与 CPython fallback 不作为两个 Provider；类型/调用目标 Guard 由 CinderX 闭环 |
+| Vectorized Execution Provider | 承载 Arrow、SIMD 与 NumPy/Pandas 批量适配 | Columnar/Batch Region → Vector Executable | 不声称任意 Python 对象、副作用、异常顺序或 Null 语义可向量化 |
+| PyTorch Execution Provider | 承载 Tensor Graph、Shape/DType Guard 和 CPU/GPU Runtime | Tensor-compatible Region → Compiled Graph | Tensor 化、设备传输和 graph break 成本必须显式 |
+| Native Kernel Execution Provider | 承载已验证 Buffer Region、LLVM/native codegen 或注册内核 | Semantic/Physical Region → Native Executable | Bounds、Alias、Ownership、target feature 和 Side Exit 由 Provider 闭环 |
 | Runtime Telemetry Client | 异步记录 Guard、编译、转换、Provider 和解释续接指标 | Runtime Event + Policy Snapshot → Metric/Event | 不进入每行热路径，故障不影响批执行 |
 
 ### 8.2.2 Execution Provider 内部执行方式
 
 | Provider / 执行方式 | 适用区域 | 关键约束 |
 |---|---|---|
-| Scalar Python / CinderX JIT | 类型和 Guard 可特化的标量 Python Region | 遵守 CPython ABI、GIL、引用计数、异常和 Deopt 语义 |
-| Scalar Python / CPython Interpreter | 未捕获、不支持、Guard Miss、Deopt、编译失败或普通不透明 Python 调用 | 与 JIT 共享 CPython Runtime；保留原始调用约定、Frame 和异常行为 |
-| Host Columnar / Arrow-Native | 纯、批处理友好、列式区域 | 明确类型、Null、编码、溢出、Buffer Ownership 与 SIMD Capability |
-| Host Columnar / NumPy-Pandas | 已有 ndarray、ufunc、Series/DataFrame 或可批量科学计算调用 | Copy、Object Dtype、GIL 和库版本成本必须显式计入 |
+| CinderX / JIT | 类型和 Guard 可特化的 Python callable/标量 Region | 遵守 CPython ABI、GIL、引用计数、异常和 Deopt 语义 |
+| CinderX / CPython fallback | 未捕获、不支持、Guard Miss、Deopt、编译失败或普通不透明 Python 调用 | 与 JIT 共享 CPython Runtime；保留原始调用约定、Frame 和异常行为 |
+| Vectorized / Arrow-SIMD | 纯、批处理友好、列式区域 | 明确类型、Null、编码、溢出、Buffer Ownership 与 SIMD Capability |
+| Vectorized / NumPy-Pandas | 已有 ndarray、ufunc、Series/DataFrame 或可批量科学计算调用 | Copy、Object Dtype、GIL 和库版本成本必须显式计入 |
+| PyTorch / Tensor Graph | Tensor-compatible 区域 | Shape、DType、Device、Host/Device Transfer 与 graph break 显式计入 |
+| Native Kernel / Codegen | 已验证、可绑定 Buffer 的区域 | Bounds、Alias、Ownership、ABI 和 CPU Feature 明确 |
 
-GPU/异构设备因引入 Device Memory、Host/Device Transfer、Stream 和目标编译，可通过相同 EP SPI 在后续增加 Accelerator Execution Provider；首期逻辑、实现、构建和交付清单均不包含该 Provider。
+GPU/异构设备作为 PyTorch 或 Native Kernel Provider 的 Target Capability 首先接入；只有未来出现独立内存、调度和生命周期且无法由现有 Provider 表达的执行域时，才新增 Provider 类型。
 
 ### 8.2.3 关键不变量
 
 - Artifact、Layout Descriptor、Runtime Variant 分层校验后才能执行。
 - 同一 Variant Key 采用 Singleflight；新 Variant 完整构建后原子发布。
-- Worker 重启只丢失本地 Variant/Code Cache，可由 Portable Artifact 重建或直接走 Scalar Python Interpreter。
+- Worker 重启只丢失本地 Variant/Code Cache，可由 Portable Artifact 重建或直接走 CinderX Provider 的 CPython fallback。
 - 所有跨 Region 的 Materialize、Copy、Box 与 Unbox 必须可计量、可解释。
 
 ## 8.3 UDF JIT Ops Tooling Component
@@ -1003,7 +1016,7 @@ Ops Tooling 产生只读策略快照；Portable Compiler 与 Worker Runtime 仅�
 
 ### 9.1.1 模型设计
 
-实现视图把三个逻辑组件拆成七个可独立链接或生成可执行文件的实现单元。本期不引入独立 Compile Service 或 Artifact Registry。
+实现视图把三个逻辑组件拆成九个可独立链接或生成可执行文件/包的实现单元。本期不引入独立 Compile Service 或 Artifact Registry。
 
 ### 9.1.2 实现元素清单
 
@@ -1013,8 +1026,10 @@ Ops Tooling 产生只读策略快照；Portable Compiler 与 Worker Runtime 仅�
 | Artifact Protocol Library | CPython Native Extension | Portable Compiler 与 Worker Runtime 共用的 Artifact/Descriptor/Guard Contract | Schema、Codec、Hash、Version、Verifier |
 | Daft/Ray Adapter Extension | CPython/Rust Boundary Extension | Framework Control Adapter、Framework Planner Bridge、Framework Worker Adapter 的 Daft/Ray 实现 | `.pth` 延迟引导、版本专用 Python Hook、生成 UDF Wrapper/Expression 与 Daft Scalar/Batch UDF 调用边界适配 |
 | Worker Runtime Extension | CPython Native Extension | Worker Runtime 的 Loader、Physicalizer、Target Binder、Variant/Guard、Executor/Memory、Telemetry | Worker 内目标绑定、缓存、Region 调度、资源与解释续接编排 |
-| Scalar Python Provider Plugin | Native Provider Shared Library | Worker Runtime 的 Scalar Python Execution Provider | 专用 Bytecode/Intrinsic、Data-aware HIR、CinderX Codegen/Deopt 与 CPython Interpreter Continuation |
-| Host Columnar Provider Plugin | Native Provider Shared Library | Worker Runtime 的 Host Columnar/Vector Execution Provider | Arrow/Native Kernel、Fused Loop、SIMD 和 NumPy/Pandas 批量适配 |
+| CinderX Provider Plugin | Native Provider Shared Library | Worker Runtime 的 CinderX Execution Provider | callable-first CinderX JIT/Guard/Deopt、可选 external Semantic Region bridge 与 CPython Interpreter Continuation |
+| Vectorized Provider Plugin | Native Provider Shared Library | Worker Runtime 的 Vectorized Execution Provider | Arrow/Fused Loop/SIMD 和 NumPy/Pandas 批量适配 |
+| PyTorch Provider Plugin | Optional Provider Package | Worker Runtime 的 PyTorch Execution Provider | Tensor/Graph 捕获、Shape/DType Guard、CPU/GPU Runtime |
+| Native Kernel Provider Plugin | Native Provider Shared Library | Worker Runtime 的 Native Kernel Execution Provider | verified Region、Buffer Contract、LLVM/Native Codegen 或注册 Kernel |
 | Ops CLI | Native Executable | UDF JIT Ops Tooling Component | Explain、兼容检查、Profile 聚合、Policy 与发布校验 |
 
 ### 9.1.3 实现元素规格视图输出策略
@@ -1074,7 +1089,7 @@ Ops Tooling 产生只读策略快照；Portable Compiler 与 Worker Runtime 仅�
 | 编译流水线 | Portable Compiler Library | 同进程 Native API；IR/Analysis 使用不可变 Handle 与显式 Verifier Result |
 | Portable Artifact | Artifact Protocol Library | Content-addressed Blob + Ray Object Reference + 版本化 Schema/Hash |
 | Worker 目标特化 | Worker Runtime Extension | 同 Actor 进程 Native API + Worker-local Descriptor/Handle |
-| Execution Provider | Scalar Python/Host Columnar Provider Plugin | C++ EP SPI + Capability Schema + Value/Layout Contract；解释续接是 Scalar Python Provider 内部模式 |
+| Execution Provider | CinderX/Vectorized/PyTorch/Native Kernel Provider Plugin | Provider-neutral SPI + Capability/Assumption/GuardCoverage + Value/Layout Contract；解释续接是 CinderX Provider 内部模式 |
 | 反馈与策略 | Compiler/Runtime Telemetry + Ops CLI | 结构化异步 Event Batch + 版本化只读 Policy Snapshot；不要求热路径 RPC |
 | 离线工具 | Ops CLI | CLI/JSON 输入输出 + 人类可读 Report/IR Dump |
 
@@ -1122,8 +1137,10 @@ Ops Tooling 产生只读策略快照；Portable Compiler 与 Worker Runtime 仅�
 | Artifact Protocol Library | `udf_jit/protocol/` | `_udf_jit_protocol` | 基础序列化、Hash、Schema 与 ABI 工具 |
 | Daft/Ray Adapter Extension | `udf_jit/integration/daft_ray/` | `_udf_jit_daft_ray` | Daft Python/Rust API、Ray API、Protocol ABI |
 | Worker Runtime Extension | `udf_jit/runtime/` | `_udf_jit_worker_runtime` | Protocol ABI、Execution Provider SPI、CPython ABI |
-| Scalar Python Provider Plugin | `udf_jit/provider/scalar_python/` | `udf_jit_provider_scalar_python` | Worker Runtime EP SPI、CPython/CinderX HIR/LIR/Runtime |
-| Host Columnar Provider Plugin | `udf_jit/provider/host_columnar/` | `udf_jit_provider_host_columnar` | Worker Runtime EP SPI、Arrow、NumPy/Pandas C API、Native Codegen |
+| CinderX Provider Plugin | `udf_jit/provider/cinderx/`（迁移期映射现有 `provider/scalar_python/`） | `udf_jit_provider_cinderx` | Worker Runtime EP SPI、CPython/CinderX HIR/LIR/Runtime |
+| Vectorized Provider Plugin | `udf_jit/provider/vectorized/` | `udf_jit_provider_vectorized` | Worker Runtime EP SPI、Arrow、NumPy/Pandas C API、SIMD |
+| PyTorch Provider Plugin | `udf_jit/provider/pytorch/` | `udf_jit_provider_pytorch` | Worker Runtime EP SPI、PyTorch Runtime/Compiler、Device ABI |
+| Native Kernel Provider Plugin | `udf_jit/provider/native_kernel/` | `udf_jit_provider_native_kernel` | Worker Runtime EP SPI、LLVM/Native Runtime、Target ABI |
 | Ops CLI | `udf_jit/tools/` | `udfjitctl` | 生成式 Artifact/Event Schema；内置只读 Decoder，不依赖运行时 Wheel |
 
 `.pth`、Python Bootstrap、Wheel Metadata、SBOM 和签名清单属于交付包装资源，不是独立编译目标。
@@ -1142,8 +1159,10 @@ Ops Tooling 产生只读策略快照；Portable Compiler 与 Worker Runtime 仅�
 | `_udf_jit_protocol.cpython-<pyabi>-<platform>.so` | Artifact Protocol Library | `_udf_jit_protocol` | CPython ABI、Artifact/Descriptor Format Version |
 | `_udf_jit_daft_ray.cpython-<pyabi>-<platform>.so` | Daft/Ray Adapter Extension | `_udf_jit_daft_ray` | Daft/Ray、Python/Rust Extension ABI |
 | `_udf_jit_worker_runtime.cpython-<pyabi>-<platform>.so` | Worker Runtime Extension | `_udf_jit_worker_runtime` | CPython、Runtime ABI、OS/Arch |
-| `libudf_jit_provider_scalar_python.so.<soversion>` | Scalar Python Provider Plugin | `udf_jit_provider_scalar_python` | CPython/CinderX ABI、Runtime EP SPI、CPU Feature |
-| `libudf_jit_provider_host_columnar.so.<soversion>` | Host Columnar Provider Plugin | `udf_jit_provider_host_columnar` | Runtime EP SPI、Daft/Arrow、NumPy/Pandas ABI、CPU Feature |
+| `libudf_jit_provider_cinderx.so.<soversion>` | CinderX Provider Plugin | `udf_jit_provider_cinderx` | CPython/CinderX ABI、Runtime EP SPI、CPU Feature |
+| `libudf_jit_provider_vectorized.so.<soversion>` | Vectorized Provider Plugin | `udf_jit_provider_vectorized` | Runtime EP SPI、Arrow、NumPy/Pandas ABI、CPU Feature |
+| `python_udf_jit_provider_pytorch-<version>.whl` | PyTorch Provider Plugin | `udf_jit_provider_pytorch` | Runtime EP SPI、PyTorch/Device ABI |
+| `libudf_jit_provider_native_kernel.so.<soversion>` | Native Kernel Provider Plugin | `udf_jit_provider_native_kernel` | Runtime EP SPI、LLVM/Native Runtime、Target ABI |
 | `udfjitctl` | Ops CLI | `udfjitctl` | Artifact/Event Schema、OS/Arch |
 
 本期全部代码运行在用户态，不包含 Linux Kernel Module，因此没有 `.ko` 构建产物；若后续引入内核模块或 eBPF Agent，应作为新的实现/代码/构建元素单独设计。
@@ -1152,20 +1171,20 @@ Ops Tooling 产生只读策略快照；Portable Compiler 与 Worker Runtime 仅�
 
 - 首期：Linux x86-64/aarch64 CPU Worker；
 - CPU Feature 进入 Variant Key；
-- SIMD 能力由 Host Columnar Provider Capability 声明；
+- SIMD 能力由 Vectorized/Native Kernel Provider Capability 声明；
 - GPU/加速器不属于首期，但 EP SPI 和 Physical IR 不排除后续扩展 Accelerator Provider。
 
 ## 9.6 交付模型
 
 ### 9.6.1 模型设计
 
-本期运行环境只需要安装一个 Daft/Ray Runtime Wheel。该 Wheel 同时覆盖控制端和 Worker 侧，Bootstrap 根据所在进程及框架 Hook 延迟加载相应模块；Host Columnar Provider 在依赖和 ABI 满足时启用，否则 Region 留在 Scalar Python Provider，并由 CinderX JIT 或 CPython 解释执行。运维工具是独立 ELF 二进制，不要求安装 Python 包。
+当前运行环境仍可由一个 Daft/Ray Runtime Wheel 覆盖控制端和 Worker 侧；Bootstrap 根据所在进程及框架 Hook 延迟加载 Core 与 CinderX Provider。目标态下 Vectorized、PyTorch、Native Kernel 作为可选 Provider Package 独立安装；缺失或 ABI 不满足时重新分区，最终由 CinderX JIT 或 CPython fallback 保留原始语义。运维工具是独立 ELF 二进制，不要求安装 Python 包。
 
 ### 9.6.2 交付元素清单
 
 | 交付元素 | 交付文件 | 包含的构建元素 | 使用方式 |
 |---|---|---|---|
-| Daft/Ray UDF JIT Runtime | `python_udf_jit_daft_ray-<version>-<python>-<abi>-<platform>.whl` | `_udf_jit_portable_compiler.cpython-<pyabi>-<platform>.so`<br/>`_udf_jit_protocol.cpython-<pyabi>-<platform>.so`<br/>`_udf_jit_daft_ray.cpython-<pyabi>-<platform>.so`<br/>`_udf_jit_worker_runtime.cpython-<pyabi>-<platform>.so`<br/>`libudf_jit_provider_scalar_python.so.<soversion>`<br/>`libudf_jit_provider_host_columnar.so.<soversion>` | 在集群镜像或 Ray Runtime Environment 中执行一次 `pip install`；Driver 与 Worker 按进程角色自动加载 |
+| Daft/Ray UDF JIT Core Runtime | `python_udf_jit_daft_ray-<version>-<python>-<abi>-<platform>.whl` | `_udf_jit_portable_compiler.cpython-<pyabi>-<platform>.so`<br/>`_udf_jit_protocol.cpython-<pyabi>-<platform>.so`<br/>`_udf_jit_daft_ray.cpython-<pyabi>-<platform>.so`<br/>`_udf_jit_worker_runtime.cpython-<pyabi>-<platform>.so` | 在集群镜像或 Ray Runtime Environment 中安装；Driver 与 Worker 按进程角色自动加载，Provider Packages 独立声明依赖 |
 | UDF JIT Operations CLI | `udfjitctl-<version>-<os>-<arch>` | `udfjitctl` ELF executable | 赋予执行权限后在 CI/运维节点直接运行；不进入作业运行环境 |
 
 Wheel 还包含 `.pth`、Python Bootstrap、默认 Pass/Guard/Cache 策略、Compatibility Manifest 和必要的 Schema 资源。SBOM 与签名作为发布侧伴随文件，不构成新的运行交付元素。
@@ -1274,7 +1293,7 @@ flowchart TB
             AEXEC["Executor → Guard / Variant Resolve"]
             ACACHE[("Process-wide Variant / Code Cache")]
             APOOL["Bounded Target Compiler Pool"]
-            PROVIDERS["Scalar Python · Host Columnar/Vector<br/>Execution Providers"]
+            PROVIDERS["CinderX · Vectorized · PyTorch · Native Kernel<br/>Execution Providers"]
 
             ACALL -->|"first call / cold handle"| ALOAD
             ALOAD --> ACACHE
@@ -1304,7 +1323,7 @@ flowchart TB
 - Candidate/Operation Hook 与 Scalar/Batch Wrapper Entry 分别运行在 Daft 调用它们的当前线程上，不创建常驻代理线程；Adapter 不假设固定 Worker 线程编号。
 - Driver 的可移植编译和 Actor 的目标编译使用各自受限线程池；其队列、CPU 和内存预算归所属组件管理，不能占满 Daft/Swordfish 执行线程。
 - Daft 0.7.2 不提供本系统可用的 Actor Attach/Detach SPI。Artifact Resolve、Layout Binding 和 Region Context 创建在 Wrapper 首次调用时懒执行；Loader、Guard、Executor 和 Execution Provider 是组件内调用路径，不代表额外进程。
-- Variant/Code Cache 仅在单个 Actor 进程内共享；Scalar Python Provider 的 CinderX JIT/CPython Interpreter 路径共同遵守 GIL，纯 Arrow/Native Region 满足线程安全和对象隔离条件时可释放 GIL。
+- Variant/Code Cache 仅在单个 Actor 进程内共享；CinderX Provider 的 JIT/CPython fallback 共同遵守 GIL，Vectorized/Native Region 满足线程安全和对象隔离条件时可释放 GIL。
 
 ### 9.8.3 透明启用与 Worker 懒加载流程
 
@@ -1312,11 +1331,11 @@ flowchart TB
 
 - 用户继续使用原有 Daft UDF 定义、注册和查询 API，不增加 `@jit`，也不改写成 Pandas UDF。
 - 集群镜像或 Ray Runtime Environment 预装同一个 Daft/Ray Runtime Wheel 后，业务代码无需显式 `import python_udf_jit`。
-- 平台仍须维护 Daft、Ray、CPython/CinderX 和 Native Wheel 的兼容矩阵；不受支持的 Region 保持原始 UDF 语义并由 Scalar Python Provider 解释执行。
+- 平台仍须维护 Daft、Ray、CPython/CinderX 和各 Provider Package 的兼容矩阵；不受支持的 Region 保持原始 UDF 语义并由 CinderX Provider 的 CPython fallback 执行。
 
 自动入口复用 CinderX 的成熟启动模式：[cinderx.pth](../../../cinderx/cinderx/PythonLib/cinderx.pth) 在 CPython `site` 初始化时导入 [`_cinderx_auto.py`](../../../cinderx/cinderx/PythonLib/_cinderx_auto.py)。UDF JIT 的 `.pth` 同样只导入轻量 Bootstrap；Bootstrap 安装 Post-import Hook，并不在进程启动时 Capture、编译或假设 Daft 已加载。
 
-Daft 0.7.2 导入后，Post-import Hook 先校验版本和源码指纹，再保存原始方法并安装幂等包装器：`Func.__call__` 包装器登记候选，`DataFrame.where/select/with_columns` 包装器取得 `self.schema()` 与使用上下文、提交 `CaptureRequest`，随后调用原方法或传入已证明等价的替代表达式。版本/指纹/签名不匹配、Hook 异常或功能关闭时直接调用保存的原方法。这一层是普通 Python 进程内 Runtime Instrumentation，不是 Daft Native Plugin，也不修改 Daft 源码；真正属于 CPython Runtime Plugin 的是 Scalar Python Provider 内的 CinderX/Native JIT 部分。
+Daft 0.7.2 导入后，Post-import Hook 先校验版本和源码指纹，再保存原始方法并安装幂等包装器：`Func.__call__` 包装器登记候选，`DataFrame.where/select/with_columns` 包装器取得 `self.schema()` 与使用上下文、提交 `CaptureRequest`，随后调用原方法或传入已证明等价的替代表达式。版本/指纹/签名不匹配、Hook 异常或功能关闭时直接调用保存的原方法。这一层是普通 Python 进程内 Runtime Instrumentation，不是 Daft Native Plugin，也不修改 Daft 源码；真正属于 CPython Runtime Plugin 的是 CinderX Provider 内的 JIT 部分。
 
 建议配置名为架构占位，最终名称由实现确定：
 
@@ -1324,7 +1343,7 @@ Daft 0.7.2 导入后，Post-import Hook 先校验版本和源码指纹，再保�
 UDFJIT_PLUGIN_ENABLE=1
 UDFJIT_MODE=off | observe | auto
 UDFJIT_DISABLE=1            # 紧急 Kill Switch
-CINDERX_PLUGIN_ENABLE=1     # 启用 Scalar Python Provider 的 CinderX JIT tier
+CINDERX_PLUGIN_ENABLE=1     # 启用 CinderX Provider 的 JIT tier
 ```
 
 `observe` 只捕获、分析和采集成本，执行仍走原始标量解释路径；`auto` 允许编译和执行优化 Variant。
@@ -1357,7 +1376,7 @@ sequenceDiagram
         WorkerJIT->>WorkerJIT: 提交受限目标编译池
         WorkerJIT->>WorkerJIT: 当前调用走已有 Variant 或标量解释续接
     else 不兼容、未达热度或超预算
-        WorkerJIT->>WorkerJIT: Scalar Python Interpreter
+        WorkerJIT->>WorkerJIT: CinderX Provider / CPython fallback
     end
     WorkerJIT-->>Worker: Daft Column / Python Object / Exception
 ```
@@ -1407,7 +1426,7 @@ Daft 0.7.2 没有可依赖的显式 `detach_region()` 回调。每次调用结�
 - 执行线程与编译线程池分离；首批数据可在异步编译期间走标量解释路径。
 - 同一 Variant Key 采用 Singleflight，其他请求等待短期结果或走标量解释路径。
 - Runtime Variant 构建完成后原子发布；执行线程使用只读快照。
-- Native/Arrow Region 在语义允许时释放 GIL；Scalar Python Provider 的 CinderX JIT 与 CPython Interpreter 路径按同一 CPython 约束获取 GIL。
+- Native/Arrow Region 在语义允许时释放 GIL；CinderX Provider 的 JIT 与 CPython fallback 路径按同一 CPython 约束获取 GIL。
 - Ray ObjectRef 获取、Profile 和 OM 操作异步、限流且不阻塞批执行。
 - 代码与 Buffer 释放使用引用计数、Epoch 或等价机制，避免正在执行的 Variant 被回收。
 - 受限编译池必须配置 Actor 级 CPU/内存预算，不能与 Swordfish Tokio Pool 无界竞争；Actor 停止时先拒绝新编译，再等待或取消在途任务。
@@ -1431,9 +1450,9 @@ flowchart LR
 flowchart LR
     MISS["Guard Miss / Provider Failure"] --> BUDGET{"版本与编译预算允许？"}
     BUDGET -->|"是"| COMPILE["提交受限异步编译"]
-    COMPILE --> CURRENT["当前批次走兼容 Variant<br/>或 Scalar Interpreter"]
+    COMPILE --> CURRENT["当前批次走兼容 Variant<br/>或 CinderX/CPython fallback"]
     BUDGET -->|"否"| NEGATIVE["命中或写入负缓存"]
-    NEGATIVE --> FALLBACK["Scalar Python Interpreter"]
+    NEGATIVE --> FALLBACK["CinderX Provider / CPython fallback"]
     CURRENT -.-> REASON["记录结构化原因"]
     FALLBACK -.-> REASON
 ```
@@ -1528,7 +1547,7 @@ flowchart LR
 - 校验 Adapter、Runtime、Execution Provider ABI；
 - 校验 Artifact Format、Hash/签名和依赖；
 - 初始化 Code Cache 时使用最小权限和 W^X；
-- 不兼容时禁用对应 Provider，不影响 Scalar Python Interpreter 路径。
+- 不兼容时禁用对应 Provider，不影响 CinderX Provider 的 CPython fallback 路径。
 
 #### 10.2.1.2 运行安全域
 
@@ -1595,26 +1614,27 @@ flowchart LR
 | 独立能力 | 架构体现 |
 |---|---|
 | 独立开发 | Portable Compiler、Worker Runtime、Framework Adapter、Execution Provider 与 Ops 按稳定契约解耦开发 |
-| 独立构建 | 七个代码目标分别生成六个 `.so` 与一个 ELF 可执行文件 |
+| 独立构建 | 九个代码目标分别生成七个 `.so`、一个可选 Provider Wheel 与一个 ELF 可执行文件 |
 | 独立测试 | IR/Pass、Adapter Contract、EP Contract、Runtime 差分分别测试 |
 | 独立发布 | Daft/Ray Runtime Wheel 与 Ops CLI 二进制分别版本化；核心格式和 ABI 明确兼容窗口 |
 | 独立部署 | Runtime Wheel 统一进入 Job/Worker 环境并按角色加载；Ops CLI 仅部署在 CI/运维节点 |
-| 独立演进/替换 | 可新增 MLIR Bridge、Scalar Compiler Tier 或 Accelerator Execution Provider，而不改变 Framework SPI 与 Portable 语义层 |
+| 独立演进/替换 | 可新增 MLIR Bridge、Provider 或 Target Capability，而不改变 Framework SPI 与 Portable 语义层 |
 
 # 12 其他说明
 
 ## 12.1 推荐演进路线
 
 1. **Phase 1：主线标量闭环（RFC-001～008）**。打通 `.pth`/Daft Hook、Capture、Core IR、Portable Artifact、Worker Layout 绑定、CinderX 标量 JIT、Guard/Cache、CPython 域内续接与运行治理，端到端门槛为原始基线 `1.15x`。
-2. **Phase 2：可选混合 Provider（RFC-009）**。建立 Scalar Python、Host Columnar/Vector 及未来执行域之间的 Capability、分区、成本和转换契约，不纳入首期强制门槛。
-3. **Phase 3：高阶执行模型（RFC-010～012）**。实现列式执行、批内稀疏退出和等价语义回填；三项相对同一原始基线合计增加 `0.15`，最终达到 `1.30x`。
-4. **Phase 4：跨 UDF/算子 Region 与覆盖扩展**。扩大字符串、时间、嵌套类型、科学计算库和 Planner 协同的安全覆盖面。
-5. **Phase 5：PGO、有限 Tactic Search、纯 Native Operator 接入和 Ray 集群内 Artifact 复用**。
+2. **Phase 2：Provider-neutral SPI 与 CinderX 归属收敛**。以中立 CompileRequest/GuardCoverage 包住当前 CinderX 穿刺，实现 callable-first，并删除 CinderX 可自给的必需元数据依赖。
+3. **Phase 3：可选混合 Provider（RFC-009）**。接入 Vectorized、PyTorch、Native Kernel，建立 Capability、分区、成本和显式转换契约，不纳入首期强制门槛。
+4. **Phase 4：高阶执行模型（RFC-010～012）**。实现列式执行、批内稀疏退出和等价语义回填；三项相对同一原始基线合计增加 `0.15`，最终达到 `1.30x`。
+5. **Phase 5：跨 UDF/算子 Region 与覆盖扩展**。扩大字符串、时间、嵌套类型、科学计算库和 Planner 协同的安全覆盖面。
+6. **Phase 6：PGO、有限 Tactic Search、纯 Native Operator 接入和 Ray 集群内 Artifact 复用**。
 
 ## 12.2 首期建议
 
 - 首期只接入 Daft Ray Runner/Flotilla，固定一组 Daft、Ray、CPython/CinderX 版本建立可验证的兼容基线。
-- CinderX 首期采用专用 Bytecode/Intrinsic + Descriptor Table，避免直接开放通用 HIR Frontend。
+- CinderX 普通 callable 优先使用原生 Bytecode Frontend；穿刺期 external-region/Descriptor 接口隔离在版本绑定 Provider Plugin，不作为 CinderX 公共 API。
 - 第一版 Partitioner 只做有限 Region 模式和确定性成本规则，不引入复杂搜索。
 - 第一版 Daft Optimizer Bridge 默认关闭，仅对严格白名单的纯表达式启用。
 - 首期基准覆盖 Actor 冷启动、首批编译、稳态命中、Guard Miss、Actor 重启恢复和 Ray Object Store 数据路径；其他框架在这些闭环稳定后再评估。
@@ -1627,7 +1647,7 @@ flowchart LR
 - 字符串、Decimal、时区、嵌套类型和用户自定义对象的统一语义规范。
 - Artifact Format、Schema 演进与跨版本 Compatibility Window。
 - Daft 0.7.2 Python Runtime Hook 的指纹、签名和失效策略，以及未来官方 UDF/Rewrite SPI 出现后的迁移路径。
-- Accelerator Execution Provider 的引入门槛、设备内存 Contract 和是否需要独立 Artifact Variant。
+- 新执行域独立于 PyTorch/Native Kernel Target Capability 的引入门槛、设备内存 Contract 和 Artifact Variant 边界。
 - Ray Autoscaling、Actor Restart 与 Portable Artifact 所有权/重建策略。
 - Daft + Ray 基准集向真实业务算子链扩展后的权重，以及生产灰度期的长期稳定性门槛。
 
@@ -1648,3 +1668,4 @@ flowchart LR
 13. [Daft Architecture：Ray Runner / Flotilla / Swordfish](https://docs.daft.ai/en/stable/architecture/)。
 14. [Daft Running on Ray：Ray Client、Ray Jobs 与 Runtime Environment](https://docs.daft.ai/en/stable/distributed/ray/)。
 15. [Ray Cluster Key Concepts](https://docs.ray.io/en/latest/cluster/key-concepts.html)、[Ray Actors](https://docs.ray.io/en/latest/ray-core/actors.html)、[Ray Serialization and Object Store](https://docs.ray.io/en/latest/ray-core/objects/serialization.html)。
+16. [Python UDF JIT 多后端信息归属与接入架构](2026-08-06-multi-provider-information-ownership-architecture.md)。
