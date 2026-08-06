@@ -5,7 +5,7 @@
 | 项目 | 内容 |
 | --- | --- |
 | 产品/组件 | Python UDF JIT / Scalar Python Execution Provider |
-| 设计范围 | UDF JIT Typed Semantic IR、行为分类、CinderX HIR/LIR Lowering |
+| 设计范围 | 通用循环/类型特化语义、Provider-neutral 分析、CinderX HIR/LIR 能力与迁移期 Lowering |
 | 目标版本 | Semantic Core IR v2（P0 已实现） |
 | 密级 | 内部 |
 
@@ -13,12 +13,13 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 (Status) | Implemented for the exact-str generic typed-region subset |
+| 状态 (Status) | Implemented prototype；Provider 信息归属按 2026-08-06 专项架构迁移 |
 | 作者 (Authors) | Python UDF JIT 项目组 |
 | 创建日期 (Created) | 2026-08-03 |
-| 更新日期 (Updated) | 2026-08-04 |
+| 更新日期 (Updated) | 2026-08-06 |
 | 相关 Issue/PR | TBD；进入 Reviewing 前必须创建并回填 |
 | 上游设计 | `docs/design/2026-07-13-python-udf-jit-architecture.md` |
+| 信息归属设计 | `docs/design/2026-08-06-multi-provider-information-ownership-architecture.md` |
 | 证据输入 | `docs/reports/2026-08-03-fineweb-udfjit-cinderx-backend-opportunity.md`、`docs/reports/2026-08-03-generic-loop-type-specialization-validation.md` |
 
 ## 0.3 修订记录
@@ -28,6 +29,7 @@
 | V0.1 | 2026-08-03 | Python UDF JIT 项目组 | 首次提出“行为分类 × 类型系统 × 通用 Pass”设计，废弃业务语义 opcode 方案。 |
 | V0.2 | 2026-08-03 | Python UDF JIT 项目组 | 完成 P0 typed CFG/SSA、循环/归约分析、Unicode property backend、全链路诊断和穿刺 A/B；P1 builder/FSM/full-pipeline 仍开放。 |
 | V0.3 | 2026-08-04 | Python UDF JIT 项目组 | 删除 whole-loop helper 路径，完成 CinderX generic HIR/LIR、immutable lookup、bool-class FSM、sequence builder、closure devirtualization、generator failure cache、全链诊断和 FineWeb 200K A/B。 |
+| V0.4 | 2026-08-06 | Python UDF JIT 项目组 | 按多后端信息归属架构修正 CinderX 对接：普通 callable 由 CinderX 自行分析、Guard 和 Deopt；Typed Region 改为可选 external-region 输入，当前专用入口仅属穿刺期 Provider Plugin。 |
 
 ## 0.4 Keywords 关键词
 
@@ -41,11 +43,11 @@ Python UDF、Typed SSA、CFG、Loop、Iterator、Type Specialization、CinderX�
 参考 CinderX AutoJIT，把程序按 Compute、Control、Object、Dispatch、Suspend、Dynamic 等行为维度
 分类，用于准入、Pass 选择和成本控制，但不参与定义程序语义。
 
-Worker 在重新验证 Typed Semantic IR 后，结合 exact type、闭包常量和运行时反馈 Lower 到 CinderX
-HIR；CinderX 通过通用的调用去虚拟化、generator inline、typed iterator specialization、loop
-canonicalization、reduction、immutable lookup 和 sequence builder Pass 生成 LIR/机器码。FineWeb 的
-alphanumeric、punctuation、whitespace 仅作为三类通用能力的验证 workload，不成为 IR 或后端中的
-函数名、算子名或专用 opcode。
+通用能力有两条触发路径：普通 Python callable 优先由 CinderX 原生 Bytecode Frontend 自行恢复 CFG、类型、
+闭包/调用目标、行为分类和 Guard，再执行调用去虚拟化、generator inline、typed iterator、reduction、
+immutable lookup 和 sequence builder 等 Pass；跨算子或没有等价 bytecode 的 Region 才由 Provider Plugin
+重新验证 provider-neutral Typed Semantic IR 后构造 CinderX HIR。FineWeb 的 alphanumeric、punctuation、
+whitespace 仅作为三类通用能力的验证 workload，不成为 IR 或后端中的函数名、算子名或专用 opcode。
 
 ## 0.6 缩略语清单
 
@@ -64,8 +66,10 @@ alphanumeric、punctuation、whitespace 仅作为三类通用能力的验证 wor
 
 ## 1.1 简介
 
-本提案建设一条不依赖业务函数名的组合优化链：UDF JIT 负责把 Python 程序还原为通用 Typed
-Semantic IR 和可验证的类型/Effect 事实，CinderX 负责动态准入、HIR 优化、Deopt 与机器码生成。
+本提案建设一条不依赖业务函数名的组合优化链。UDF JIT Semantic Core 为跨算子和无 Python 前端的
+Provider 提供通用 Typed Semantic IR；对普通 callable，CinderX 自己负责从 Python 程序恢复类型、
+控制流、调用目标和 Guard，并完成动态准入、HIR 优化、Deopt 与机器码生成。UDF JIT 的同类分析只能
+作为候选、诊断或可验证 external-region 输入，不能成为 CinderX 原生路径的隐含正确性依赖。
 
 “通用”在本文中的定义是：来自不同框架、不同业务、不同源码写法的 UDF，只要拥有相同的控制结构、
 基础操作和类型条件，就能由同一组编译 Pass 优化；改变类型、Effect、异常顺序或动态调用条件时，必须
@@ -103,10 +107,10 @@ Semantic IR 和可验证的类型/Effect 事实，CinderX 负责动态准入、H
 2. 为直线、分支、循环、迭代、归约、查表转换和可变长序列构造提供通用表示。
 3. 让类型成为独立维度，至少表达 exact Python type、逻辑元素类型、nullability、boxed/unboxed 和
    运行时 Guard 要求。
-4. 复用 CinderX AutoJIT 的行为分类、动态阈值、Deopt 与负 ROI backoff，而不是在 UDF JIT 中复制
-   第二套 JIT 生命周期。
-5. 通过 Worker-local CinderX HIR Builder 保留循环和类型事实，不把 CinderX HIR/LIR 写入可移植
-   Artifact。
+4. 普通 callable 复用 CinderX AutoJIT 的行为分类、动态阈值、Guard、Deopt 与负 ROI backoff，不在
+   UDF JIT 中复制第二套 CinderX JIT 生命周期。
+5. 仅对跨算子或无 bytecode Region，通过 Worker-local CinderX Provider Plugin 保留循环和类型事实；
+   不把 CinderX HIR/LIR 写入可移植 Artifact，也不把该入口变成 UDF JIT Core 专属 SPI。
 6. 任何优化 Pass 不得读取业务模块名、函数名、pipeline 名或 Data-Juicer 算子名。
 7. 以多个业务域、多个源码写法验证同一通用 Pass，并在 diagnostics=off 的独立进程完成性能资格。
 8. 组合优化的正式 full-pipeline 目标明显高于单独 CinderX 约 10% 的预期收益。
@@ -185,11 +189,11 @@ mapping 可作为 module constant、closure constant 或字面量构造，但只
 
 ### 3.1.1 架构图
 
-下图只展开现有架构中的 IR and Pass Manager、Candidate Partitioner、Scalar Python Execution
-Provider，不引入新的顶层组件。
+下图只展开现有架构中的 Semantic Core、Planning 与 CinderX Provider。普通 callable 与可选 external
+Semantic Region 是两条并存输入，不引入 CinderX 专属 Core 接口。
 
 ```mermaid
-flowchart TB
+graph TB
     subgraph DRIVER["UDF JIT Portable Compiler Component — Driver"]
         FCA["Framework Control Adapter"]
         CF["Capture Frontend"]
@@ -204,22 +208,30 @@ flowchart TB
         FCA --> CF --> SSA --> TA --> BP --> GP --> CP --> PAP
     end
 
-    PAP -. "Portable Typed IR + Guard Template" .-> ALV
+    PAP -. "Portable Typed IR + External Assumptions" .-> ALV
 
     subgraph WORKER["UDF JIT Worker Runtime Component — Worker"]
         ALV["Artifact Loader and Validator"]
-        SLP["Schema and Layout Physicalizer"]
-        VGM["Variant and Guard Manager"]
-        subgraph SPEP["Scalar Python Execution Provider"]
-            ADMIT["CinderX Admission + Runtime ROI"]
-            HB["Typed Region → CinderX HIR Builder"]
+        SLP["Framework Contract Physicalizer"]
+        VGM["Runtime Dispatcher and Variant Manager"]
+        CALLABLE["Worker-local Python callable"]
+        subgraph SPEP["CinderX Execution Provider"]
+            NF["Native Bytecode Frontend + AutoJIT"]
+            EXT["Optional External-region Adapter"]
             HP["Generic HIR Passes"]
-            LC["LIR + Codegen + Deopt"]
-            PY["CPython Interpreter Continuation"]
-            ADMIT --> HB --> HP --> LC
-            ADMIT --> PY
+            LC["Guard + Deopt + LIR + Codegen"]
+            PY["CPython Fallback"]
+            NF --> HP
+            EXT --> HP
+            HP --> LC
+            NF -. "reject/defer" .-> PY
+            EXT -. "reject" .-> PY
+            LC -. "guard miss/deopt" .-> PY
         end
-        ALV --> SLP --> VGM --> ADMIT
+        ALV --> SLP --> VGM
+        VGM --> NF
+        VGM --> EXT
+        CALLABLE --> NF
     end
 ```
 
@@ -227,38 +239,42 @@ flowchart TB
 
 | 逻辑接口 | 来源模块 | 目标模块 | 本 RFC 的变化 |
 | --- | --- | --- | --- |
-| `IF-CAPTURE-REQUEST-API` | Framework Control Adapter | Capture Frontend | 增加 closure/type/schema 证据，不增加业务算子 |
+| `IF-CAPTURE-REQUEST-API` | Framework Control Adapter | Capture Frontend | 形成 callable/Semantic Candidate 和 provenance，不增加业务算子 |
 | `IF-IR-PIPELINE-API` | Capture Frontend | IR and Pass Manager | 输出 Semantic Core IR v2 与可重算分析 |
 | `IF-PARTITION-API` | IR and Pass Manager | Candidate Partitioner | Capability 以 pattern、type、effect 表达 |
-| `IF-ARTIFACT-CONTRACT` | Publisher | Worker Loader | 携带 v2 Typed IR、Guard Template 和兼容要求 |
-| `IF-EP-CAPABILITY-API` | Scalar Python Provider | Target Binder | 声明通用 IR 节点、类型、Guard 与 Deopt 能力 |
-| `IF-EP-COMPILE-API` | Variant Manager | Scalar Python Provider | 输入 verified typed region，不输入业务 opcode |
+| `IF-ARTIFACT-CONTRACT` | Publisher | Worker Loader | 可选携带 v2 Typed IR、External Assumption 和兼容要求 |
+| `IF-EP-CAPABILITY-API` | CinderX Provider | Target Binder | 声明 callable/external-region 输入能力、类型、Assumption 与 Side Exit |
+| `IF-EP-COMPILE-API` | Variant Manager | CinderX Provider | 中立 CompileRequest；返回 Variant + GuardCoverage，不输入业务 opcode |
 
 ### 3.1.3 编译流程
 
 ```mermaid
-flowchart LR
-    SRC["Python UDF"] --> BC["Bytecode + Closure"]
-    BC --> CAP["Capture CFG"]
-    CAP --> TIR["Typed SSA/CFG"]
-    TIR --> PROF["Behavior Profile"]
-    TIR --> NORM["Generic Normalize"]
-    PROF --> PART["Capability + Cost Partition"]
-    NORM --> PART
-    PART --> ART["Portable Artifact"]
-    ART --> BIND["Worker Type/Layout Bind"]
-    BIND --> GATE{"AutoJIT/ROI Gate"}
-    GATE -->|accept| HIR["CinderX HIR"]
-    GATE -->|defer/reject| PY["CPython"]
-    HIR --> LIR["CinderX LIR"]
-    LIR --> ASM["Machine Code"]
-    HIR -->|guard/deopt| PY
+sequenceDiagram
+    participant S as Semantic Core
+    participant P as Planning
+    participant R as Runtime Dispatcher
+    participant C as CinderX Execution Provider
+
+    S->>P: submit_candidate(callable_ref, optional_semantic_region)
+    P->>C: probe(candidate, framework_context)
+    C-->>P: SupportReport(input_mode, assumptions, cost)
+    P->>R: install_assignment(fallback_contract)
+    R->>C: compile(CompileRequest)
+    alt ordinary Python callable
+        C->>C: native bytecode analysis + AutoJIT + Guard/Deopt
+    else cross-operator/external region
+        C->>C: verify region + provider-local HIR construction
+    end
+    C-->>R: CompiledVariant + GuardCoverage
+    R->>C: execute(variant, inputs)
+    C-->>R: result or CPython side exit
 ```
 
 ## 3.2 Behavior Profile 设计
 
-Behavior Profile 参考 CinderX `StructureKey`，但由 UDF JIT 的 verified IR 重算，避免只根据未展开的
-wrapper bytecode 分类。建议模型：
+Behavior Profile 是 provider-neutral 的候选分析，可由 UDF JIT verified IR 重算，供没有 Python 前端的
+Provider 和跨 Provider Partitioner 使用；CinderX callable 路径继续使用自己的 `StructureKey`/AutoJIT，
+不把 UDF JIT Profile 当作正确性或准入必需输入。建议中立模型：
 
 ```text
 BehaviorProfile {
@@ -282,7 +298,8 @@ BehaviorProfile {
 约束：
 
 - Profile 是 Analysis，不是 Semantic Operation；
-- Driver 的 Profile 只是候选提示，Worker 必须从验证后的 IR 重算；
+- Driver 的 Profile 只是候选提示；接收 external Region 的 Provider 必须从验证后的 IR 重算，拥有 callable
+  原生前端的 Provider 可以忽略；
 - Profile 不进入 semantic hash；若随 Artifact 携带，只能作为有版本、可校验、可丢弃的 hint；
 - CinderX 最终编译阈值还必须结合真实 call count、deopt count、compile time 和 negative ROI backoff；
 - wrapper 与解析后的 closure target 分别分类，不能用 wrapper 的 `CallDispatcher` 形态覆盖真实循环。
@@ -385,28 +402,39 @@ Pass 必须声明依赖的 Analysis 与失效集合。Pattern 识别结果作为
 
 ### 3.5.1 选定方案
 
-采用 Worker-local `Typed Region → CinderX HIR Builder`：Portable Artifact 只携带 provider-neutral Typed
-IR；Worker 在 ABI、类型、布局和策略校验后构造 CinderX HIR。理由：
+采用“双路径、同一 CinderX 后端能力”方案：
 
+1. 普通 Python callable 优先走 CinderX 原生 Bytecode Frontend，由 CinderX 自行分析 CFG、类型、
+   closure/global、调用目标、Behavior、Guard 和 Deopt；
+2. 只有跨 UDF/算子、框架融合后没有等价 bytecode 的 Region，才由 CinderX Provider Plugin 接收
+   verified provider-neutral Typed IR，并在 Worker 内构造 HIR。
+
+理由：
+
+- 保持 CinderX 随 CPython 单独使用时仍能触发同一套通用优化；
+- 避免把 UDF JIT 的 Behavior、类型或 dependency hash 变成 CinderX 原生路径的正确性依赖；
 - 避免用业务专用 bytecode 重新编码结构化循环；
 - 避免把 CinderX HIR 变成跨版本协议；
-- 保留 exact type、loop-carried value、Effect 和 Deopt metadata；
+- external Region 仍可保留 loop-carried value、Effect、异常和 provenance；
 - 可直接复用 CinderX `GuardType`、`TUnicodeExact`、HIR CFG、Phi、simplify、LIR 和 codegen；
-- CinderX 版本耦合被限制在 Worker Provider Plugin，与现有 ABI pinning 一致。
+- external-region 版本耦合被限制在 Worker Provider Plugin，与现有 ABI pinning 一致。
 
-标准 CPython bytecode 路径继续承担原始 UDF fallback、未支持区域和诊断对照，不作为 Typed Region 的主要
-信息传递格式。
+当前 `compile_typed_region` 是第二条路径的穿刺入口，不是目标 Provider SPI，也不代表普通 callable 必须
+先经过 UDF JIT Typed IR。目标中立接口见[多后端信息归属与接入架构](2026-08-06-multi-provider-information-ownership-architecture.md)。
 
 ### 3.5.2 CinderX 适配范围
 
-CinderX 侧允许增加通用能力：
+CinderX Core 侧允许增加可由普通 callable 触发的通用能力：
 
-1. 受版本控制的内部 HIR construction adapter；
-2. block/frame/deopt state 构造与验证入口；
-3. exact built-in iterator 与 Unicode storage primitive 的 HIR/LIR lowering；
-4. generator LIR failure 修复及确定性编译失败负缓存；
-5. Behavior Profile/StructureKey 与 runtime ROI 的组合准入；
-6. 通用 Pass 的统计和诊断导出。
+1. exact closure target Guard/inline、generator HIR→LIR 修复和确定性编译失败负缓存；
+2. exact built-in iterator、Unicode storage/classification、immutable lookup 和 sequence builder 的通用
+   HIR/LIR lowering；
+3. 从普通 CallMethod/VectorCall/loop 形态触发上述能力的原生 HIR Pass；
+4. CinderX 自有 Behavior Profile/StructureKey、runtime ROI、Guard/Watcher/Deopt；
+5. 通用 HIR/LIR/machine provenance、Pass 统计和诊断导出。
+
+CinderX Provider Plugin 可以保留受版本控制的 external-region HIR construction adapter、Framework
+Descriptor bridge 和迁移期属性；在没有多个非 UDF producer 之前，不把它们提升为 CinderX 公共 API。
 
 CinderX 侧禁止出现：
 
@@ -414,20 +442,26 @@ CinderX 侧禁止出现：
 - Data-Juicer、FineWeb、Daft pipeline 标识；
 - 固定的六字符业务映射；
 - `collapse_whitespace` 等业务复合 HIR opcode。
+- 以 `__udf_jit_*`、`JITRT_Udf*` 命名的公共上游接口。
 
 ### 3.5.3 准入与版本选择
 
-编译准入由三部分共同决定：
+普通 callable 的编译准入由 CinderX 自己闭环：
 
 ```text
-verified_semantics
+CinderX_verified_python_semantics
 AND supported_type_specialization
 AND dynamic_ROI_gate
+AND CinderX_guard_deopt_coverage
 ```
 
-- `verified_semantics`：UDF JIT Verifier、Effect/Exception 与依赖证明；
-- `supported_type_specialization`：Worker exact type/layout/ABI capability；
+- `CinderX_verified_python_semantics`：CinderX Bytecode/HIR、Effect/Exception 与调用语义；
+- `supported_type_specialization`：CinderX runtime exact type/ABI capability；
 - `dynamic_ROI_gate`：CinderX call threshold、Behavior family、risk、compile/deopt feedback 和 backoff。
+- `CinderX_guard_deopt_coverage`：CinderX 自有 Guard/Watcher/Deopt 覆盖所有代码依赖。
+
+external Region 还必须经过 UDF JIT Verifier、Provider 二次验证和 Runtime `GuardCoverage` 发布门禁。UDF JIT
+Behavior Profile、`runtime_dependency_hashes` 和 plan 字段不能补足缺失的 CinderX Guard。
 
 任何一项失败都选择 CPython continuation 或已有泛化 Variant，不造成作业失败。
 
@@ -598,14 +632,16 @@ analyze_behavior(module: VerifiedSemanticCoreModuleV2) -> BehaviorProfile
 - 变更说明：新增内部 SPI，不形成第三方 API。
 - 调用参考代码：`profile = analyze_behavior(verify_semantic_v2(module))`。
 
-#### 3.12.2.2 CinderX Typed Region Compile SPI
+#### 3.12.2.2 Provider-neutral Compile SPI
 
-接口描述：在 Worker 内把已物理化、已验证的 typed region Lower 到 CinderX HIR 并按 ROI gate 编译。
+接口描述：Runtime 以中立请求调用 CinderX Provider；Provider 自行选择 callable 原生前端或 external-region
+adapter，并返回 GuardCoverage。当前 `cinderx.jit.compile_typed_region` 只由 Provider Plugin 内部调用。
 
 接口原型：
 
 ```text
-compile_typed_region(request: CinderXTypedRegionRequest)
+provider.probe(candidate, context) -> SupportReport
+provider.compile(request: CompileRequest)
   -> CompiledVariant | Deferred | Unsupported | CompileFailure
 ```
 
@@ -613,11 +649,12 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 
 | 参数名称 | 输入/输出 | 类型 | 描述 | 取值范围 |
 | --- | --- | --- | --- | --- |
-| `request.region` | 输入 | VerifiedTypedRegion | provider-neutral CFG/SSA | Semantic IR v2 subset |
-| `request.types` | 输入 | BoundTypeEvidence | exact type、layout、Guard | Worker-local |
-| `request.profile` | 输入 | BehaviorProfile | Worker 重算分类 | 版本化 |
-| `request.runtime` | 输入 | RuntimeFeedback | call/deopt/ROI | 当前进程代 |
-| result | 输出 | CompileDecision | variant 或有限原因码 | 不抛业务异常 |
+| `request.source_callable` | 输入 | WorkerLocalCallable? | CinderX 普通函数首选输入 | Worker-local |
+| `request.semantic_region` | 输入 | VerifiedTypedRegion? | 跨算子/无 bytecode 的可选输入 | Semantic IR v2 subset |
+| `request.framework_contract` | 输入 | FrameworkContract | schema、null、binding、layout/epoch | Worker 物理化 |
+| `request.external_assumptions` | 输入 | ExternalAssumption[] | Provider 无法自行恢复的外部条件 | 有来源和失效方式 |
+| `request.profile` | 输入 | RuntimeProfile? | call/deopt/ROI/转换成本 Hint | 可省略 |
+| result | 输出 | CompileDecision | variant + GuardCoverage 或有限原因码 | 不抛业务异常 |
 
 返回参数：
 
@@ -626,9 +663,10 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 | result | CompileDecision | 编译、延迟、不支持或失败 | 有限状态集合 |
 
 - 异常处理：内部错误转换为 compile failure 并写负缓存；业务执行继续 CPython 路径。
-- 约束说明：不得跨 Worker 复用 HIR/机器码；不得接受未验证 IR。
-- 变更说明：替代业务专用 intrinsic 作为主对接路径。
-- 调用参考代码：`decision = provider.compile_typed_region(bound_request)`。
+- 约束说明：两种输入至少一个有效；不得跨 Worker 复用 HIR/机器码；不得接受未验证 external Region；
+  Hint 缺失不得改变正确性。
+- 变更说明：替代 CinderX 专属 Core SPI；穿刺期 typed-region 入口下沉为 Provider 私有实现。
+- 调用参考代码：`decision = provider.compile(compile_request)`。
 
 ### 3.12.3 编程手册设计
 
@@ -643,17 +681,21 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 | Behavior / Type / Pattern 独立分析 | 已实现 | `compiler/typed_analysis.py` |
 | generator/显式循环的通用 capture | 已实现 P0 subset | `compiler/typed_frontend.py` |
 | Worker ROI、重分析、正/负缓存、规范 lowering | 已实现 | `provider/scalar_python/typed_loop.py` |
-| 默认值/closure/global/builtin 运行时依赖 Guard | 已实现 | `compiler/typed_frontend.py`、`provider/scalar_python/typed_loop.py` |
+| 默认值/closure/global/builtin 运行时依赖 Guard | 已实现 UDF JIT 外围 Guard；未对接 CinderX 原生 Guard/Deopt | `compiler/typed_frontend.py`、`provider/scalar_python/typed_loop.py` |
 | exact Unicode property 标量访问和归约 | 已实现，覆盖 6 种 property | CinderX `UnicodeData/Kind/Read/Classify` + 普通 CFG/HIR |
 | Source→Bytecode→IR→HIR→LIR→Machine provenance | 已实现 | `diagnostics/worker_runtime.py` + CinderX startup-gated provenance |
 | SequenceBuilder、ImmutableLookup、bool-class FSM | 已实现 exact-str subset | CinderX `PrimitiveTable*`、branch、`SequenceBuilder*` |
 | closure wrapper 去虚拟化/内联 | 已实现 | exact closure target `GuardIs` + generic inliner |
 | generator 编译稳定性和确定性失败负缓存 | 已实现 | 普通 generator lowering + bounded negative cache |
 | FineWeb 200K 简单 A/B | 已完成 | 执行耗时下降 18.36%，端到端下降 18.19% |
+| Provider-neutral SPI、GuardCoverage、CinderX callable-first | 待迁移 | 目标边界见 2026-08-06 多后端信息归属架构 |
 
 当前实现不含 `UnicodeCountProperty` 等整段循环 HIR。后端必须从已验证的 CFG、类型、表和 builder
 数据流构造普通 CinderX HIR；任一事实不成立即返回 unsupported。实现与最终验证证据见
 `docs/reports/2026-08-04-generic-sequence-patterns-validation.md`。
+
+上述 FineWeb 收益来自当前 external typed-region 穿刺路径，只证明通用 HIR/LIR 机制有优化潜力。它不证明
+UDF JIT 的 Guard、Behavior 或 plan 字段是 CinderX 必需输入，也不等价于 callable-first 目标路径已经完成。
 
 # 4 缺点和风险
 
@@ -666,7 +708,7 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 | 通用 Pass 仍可能隐含 workload 假设 | 伪通用、后续不可维护 | 跨业务 corpus + 禁止业务标识扫描 + reviewer gate |
 | 编译时间抵消收益 | full pipeline 退化 | AutoJIT threshold、Behavior risk、negative ROI backoff |
 | Unicode/regex 语义复杂 | 边界错误 | exact type/version Guard；regex 延后并限制语义子集 |
-| 直接 HIR Builder 耦合 CinderX | 双仓协调成本 | 对接仅存在 Worker Provider；Portable IR 保持独立 |
+| external-region HIR Builder 耦合 CinderX | 双仓协调成本 | 只存在版本绑定 CinderX Provider Plugin；普通 callable 优先原生前端 |
 | Breaking Change：IR v2 | 旧 Worker 无法加载 | 显式版本拒绝并回退，v1/v2 双读过渡 |
 
 # 5 现有技术
@@ -674,7 +716,8 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 1. CinderX AutoJIT `behavior_classifier` 已提供 Family、WorkDim、loop score、risk、code size 与动态阈值，
    本提案复用其准入思想，但不把 StructureKey 当作 IR。
 2. CinderX HIR 已具备 CFG、Phi、GuardType、exact built-in type、Unicode compare/subscript、Deopt 和
-   LIR/codegen 基础；本提案补充的是通用 typed region construction 和缺失的 iterator/Unicode lowering。
+   LIR/codegen 基础；目标优先补普通 callable 的 iterator/Unicode/lookup/builder 识别与 lowering，
+   external typed-region construction 只是可选 Provider 输入。
 3. 当前 Python UDF JIT Semantic Core IR 已有通用 operation、type/effect/exception 字段、canonical codec、
    verifier、region graph 和 provenance，可演进为 v2，而无需引入全新编译框架。
 4. 编译器领域的 CFG/SSA、loop canonicalization、reduction、escape analysis、automaton lowering 是成熟
@@ -683,8 +726,8 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 # 6 未解决问题
 
 1. Core IR v2 使用显式 `phi` 还是 block argument？建议在详细设计中选择一种，不能并存。
-2. CinderX HIR Builder adapter 放在 CinderX 仓还是 provider plugin，并如何稳定最小接口？
-3. Behavior Profile 是否进入 Artifact hint；若进入，Artifact format 是否需要 1.1？
+2. 是否存在除 UDF JIT 外第二个 external Semantic Region producer；若没有，adapter 固定留在 provider plugin。
+3. Behavior Profile 若进入 Artifact，只能作为可忽略 Hint；是否值得为此升级 Artifact format？
 4. 第一阶段 exact container 范围是仅 `str/range/tuple/list`，还是先限制为 `str/range`？
 5. generator expression 的最小合法子集和精确 Deopt 位置如何定义？
 6. Unicode property primitive 直接调用 CPython runtime table，还是复制稳定数据表？
@@ -698,6 +741,7 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 ## 7.1 参考资料
 
 - `docs/design/2026-07-13-python-udf-jit-architecture.md`
+- `docs/design/2026-08-06-multi-provider-information-ownership-architecture.md`
 - `docs/reports/2026-08-03-fineweb-udfjit-cinderx-backend-opportunity.md`
 - `docs/reports/evidence/2026-08-03-fineweb-backend-diagnostics-summary.json`
 - CinderX repository: `cinderx/Jit/behavior_classifier.h`
@@ -716,12 +760,13 @@ compile_typed_region(request: CinderXTypedRegionRequest)
 | Pattern Analysis | 从 IR 派生的循环、归约、状态机、查表、builder 等可失效分析结果 |
 | Call Model | 对 CPython/标准库稳定调用语义的版本化模型，不包含业务函数知识 |
 | Typed Region | Candidate Partitioner 选择出的、由某 Provider 声明支持的 Typed IR 子图 |
-| HIR Builder Adapter | Worker 内把 verified Typed Region 转换为当前 CinderX HIR 的版本化内部接口 |
+| HIR Builder Adapter | CinderX Provider Plugin 内把可选 verified external Region 转换为当前 CinderX HIR 的版本化私有接口 |
+| GuardCoverage | Provider/Dispatcher 对 consumed assumption 的机制、所有者、检查阶段和失败动作报告 |
 
 ## 7.3 文档更新计划
 
-1. RFC Approved 后更新 `2026-07-13-python-udf-jit-architecture.md` 中“专用 Bytecode/Intrinsic”表述。
+1. 已更新 `2026-07-13-python-udf-jit-architecture.md`，用 callable-first + Provider-neutral SPI 取代专用 Bytecode 主路径。
 2. 新增 Semantic Core IR v2 详细设计，冻结节点、类型、Verifier 和 canonical codec。
-3. 新增 CinderX Typed Region HIR Builder 详细设计，冻结 Guard/Deopt/ABI 接口。
+3. 新增 CinderX callable 原生识别/优化功能设计；external-region HIR Builder 只做 Provider Plugin 详细设计。
 4. 更新标量主线功能设计的支持范围、接口与 DFX；不直接修改历史版本而无修订记录。
 5. 更新 USERGUIDE 和诊断 schema 文档。

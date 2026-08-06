@@ -4,7 +4,7 @@
 
 RFC-001～RFC-008 的标量生产代码已经实现，并在提交 `eb97ee8a806f676cda8e1c9f78e6dedb5b501aca` 上通过单元、集成和 blue-98 三容器系统契约。真实三物理节点、Python 3.11.6 生产资格、供应链和首发业务证据尚未完成，因此当前状态是“标量阶段已实现，发布门禁待完成”，不是“发布就绪”。
 
-RFC-005 和 RFC-006 只完成标量槽位与标量 CinderX 路径。向量、Arrow 和批处理执行未实现；RFC-009～RFC-012 保持关闭。
+RFC-005 和 RFC-006 只完成标量槽位与 CinderX 穿刺路径。向量、Arrow、PyTorch、Native Kernel 和混合执行未实现；RFC-009 已按多后端信息归属架构重新进入 Draft，RFC-010～RFC-012 保持关闭。
 
 | RFC | 类别 | 特性 | 当前状态 |
 |---|---|---|---|
@@ -16,7 +16,7 @@ RFC-005 和 RFC-006 只完成标量槽位与标量 CinderX 路径。向量、Arr
 | [RFC-006](RFC-006-scalar-cinderx-jit.md) | 主线 | 标量 JIT | 标量阶段已实现；向量/批处理未实现 |
 | [RFC-007](RFC-007-guarded-execution.md) | 主线 | 守卫式执行 | 标量阶段已实现，发布门禁待完成 |
 | [RFC-008](RFC-008-runtime-governance.md) | 主线 | 运行治理 | 标量阶段已实现，发布门禁待完成 |
-| [RFC-009](RFC-009-mixed-execution-providers.md) | 后续 | 混合执行提供器 | 未实现、关闭 |
+| [RFC-009](RFC-009-mixed-execution-providers.md) | 后续 | 混合执行提供器 | Draft，方案边界已对齐，未实现 |
 | [RFC-010](RFC-010-columnar-execution.md) | 后续 | 列式执行 | 未实现、关闭 |
 | [RFC-011](RFC-011-sparse-batch-side-exit.md) | 后续 | 稀疏批次侧退出 | 未实现、关闭 |
 | [RFC-012](RFC-012-equivalent-semantic-rewrite.md) | 后续 | 等价语义回填 | 未实现、关闭 |
@@ -75,6 +75,7 @@ flowchart LR
 | `RuntimeVariant` | RFC-007 | RFC-008 | 承载守卫、多版本、缓存、侧退出和执行计数 |
 | `PolicySnapshot` / `GovernanceEvent` | RFC-008 | 适配器、编译器、工作节点 | 冻结模式、预算、权限和无业务值诊断 |
 | `DiagnosticPolicySnapshot` / `ProvenanceMap` / `DiagnosticBundle` | RFC-013 | 编译器、CinderX Bridge、Worker、诊断 CLI | 隔离诊断运行并连接源码、中间 IR、机器码和热点样本 |
+| `CompileRequest` / `SupportReport` / `CompiledVariant` / `GuardCoverage` | RFC-009 | Planner、Runtime Dispatcher、CinderX/Vectorized/PyTorch/Native Kernel Provider | 提供后端中立的能力探测、编译、执行、失效和正确性责任合同 |
 
 所有跨进程数据结构使用封闭字段和精确版本。当前制品格式 1.0 是首个正式格式；穿刺期对象、未知字段、其他版本和未来版本一律拒绝，不提供兼容或迁移路径。
 
