@@ -114,7 +114,7 @@ class _Entry:
     backend: ScalarSlotBackend
     generation: int
     token: str
-    borrow_token: str | None = None
+    borrow_token: object | None = None
     keepalive: Any = None
 
 
@@ -156,6 +156,80 @@ class BorrowedCapability(AbstractContextManager["BorrowedCapability"]):
             finally:
                 self._active = False
                 self._keepalive = None
+        return None
+
+
+class PreparedCapabilityPair(AbstractContextManager["PreparedCapabilityPair"]):
+    """Process-local, descriptor-validated pair for repeated scalar rows.
+
+    Static capability and descriptor authority is validated when the pair is
+    prepared.  Every row still opens and closes a native borrow, checks the
+    current process and pinned registry entries, and requires a fresh input
+    write before execution.
+    """
+
+    def __init__(
+        self,
+        registry: "CapabilityRegistry",
+        input_handle: CapabilityHandle,
+        output_handle: CapabilityHandle,
+        input_entry: _Entry,
+        output_entry: _Entry,
+    ) -> None:
+        self._registry = registry
+        self._input_handle = input_handle
+        self._output_handle = output_handle
+        self._input_entry = input_entry
+        self._output_entry = output_entry
+        self._input_descriptor = input_entry.descriptor
+        self._output_descriptor = output_entry.descriptor
+        self._process_identity = registry.process_identity
+        self._input_entry_token = input_entry.token
+        self._output_entry_token = output_entry.token
+        self._active = False
+        self._owner_thread: int | None = None
+
+    @property
+    def handles(self) -> tuple[CapabilityHandle, CapabilityHandle]:
+        return self._input_handle, self._output_handle
+
+    def __enter__(self) -> "PreparedCapabilityPair":
+        self._registry._begin_prepared_pair(self)
+        return self
+
+    def _require_active(self) -> None:
+        if not self._active:
+            raise CapabilityError(CapabilityRejectCode.NOT_BORROWED)
+        if self._owner_thread != threading.get_ident():
+            raise CapabilityError(CapabilityRejectCode.BORROW_MISMATCH)
+
+    def write_input(self, value: object) -> None:
+        self._require_active()
+        descriptor = self._input_descriptor
+        self._input_entry.backend.write_scalar(
+            value,
+            scalar_type=descriptor.scalar_type,
+            nullable=descriptor.nullable,
+        )
+
+    @property
+    def execution_handles(self) -> tuple[object, object]:
+        self._require_active()
+        return (
+            self._input_entry.backend.execution_handle(),
+            self._output_entry.backend.execution_handle(),
+        )
+
+    def load_output(self) -> object:
+        self._require_active()
+        descriptor = self._output_descriptor
+        return self._output_entry.backend.load_scalar(
+            scalar_type=descriptor.scalar_type,
+            nullable=descriptor.nullable,
+        )
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._registry._end_prepared_pair(self)
         return None
 
 
@@ -264,6 +338,24 @@ class CapabilityRegistry:
                 keepalive,
             )
 
+    def prepare_pair(
+        self,
+        input_handle: CapabilityHandle,
+        output_handle: CapabilityHandle,
+    ) -> PreparedCapabilityPair:
+        with self._lock:
+            input_entry = self._resolve(input_handle)
+            output_entry = self._resolve(output_handle)
+            if input_entry is output_entry:
+                raise CapabilityError(CapabilityRejectCode.ALREADY_BORROWED)
+            return PreparedCapabilityPair(
+                self,
+                input_handle,
+                output_handle,
+                input_entry,
+                output_entry,
+            )
+
     def guard_data_handle(self, handle: CapabilityHandle) -> _GuardedSlot:
         with self._lock:
             entry = self._resolve(handle)
@@ -314,6 +406,110 @@ class CapabilityRegistry:
     def _assert_current_process(self) -> None:
         if os.getpid() != self._identity.pid:
             raise CapabilityError(CapabilityRejectCode.PROCESS_MISMATCH)
+
+    def _validate_prepared_pair(self, pair: PreparedCapabilityPair) -> None:
+        self._assert_current_process()
+        if pair._registry is not self:
+            raise CapabilityError(CapabilityRejectCode.REGISTRY_MISMATCH)
+        if pair._process_identity is not self._identity:
+            raise CapabilityError(
+                CapabilityRejectCode.PROCESS_GENERATION_MISMATCH
+            )
+        for handle, entry, descriptor, entry_token in (
+            (
+                pair._input_handle,
+                pair._input_entry,
+                pair._input_descriptor,
+                pair._input_entry_token,
+            ),
+            (
+                pair._output_handle,
+                pair._output_entry,
+                pair._output_descriptor,
+                pair._output_entry_token,
+            ),
+        ):
+            current = self._entries.get(handle.access_id)
+            if current is not entry:
+                if current is not None or handle.access_id in self._last_generation:
+                    raise CapabilityError(
+                        CapabilityRejectCode.GENERATION_MISMATCH
+                    )
+                raise CapabilityError(CapabilityRejectCode.UNKNOWN_ACCESS)
+            if entry.generation != handle.generation:
+                raise CapabilityError(
+                    CapabilityRejectCode.GENERATION_MISMATCH
+                )
+            if entry.token is not entry_token:
+                raise CapabilityError(CapabilityRejectCode.TOKEN_MISMATCH)
+            if entry.descriptor is not descriptor:
+                raise CapabilityError(
+                    CapabilityRejectCode.DESCRIPTOR_MISMATCH
+                )
+
+    def _begin_prepared_pair(self, pair: PreparedCapabilityPair) -> None:
+        with self._lock:
+            self._validate_prepared_pair(pair)
+            if pair._active:
+                raise CapabilityError(CapabilityRejectCode.ALREADY_BORROWED)
+            input_entry = pair._input_entry
+            output_entry = pair._output_entry
+            if (
+                input_entry.borrow_token is not None
+                or output_entry.borrow_token is not None
+            ):
+                raise CapabilityError(CapabilityRejectCode.ALREADY_BORROWED)
+
+            input_entry.borrow_token = pair
+            try:
+                input_entry.keepalive = input_entry.backend.begin_borrow()
+            except BaseException:
+                input_entry.borrow_token = None
+                raise
+            self._active_borrows += 1
+            output_entry.borrow_token = pair
+            try:
+                output_entry.keepalive = output_entry.backend.begin_borrow()
+            except BaseException:
+                output_entry.borrow_token = None
+                try:
+                    input_entry.backend.end_borrow()
+                finally:
+                    input_entry.borrow_token = None
+                    input_entry.keepalive = None
+                    self._active_borrows -= 1
+                raise
+            self._active_borrows += 1
+            pair._owner_thread = threading.get_ident()
+            pair._active = True
+
+    def _end_prepared_pair(self, pair: PreparedCapabilityPair) -> None:
+        with self._lock:
+            if not pair._active:
+                raise CapabilityError(CapabilityRejectCode.NOT_BORROWED)
+            if pair._owner_thread != threading.get_ident():
+                raise CapabilityError(CapabilityRejectCode.BORROW_MISMATCH)
+            input_entry = pair._input_entry
+            output_entry = pair._output_entry
+            if (
+                input_entry.borrow_token is not pair
+                or output_entry.borrow_token is not pair
+            ):
+                raise CapabilityError(CapabilityRejectCode.BORROW_MISMATCH)
+            try:
+                output_entry.backend.end_borrow()
+            finally:
+                output_entry.borrow_token = None
+                output_entry.keepalive = None
+                self._active_borrows -= 1
+                try:
+                    input_entry.backend.end_borrow()
+                finally:
+                    input_entry.borrow_token = None
+                    input_entry.keepalive = None
+                    self._active_borrows -= 1
+                    pair._owner_thread = None
+                    pair._active = False
 
     def _resolve(self, handle: object) -> _Entry:
         self._assert_current_process()

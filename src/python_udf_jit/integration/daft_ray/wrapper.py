@@ -11,9 +11,14 @@ from python_udf_jit.integration.daft_ray.carrier import (
     ProductionCarrierState,
     ScalarCallView,
 )
+from python_udf_jit.integration.daft_ray.invocation_layout import (
+    EXACT_UNICODE_LAYOUT_KIND,
+    PYTHON_OBJECT_LAYOUT_KIND,
+    InvocationLayoutContract,
+)
 
 
-WRAPPER_SERIALIZATION_VERSION = 1
+WRAPPER_SERIALIZATION_VERSION = 2
 
 
 @dataclass
@@ -25,6 +30,7 @@ class FallbackOnlyWrapper:
     carrier: ProductionCarrierState
     logical_schema: str | None = None
     usage_context: str | None = None
+    invocation_layout: InvocationLayoutContract | None = None
     _worker_adapter: Any = field(default=None, init=False, repr=False, compare=False)
     _typed_loop_adapter: Any = field(
         default=None,
@@ -50,6 +56,8 @@ class FallbackOnlyWrapper:
         logical_schema: str,
         usage_context: str,
         artifact: bytes | None = None,
+        *,
+        invocation_layout: InvocationLayoutContract | None = None,
     ) -> bool:
         """Attach operation context once, before Daft serializes the finalized plan."""
 
@@ -57,6 +65,12 @@ class FallbackOnlyWrapper:
             return False
         self.logical_schema = logical_schema
         self.usage_context = usage_context
+        if invocation_layout is not None and not isinstance(
+            invocation_layout,
+            InvocationLayoutContract,
+        ):
+            raise TypeError("invocation layout contract required")
+        self.invocation_layout = invocation_layout
         if artifact is not None:
             publisher = None
             threshold = DEFAULT_INLINE_ARTIFACT_THRESHOLD
@@ -122,6 +136,7 @@ class FallbackOnlyWrapper:
             candidate_id=self.candidate_id,
             usage_context=self.usage_context,
             logical_schema=self.logical_schema,
+            invocation_layout=self.invocation_layout,
             carrier=self.carrier,
         )
 
@@ -145,8 +160,8 @@ class FallbackOnlyWrapper:
             or self.logical_schema is None
         ):
             return self._fallback(args, kwargs, "u2_fallback_only")
-        schema = self.logical_schema.lower()
-        if "string" in schema and "float64" not in schema:
+        layout = self.invocation_layout
+        if layout is not None and layout.layout_kind == EXACT_UNICODE_LAYOUT_KIND:
             if self._typed_loop_terminal_bypass:
                 return self.original_callable(*args, **kwargs)
             typed_adapter = self._typed_loop_adapter
@@ -157,6 +172,16 @@ class FallbackOnlyWrapper:
                 typed_adapter = None
                 self._typed_loop_adapter = None
             if typed_adapter is None:
+                # The cluster epoch is fixed for a Worker process. Validate it
+                # after deserialization/fork, before binding process-local state,
+                # and keep the per-row warm path free of environment lookups.
+                observed_epoch = os.environ.get("UDFJIT_CLUSTER_EPOCH", "")
+                if observed_epoch != layout.epoch:
+                    return self._fallback(
+                        args,
+                        kwargs,
+                        "layout_epoch_mismatch",
+                    )
                 try:
                     from python_udf_jit.integration.daft_ray.typed_loop_worker import (
                         build_worker_typed_loop_adapter,
@@ -176,6 +201,8 @@ class FallbackOnlyWrapper:
             if outcome.terminal:
                 self._typed_loop_terminal_bypass = True
             return self._fallback(args, kwargs, outcome.reason_code)
+        if layout is not None and layout.layout_kind == PYTHON_OBJECT_LAYOUT_KIND:
+            return self._fallback(args, kwargs, "candidate_layout_unsupported")
         if not self.carrier.finalized:
             return self._fallback(args, kwargs, "u2_fallback_only")
         adapter = self._worker_adapter

@@ -6,10 +6,13 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import unittest
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
+import python_udf_jit.integration.daft_ray.worker as worker_runtime
 from python_udf_jit.compiler.abstract_interpreter import analyze_function
 from python_udf_jit.compiler.capture import (
     CaptureRequest,
@@ -23,12 +26,17 @@ from python_udf_jit.compiler.region import form_semantic_region_graph
 from python_udf_jit.compiler.reference import reference_resume_semantic
 from python_udf_jit.diagnostics.report import InMemoryRuntimeReport
 from python_udf_jit.diagnostics.config import (
+    DiagnosticRuntimeContext,
     OFF_DIAGNOSTIC_POLICY,
+    resolve_diagnostic_policy,
 )
 from python_udf_jit.governance.policy import PolicySnapshot
 from python_udf_jit.integration.daft_ray.carrier import (
     InlineArtifactHandle,
     ProductionCarrierState,
+)
+from python_udf_jit.integration.daft_ray.invocation_layout import (
+    InvocationLayoutContract,
 )
 from python_udf_jit.integration.daft_ray.worker import (
     RuntimeTarget,
@@ -48,7 +56,11 @@ from python_udf_jit.protocol.manifest import (
     DEFAULT_MANIFEST,
     DependencyRequirement,
 )
-from python_udf_jit.provider.scalar_python.capability import CapabilityRegistry
+from python_udf_jit.provider.scalar_python.capability import (
+    CapabilityError,
+    CapabilityRegistry,
+    CapabilityRejectCode,
+)
 from python_udf_jit.provider.scalar_python.compiler import (
     compile_semantic_scalar_region,
 )
@@ -59,6 +71,7 @@ from python_udf_jit.provider.scalar_python.executor import (
 )
 from python_udf_jit.runtime.continuation import build_continuation_payload
 from python_udf_jit.runtime.layout import LocalScalarSlotBackend
+from python_udf_jit.runtime.physicalize import ScalarPhysicalizer
 from python_udf_jit.runtime.variant import WorkerProcessKey
 
 
@@ -160,6 +173,7 @@ class _LocalProviderFactory:
         self.compile_count = 0
         self.continuation_payload_count = 0
         self.continuation_payload_values = []
+        self.compiled_variants = []
 
     def compile(self, artifact, key, *, continuation=None):
         self.compile_count += 1
@@ -198,7 +212,7 @@ class _LocalProviderFactory:
             compiled.jit_function.__globals__[
                 "_udf_build_continuation_payload"
             ] = observed_payload
-        return ScalarProviderVariant(
+        variant = ScalarProviderVariant(
             key,
             compiled,
             registry,
@@ -208,6 +222,8 @@ class _LocalProviderFactory:
             (),
             continuation is not None,
         )
+        self.compiled_variants.append(variant)
+        return variant
 
 
 class _FailingProviderFactory:
@@ -278,17 +294,30 @@ class WorkerRuntimeTest(unittest.TestCase):
         )
         self.report = InMemoryRuntimeReport()
 
-    def adapter(self, provider, *, artifact_loader=None):
+    def adapter(
+        self,
+        provider,
+        *,
+        artifact_loader=None,
+        invocation_layout=None,
+        target_provider=None,
+    ):
         arguments = dict(
             candidate_id="candidate-a",
             original_callable=self.original,
             carrier=self.carrier,
             logical_schema="{'value': 'float64'}",
             context=self.context,
-            target_provider=lambda: self.target,
+            target_provider=(
+                (lambda: self.target)
+                if target_provider is None
+                else target_provider
+            ),
             provider_factory=provider,
             event_sink=self.report,
         )
+        if invocation_layout is not None:
+            arguments["invocation_layout"] = invocation_layout
         if artifact_loader is not None:
             arguments["artifact_loader"] = artifact_loader
         return WorkerScalarAdapter(**arguments)
@@ -315,6 +344,400 @@ class WorkerRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(len({event.variant_key for event in events if event.variant_key}), 1)
 
+    def test_diagnostics_off_keeps_the_existing_hot_event_sink(self):
+        adapter = self.adapter(_LocalProviderFactory())
+
+        self.assertIs(adapter._event_sink, self.report)
+        adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
+        with mock.patch.object(
+            adapter,
+            "_finalize_diagnostic_runtime",
+            side_effect=AssertionError("diagnostics off hot path polluted"),
+        ):
+            self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
+
+    def _diagnostic_adapter(self, root: Path, *, perf: bool = False):
+        profile = "full" if perf else "summary"
+        policy = resolve_diagnostic_policy(
+            {
+                "UDFJIT_DIAGNOSTICS": profile,
+                "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
+                "UDFJIT_DIAGNOSTIC_FILTER": "candidate:candidate-a",
+                "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                "UDFJIT_DIAGNOSTIC_PERF": "record" if perf else "off",
+                "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                "UDFJIT_DIAGNOSTIC_MAX_BYTES": "1048576",
+            },
+            DiagnosticRuntimeContext(
+                dedicated_worker=perf,
+                workspace_root=root / "workspace",
+                home_root=root / "home",
+            ),
+        )
+        payload = encoded_artifact()
+        carrier = ProductionCarrierState.placeholder(
+            "candidate-a",
+            "a" * 64,
+            diagnostic_policy=policy,
+        ).finalize(payload)
+        context = WorkerRuntimeContext(
+            "run-a",
+            self.process,
+            "partition-a",
+            "attempt-a",
+            diagnostic_policy=policy,
+            diagnostic_bootstrapped=perf,
+        )
+        return WorkerScalarAdapter(
+            candidate_id="candidate-a",
+            original_callable=self.original,
+            carrier=carrier,
+            logical_schema="{'value': 'float64'}",
+            context=context,
+            target_provider=lambda: self.target,
+            provider_factory=_LocalProviderFactory(),
+            event_sink=self.report,
+        )
+
+    def test_first_successful_hot_hit_publishes_diagnostic_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = self._diagnostic_adapter(root)
+
+            self.assertEqual(adapter.invoke((None, 2.0), {}), 7.0)
+            adapter.drain_compilation()
+            self.assertEqual(tuple((root / "diagnostics").glob("diagnostic-*")), ())
+
+            runtime = adapter._diagnostic_runtime
+            self.assertIsNotNone(runtime)
+            with mock.patch.object(
+                runtime,
+                "finalize",
+                wraps=runtime.finalize,
+            ) as finalize:
+                self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
+                self.assertEqual(adapter.invoke((None, 5.0), {}), 13.0)
+                finalize.assert_called_once_with()
+
+            bundles = tuple((root / "diagnostics").glob("diagnostic-*"))
+            self.assertEqual(len(bundles), 1)
+            self.assertTrue((bundles[0] / "COMPLETE").is_file())
+            adapter.close()
+            self.assertEqual(
+                len(tuple((root / "diagnostics").glob("diagnostic-*"))),
+                1,
+            )
+
+    def test_perf_record_waits_for_evidence_until_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = self._diagnostic_adapter(root, perf=True)
+
+            self.assertEqual(adapter.invoke((None, 2.0), {}), 7.0)
+            adapter.drain_compilation()
+            self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
+
+            self.assertEqual(tuple((root / "diagnostics").glob("diagnostic-*")), ())
+            adapter.close()
+            bundles = tuple((root / "diagnostics").glob("diagnostic-*"))
+            self.assertEqual(len(bundles), 1)
+            manifest = json.loads((bundles[0] / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "partial")
+
+    def test_hot_hit_finalize_failure_preserves_result_and_close_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = self._diagnostic_adapter(root)
+            runtime = adapter._diagnostic_runtime
+            self.assertIsNotNone(runtime)
+            real_finalize = runtime.finalize
+            finalize_calls = 0
+
+            def flaky_finalize():
+                nonlocal finalize_calls
+                finalize_calls += 1
+                if finalize_calls == 1:
+                    raise RuntimeError("controlled_finalize_failure")
+                return real_finalize()
+
+            with mock.patch.object(
+                runtime,
+                "finalize",
+                side_effect=flaky_finalize,
+            ):
+                self.assertEqual(adapter.invoke((None, 2.0), {}), 7.0)
+                adapter.drain_compilation()
+                self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
+                self.assertEqual(
+                    tuple((root / "diagnostics").glob("diagnostic-*")),
+                    (),
+                )
+                adapter.close()
+
+            self.assertEqual(finalize_calls, 2)
+            bundles = tuple((root / "diagnostics").glob("diagnostic-*"))
+            self.assertEqual(len(bundles), 1)
+            manifest = json.loads((bundles[0] / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "partial")
+            adapter.close()
+            self.assertEqual(finalize_calls, 2)
+
+    def test_swallowed_bundle_failure_remains_retryable_at_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = self._diagnostic_adapter(root)
+            runtime = adapter._diagnostic_runtime
+            self.assertIsNotNone(runtime)
+            writer = runtime._session._bundle_writer
+            self.assertIsNotNone(writer)
+            real_complete = writer.complete
+            complete_calls = 0
+
+            def flaky_complete(status):
+                nonlocal complete_calls
+                complete_calls += 1
+                if complete_calls == 1:
+                    raise OSError("controlled_bundle_failure")
+                return real_complete(status)
+
+            with mock.patch.object(
+                writer,
+                "complete",
+                side_effect=flaky_complete,
+            ):
+                self.assertEqual(adapter.invoke((None, 2.0), {}), 7.0)
+                adapter.drain_compilation()
+                self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
+                self.assertEqual(
+                    tuple((root / "diagnostics").glob("diagnostic-*")),
+                    (),
+                )
+                adapter.close()
+
+            self.assertEqual(complete_calls, 2)
+            bundles = tuple((root / "diagnostics").glob("diagnostic-*"))
+            self.assertEqual(len(bundles), 1)
+            manifest = json.loads((bundles[0] / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "partial")
+
+    def test_warm_hit_reuses_process_stable_guard_inputs(self):
+        target_provider = mock.Mock(return_value=self.target)
+        adapter = self.adapter(
+            _LocalProviderFactory(),
+            target_provider=target_provider,
+        )
+
+        with mock.patch.object(
+            worker_runtime,
+            "capture_identities",
+            wraps=worker_runtime.capture_identities,
+        ) as capture_spy:
+            with mock.patch.object(
+                worker_runtime,
+                "_sha256_text",
+                wraps=worker_runtime._sha256_text,
+            ) as sha_spy:
+                adapter.invoke((None, 2.0), {})
+                adapter.drain_compilation()
+                counts_after_initialization = (
+                    capture_spy.call_count,
+                    target_provider.call_count,
+                    sha_spy.call_count,
+                )
+
+                self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
+
+        self.assertEqual(
+            (
+                capture_spy.call_count,
+                target_provider.call_count,
+                sha_spy.call_count,
+            ),
+            counts_after_initialization,
+        )
+
+    def test_warm_hit_acquires_without_re_resolving_the_variant(self):
+        adapter = self.adapter(_LocalProviderFactory())
+        self.assertEqual(adapter.invoke((None, 2.0), {}), 7.0)
+        adapter.drain_compilation()
+        self.assertEqual(adapter.invoke((None, 3.0), {}), 9.0)
+
+        with mock.patch.object(
+            adapter._variants,
+            "resolve",
+            wraps=adapter._variants.resolve,
+        ) as resolve, mock.patch.object(
+            adapter._variants,
+            "acquire",
+            wraps=adapter._variants.acquire,
+        ) as acquire:
+            self.assertEqual(adapter.invoke((None, 4.0), {}), 11.0)
+
+        resolve.assert_not_called()
+        acquire.assert_called_once_with(adapter._key)
+        adapter.close()
+
+    def test_guard_overrides_keep_the_complete_slow_guard(self):
+        target_provider = mock.Mock(return_value=self.target)
+        adapter = self.adapter(
+            _LocalProviderFactory(),
+            target_provider=target_provider,
+        )
+        adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
+
+        with mock.patch.object(
+            worker_runtime,
+            "capture_identities",
+            wraps=worker_runtime.capture_identities,
+        ) as capture_spy:
+            with mock.patch.object(
+                worker_runtime,
+                "_sha256_text",
+                wraps=worker_runtime._sha256_text,
+            ) as sha_spy:
+                self.assertEqual(
+                    adapter.invoke(
+                        (None, 4.0),
+                        {},
+                        guard_overrides=WorkerGuardOverrides(),
+                    ),
+                    11.0,
+                )
+
+        self.assertGreater(capture_spy.call_count, 0)
+        self.assertGreater(target_provider.call_count, 1)
+        self.assertGreater(sha_spy.call_count, 0)
+
+    def test_replacing_wrapped_user_function_falls_back_before_provider_entry(self):
+        provider = _LocalProviderFactory()
+        adapter = self.adapter(provider)
+        adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
+        self.calls.clear()
+        event_count = len(self.report.snapshot())
+
+        def replacement(value):
+            return value + 100.0
+
+        wrapped = vars(self.original)["__wrapped__"]
+        vars(self.original)["__wrapped__"] = replacement
+        try:
+            result = adapter.invoke((None, 3.0), {})
+        finally:
+            vars(self.original)["__wrapped__"] = wrapped
+
+        self.assertEqual(result, 9.0)
+        self.assertEqual(self.calls, [3.0])
+        self.assertEqual(provider.compile_count, 1)
+        self.assertTrue(
+            any(
+                event.decision == "fallback"
+                and event.reason_code == "callable_mismatch"
+                for event in self.report.snapshot()[event_count:]
+            )
+        )
+
+    def test_replacing_user_code_falls_back_before_provider_entry(self):
+        provider = _LocalProviderFactory()
+        adapter = self.adapter(provider)
+        adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
+        self.calls.clear()
+        event_count = len(self.report.snapshot())
+
+        def replacement(value):
+            return value + 100.0
+
+        original_code = affine.__code__
+        affine.__code__ = replacement.__code__
+        try:
+            result = adapter.invoke((None, 3.0), {})
+        finally:
+            affine.__code__ = original_code
+
+        self.assertEqual(result, 103.0)
+        self.assertEqual(self.calls, [3.0])
+        self.assertEqual(provider.compile_count, 1)
+        self.assertTrue(
+            any(
+                event.decision == "fallback"
+                and event.reason_code == "callable_mismatch"
+                for event in self.report.snapshot()[event_count:]
+            )
+        )
+
+    def test_replacing_original_callable_code_falls_back_before_provider_entry(self):
+        provider = _LocalProviderFactory()
+        adapter = self.adapter(provider)
+        adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
+        self.calls.clear()
+        event_count = len(self.report.snapshot())
+
+        def replacement_factory(holder):
+            def replacement(_self, value):
+                holder.calls.append(value)
+                return value + 100.0
+
+            return replacement
+
+        replacement = replacement_factory(self)
+        original_code = self.original.__code__
+        self.original.__code__ = replacement.__code__
+        try:
+            result = adapter.invoke((None, 3.0), {})
+        finally:
+            self.original.__code__ = original_code
+
+        self.assertEqual(result, 103.0)
+        self.assertEqual(self.calls, [3.0])
+        self.assertEqual(provider.compile_count, 1)
+        self.assertTrue(
+            any(
+                event.decision == "fallback"
+                and event.reason_code == "callable_mismatch"
+                for event in self.report.snapshot()[event_count:]
+            )
+        )
+
+    def test_supported_hot_path_uses_provider_slot_without_second_physicalizer(self):
+        provider = _LocalProviderFactory()
+        adapter = self.adapter(provider)
+        adapter.invoke((None, 2.0), {})
+        adapter.drain_compilation()
+        self.calls.clear()
+
+        with mock.patch.object(
+            ScalarPhysicalizer,
+            "open_call",
+            side_effect=AssertionError("duplicate scalar physicalization"),
+        ):
+            result = adapter.invoke((None, 3.0), {})
+
+        self.assertEqual(result, 9.0)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(
+            any(
+                event.decision == "semantic_execute"
+                for event in self.report.snapshot()
+            )
+        )
+
+        variant = provider.compiled_variants[0]
+        with mock.patch.object(
+            ScalarPhysicalizer,
+            "close",
+            side_effect=AssertionError("duplicate scalar physicalizer close"),
+        ):
+            adapter.close()
+
+        for handle in (variant.input_handle, variant.output_handle):
+            with self.assertRaises(CapabilityError) as raised:
+                variant.registry.descriptor(handle)
+            self.assertIs(raised.exception.code, CapabilityRejectCode.UNKNOWN_ACCESS)
+
     def test_from_environment_refreshes_ray_task_id_when_partition_is_unset(self):
         runtime = SimpleNamespace(
             get_task_id=mock.Mock(side_effect=("task-build", "task-live"))
@@ -340,6 +763,36 @@ class WorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(attribution, ("task-live", ""))
         self.assertEqual(fake_ray.get_runtime_context.call_count, 2)
         self.assertEqual(runtime.get_task_id.call_count, 2)
+
+    def test_event_attribution_uses_the_process_local_ray_task_id(self):
+        context = WorkerRuntimeContext(
+            "run-a",
+            self.process,
+            "task-build",
+            "",
+            refresh_partition_from_ray=True,
+        )
+        task_id = SimpleNamespace(hex=mock.Mock(return_value="task-live"))
+        worker_module = ModuleType("ray._private.worker")
+        worker_module.global_worker = SimpleNamespace(current_task_id=task_id)
+        fake_ray = SimpleNamespace(
+            get_runtime_context=mock.Mock(
+                side_effect=AssertionError("public Ray context path is slower")
+            )
+        )
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "ray": fake_ray,
+                "ray._private.worker": worker_module,
+            },
+        ):
+            attribution = context.event_attribution()
+
+        self.assertEqual(attribution, ("task-live", ""))
+        task_id.hex.assert_called_once_with()
+        fake_ray.get_runtime_context.assert_not_called()
 
     def test_from_environment_freezes_diagnostics_once_at_worker_start(self):
         environment = {
@@ -374,6 +827,45 @@ class WorkerRuntimeTest(unittest.TestCase):
                 logical_schema="{'value': 'float64'}",
                 context=self.context,
             )
+
+    def test_worker_rejects_invocation_layout_epoch_mismatch(self):
+        layout = InvocationLayoutContract.for_types(
+            ("float64",),
+            "float64",
+            epoch="other-epoch",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "worker_invocation_layout_mismatch",
+        ):
+            self.adapter(
+                _LocalProviderFactory(),
+                invocation_layout=layout,
+            )
+
+    def test_artifact_type_mismatch_falls_back_before_provider(self):
+        layout = InvocationLayoutContract.for_types(
+            ("float32",),
+            "float64",
+            epoch="epoch-a",
+        )
+        provider = _LocalProviderFactory()
+
+        result = self.adapter(
+            provider,
+            invocation_layout=layout,
+        ).invoke((None, 2.0), {})
+
+        self.assertEqual(result, 7.0)
+        self.assertEqual(self.calls, [2.0])
+        self.assertEqual(provider.compile_count, 0)
+        self.assertTrue(
+            any(
+                event.reason_code == "schema_mismatch"
+                for event in self.report.snapshot()
+            )
+        )
 
     def test_policy_hash_and_job_namespace_bind_worker_managers(self):
         drifted = PolicySnapshot.mainline(
@@ -425,6 +917,69 @@ class WorkerRuntimeTest(unittest.TestCase):
         finally:
             first.close()
             second.close()
+
+    def test_shared_manager_can_evict_between_active_adapters(self):
+        policy = PolicySnapshot.mainline(
+            version="single-variant-test",
+            budgets={
+                "code_bytes": 1024 * 1024,
+                "compile_concurrency": 1,
+                "variant_limit": 1,
+            },
+        )
+        carrier = ProductionCarrierState.placeholder(
+            "candidate-a",
+            "a" * 64,
+            policy=policy,
+        ).finalize(encoded_artifact())
+        context = dataclasses.replace(
+            self.context,
+            run_id="single-variant-job",
+            policy=policy,
+        )
+        first_provider = _LocalProviderFactory()
+        second_provider = _LocalProviderFactory()
+
+        with mock.patch.object(
+            worker_runtime,
+            "CinderXScalarProviderFactory",
+            _LocalProviderFactory,
+        ):
+            first = WorkerScalarAdapter(
+                candidate_id="candidate-a",
+                original_callable=self.original,
+                carrier=carrier,
+                logical_schema="{'value': 'float64'}",
+                context=context,
+                target_provider=lambda: self.target,
+                provider_factory=first_provider,
+                event_sink=self.report,
+            )
+            second = WorkerScalarAdapter(
+                candidate_id="candidate-a",
+                original_callable=self.original,
+                carrier=carrier,
+                logical_schema="{'other': 'float64'}",
+                context=context,
+                target_provider=lambda: self.target,
+                provider_factory=second_provider,
+                event_sink=self.report,
+            )
+            try:
+                self.assertEqual(first.invoke((None, 2.0), {}), 7.0)
+                first.drain_compilation()
+                self.assertEqual(first.invoke((None, 3.0), {}), 9.0)
+
+                self.assertEqual(second.invoke((None, 4.0), {}), 11.0)
+                second.drain_compilation()
+                self.assertEqual(second.invoke((None, 5.0), {}), 13.0)
+
+                self.assertEqual(first_provider.compile_count, 1)
+                self.assertEqual(second_provider.compile_count, 1)
+                self.assertEqual(first._variants.budget_state()[0], 1)
+            finally:
+                first.close()
+                second.close()
 
     def test_each_invoke_freezes_one_ray_task_identity_for_all_events(self):
         provider = _LocalProviderFactory()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import functools
+import gc
+import inspect
 import json
 import sys
 import tempfile
@@ -54,6 +56,10 @@ def unsupported_opaque_middle(value: float) -> float:
     return prefix / 1.0
 
 
+def text_identity(_instance: object, value: str) -> str:
+    return value
+
+
 @functools.wraps(affine)
 def daft_affine_method(_instance: object, value: float) -> float:
     return affine(value)
@@ -76,14 +82,21 @@ def daft_unsupported_opaque_middle_method(
 
 
 class FakePyExpr:
+    def __init__(self, input_name="value"):
+        self.input_name = input_name
+
     def _hash(self):
         return id(self)
 
+    def to_field(self, schema):
+        dtype = schema[self.input_name]
+        return SimpleNamespace(dtype=lambda: dtype)
+
 
 class FakeExpression:
-    def __init__(self, worker_callable=None):
+    def __init__(self, worker_callable=None, *, input_name="value"):
         self.worker_callable = worker_callable
-        self._expr = FakePyExpr()
+        self._expr = FakePyExpr(input_name)
 
 
 class FakeComposedExpression(FakeExpression):
@@ -105,12 +118,29 @@ class FakeFunc:
         self.on_error = on_error
         self.max_retries = max_retries
         self.use_process = use_process
+        annotation = inspect.signature(method).return_annotation
+        self.return_dtype = {
+            float: "float64",
+            int: "int64",
+            str: "string",
+            "float": "float64",
+            "int": "int64",
+            "str": "string",
+        }.get(annotation, "int64")
         self.original_call_count = 0
 
     def __call__(self, *args, **kwargs):
         self.original_call_count += 1
-        if any(isinstance(value, FakeExpression) for value in (*args, *kwargs.values())):
-            return FakeExpression(self._method)
+        expression_inputs = tuple(
+            value
+            for value in (*args, *kwargs.values())
+            if isinstance(value, FakeExpression)
+        )
+        if expression_inputs:
+            return FakeExpression(
+                self._method,
+                input_name=expression_inputs[0]._expr.input_name,
+            )
         return self._method(None, *args, **kwargs)
 
 
@@ -163,6 +193,16 @@ class FakeDataFrame:
 class FakeFloatDataFrame(FakeDataFrame):
     def schema(self):
         return {"value": "float64"}
+
+
+class FakeMixedStringDataFrame(FakeDataFrame):
+    def schema(self):
+        return {"value": "string", "unrelated_numeric": "float64"}
+
+
+class FakeStringWithUnsupportedDataFrame(FakeDataFrame):
+    def schema(self):
+        return {"value": "string", "unrelated": object()}
 
 
 class InvalidSchemaDataFrame(FakeDataFrame):
@@ -481,7 +521,7 @@ class ControlHookTest(unittest.TestCase):
             (func.on_error, func.max_retries, func.use_process),
             before,
         )
-        self.assertEqual(registry.registration_count, 1)
+        self.assertEqual(registry.registration_count, 32)
         self.assertEqual(func.original_call_count, 32)
         self.assertTrue(
             all(
@@ -489,6 +529,53 @@ class ControlHookTest(unittest.TestCase):
                 for expression in expressions
             )
         )
+        self.assertEqual(
+            len({id(expression.worker_callable) for expression in expressions}),
+            32,
+        )
+
+    def test_reused_func_keeps_layout_local_to_each_expression(self):
+        registry = CandidateRegistry(
+            MANIFEST_SHA256,
+            job_namespace="layout-epoch",
+        )
+        target = target_for_objects(
+            SimpleNamespace(__version__="0.7.2"),
+            FakeFunc,
+            FakeMixedStringDataFrame,
+        )
+        result = install_daft_control_hooks(
+            daft_module=SimpleNamespace(__version__="0.7.2"),
+            func_class=FakeFunc,
+            dataframe_class=FakeMixedStringDataFrame,
+            expression_class=FakeExpression,
+            mode="auto",
+            registry=registry,
+            target=target,
+        )
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        try:
+            func = FakeFunc(text_identity)
+            text = func(FakeExpression(input_name="value"))
+            numeric = func(FakeExpression(input_name="unrelated_numeric"))
+
+            FakeMixedStringDataFrame().with_columns(
+                {"text": text, "numeric": numeric}
+            )
+
+            self.assertIsNot(text.worker_callable, numeric.worker_callable)
+            self.assertEqual(
+                text.worker_callable.invocation_layout.layout_kind,
+                "exact_unicode",
+            )
+            self.assertEqual(
+                numeric.worker_callable.invocation_layout.layout_kind,
+                "python_object",
+            )
+            self.assertEqual(registry.registration_count, 2)
+            self.assertEqual(registry.finalization_count, 2)
+        finally:
+            uninstall_daft_control_hooks(FakeFunc, FakeMixedStringDataFrame)
 
     def test_supported_float64_candidate_finalizes_a_real_inline_artifact(self):
         registry = CandidateRegistry(MANIFEST_SHA256)
@@ -519,6 +606,87 @@ class ControlHookTest(unittest.TestCase):
             self.assertEqual(len(record.semantic_region_hash), 64)
         finally:
             uninstall_daft_control_hooks(FakeFunc, FakeFloatDataFrame)
+
+    def test_string_candidate_ignores_unrelated_float_column_for_layout(self):
+        registry = CandidateRegistry(
+            MANIFEST_SHA256,
+            job_namespace="layout-epoch",
+        )
+        target = target_for_objects(
+            SimpleNamespace(__version__="0.7.2"),
+            FakeFunc,
+            FakeMixedStringDataFrame,
+        )
+        result = install_daft_control_hooks(
+            daft_module=SimpleNamespace(__version__="0.7.2"),
+            func_class=FakeFunc,
+            dataframe_class=FakeMixedStringDataFrame,
+            expression_class=FakeExpression,
+            mode="auto",
+            registry=registry,
+            target=target,
+        )
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        try:
+            expression = FakeFunc(text_identity)(FakeExpression())
+            FakeMixedStringDataFrame().with_column("result", expression)
+            record = registry.records()[0]
+
+            self.assertEqual(record.invocation_layout.input_types, ("string",))
+            self.assertEqual(record.invocation_layout.output_type, "string")
+            self.assertEqual(
+                record.invocation_layout.layout_kind,
+                "exact_unicode",
+            )
+            self.assertFalse(record.wrapper.carrier.finalized)
+        finally:
+            uninstall_daft_control_hooks(FakeFunc, FakeMixedStringDataFrame)
+
+    def test_candidate_layout_survives_unrelated_unsupported_column(self):
+        registry = CandidateRegistry(
+            MANIFEST_SHA256,
+            job_namespace="layout-epoch",
+        )
+        target = target_for_objects(
+            SimpleNamespace(__version__="0.7.2"),
+            FakeFunc,
+            FakeStringWithUnsupportedDataFrame,
+        )
+        result = install_daft_control_hooks(
+            daft_module=SimpleNamespace(__version__="0.7.2"),
+            func_class=FakeFunc,
+            dataframe_class=FakeStringWithUnsupportedDataFrame,
+            expression_class=FakeExpression,
+            mode="auto",
+            registry=registry,
+            target=target,
+        )
+        self.assertEqual(result.status, HookStatus.INSTALLED)
+        try:
+            expression = FakeFunc(text_identity)(FakeExpression())
+
+            FakeStringWithUnsupportedDataFrame().with_column(
+                "result",
+                expression,
+            )
+
+            wrapper = expression.worker_callable
+            self.assertEqual(registry.finalization_count, 1)
+            self.assertEqual(
+                wrapper.invocation_layout.layout_kind,
+                "exact_unicode",
+            )
+            diagnostic_schema = json.loads(wrapper.logical_schema)
+            self.assertEqual(diagnostic_schema["fields"], [])
+            self.assertEqual(
+                diagnostic_schema["unavailable_reason"],
+                "schema_type_unsupported",
+            )
+        finally:
+            uninstall_daft_control_hooks(
+                FakeFunc,
+                FakeStringWithUnsupportedDataFrame,
+            )
 
     def test_real_scalar_graph_break_finalizes_three_region_artifact(self):
         registry = CandidateRegistry(MANIFEST_SHA256)
@@ -675,7 +843,7 @@ class ControlHookTest(unittest.TestCase):
         self.assertIsInstance(expression.worker_callable, FallbackOnlyWrapper)
         self.assertEqual(func.original_call_count, 1)
 
-    def test_invalid_schema_fails_open_to_original_dataframe_operation(self):
+    def test_invalid_candidate_schema_finalizes_fallback_only(self):
         registry = CandidateRegistry(MANIFEST_SHA256)
         target = target_for_objects(
             SimpleNamespace(__version__="0.7.2"),
@@ -700,7 +868,14 @@ class ControlHookTest(unittest.TestCase):
 
             self.assertEqual(returned[0], "dataframe")
             self.assertEqual(dataframe.original_with_columns_count, 1)
-            self.assertEqual(registry.finalization_count, 0)
+            self.assertEqual(registry.finalization_count, 1)
+            self.assertIsNone(expression.worker_callable.invocation_layout)
+            self.assertEqual(
+                json.loads(expression.worker_callable.logical_schema)[
+                    "unavailable_reason"
+                ],
+                "schema_type_unsupported",
+            )
         finally:
             uninstall_daft_control_hooks(FakeFunc, InvalidSchemaDataFrame)
 
@@ -743,6 +918,18 @@ class ControlHookTest(unittest.TestCase):
         registry.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             registry.records()
+
+    def test_finalized_candidate_remains_observable_after_expression_gc(self):
+        _, registry = install()
+        expression = FakeFunc()(FakeExpression())
+        FakeDataFrame().with_column("answer", expression)
+
+        del expression
+        gc.collect()
+
+        records = registry.records()
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0].finalized)
 
     def test_registry_lru_eviction_removes_expression_lineage(self):
         registry = CandidateRegistry(MANIFEST_SHA256, max_candidates=1)

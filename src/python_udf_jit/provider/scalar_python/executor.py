@@ -9,6 +9,7 @@ from python_udf_jit.protocol.artifact import PortableUdfArtifact
 from python_udf_jit.provider.scalar_python.capability import (
     CapabilityHandle,
     CapabilityRegistry,
+    PreparedCapabilityPair,
 )
 from python_udf_jit.provider.scalar_python.compiler import (
     CompiledScalarFunction,
@@ -57,38 +58,47 @@ class PreSemanticsExecutionError(RuntimeError):
         super().__init__(reason_code)
 
 
+_LOAD_SCALAR_OUTPUT = object()
+
+
+def _execute_compiled_region(
+    compiled: Callable[[object, object], object],
+    arguments: tuple[object, object],
+    boundary: CommitBoundary,
+    continuation: InterpreterContinuation[object] | None,
+) -> object:
+    # This explicit transition is the conservative semantic entry. After it,
+    # no failure may replay the whole UDF.
+    boundary.commit()
+    region_result = compiled(*arguments)
+    if continuation is not None:
+        side_exit = side_exit_from_cinderx_result(
+            region_result,
+            contract=continuation.contract,
+            boundary=boundary,
+        )
+        if side_exit is not None:
+            region_result = side_exit
+    if isinstance(region_result, SideExit):
+        if region_result.boundary is not boundary:
+            raise ContinuationError("side_exit_boundary_mismatch")
+        if continuation is None:
+            raise ContinuationError("interpreter_continuation_missing")
+        return continuation.resume(region_result)
+    return _LOAD_SCALAR_OUTPUT
+
+
 class ScalarExecutor:
     """Synchronous two-slot borrow/write/execute/publish scope."""
 
     def __init__(self, registry: CapabilityRegistry) -> None:
         self._registry = registry
+        self._prepared_backend_pair: PreparedCapabilityPair | None = None
 
-    def _arguments(
+    def _validate_compiled_registry(
         self,
         compiled: Callable[[object, object], object],
-        input_handle: CapabilityHandle,
-        output_handle: CapabilityHandle,
-        input_execution_handle: object,
-        output_execution_handle: object,
-    ) -> tuple[object, object]:
-        argument_kind = getattr(
-            compiled,
-            "argument_kind",
-            "capability_pair",
-        )
-        if argument_kind == "capability_pair":
-            return input_handle, output_handle
-        if argument_kind == "backend_pair":
-            return input_execution_handle, output_execution_handle
-        raise ValueError("unknown compiled scalar argument kind")
-
-    def execute(
-        self,
-        compiled: Callable[[object, object], object],
-        input_handle: CapabilityHandle,
-        output_handle: CapabilityHandle,
-        value: object,
-    ) -> object:
+    ) -> None:
         compiled_registry_id = getattr(
             compiled,
             "registry_id",
@@ -101,6 +111,60 @@ class ScalarExecutor:
             raise ValueError(
                 "compiled scalar function belongs to another registry"
             )
+
+    def prepare_backend_pair(
+        self,
+        compiled: Callable[[object, object], object],
+        input_handle: CapabilityHandle,
+        output_handle: CapabilityHandle,
+    ) -> PreparedCapabilityPair:
+        self._validate_compiled_registry(compiled)
+        if getattr(compiled, "argument_kind", "capability_pair") != "backend_pair":
+            raise ValueError("compiled scalar function does not use backend arguments")
+        prepared = self._prepared_backend_pair
+        if prepared is None:
+            prepared = self._registry.prepare_pair(
+                input_handle,
+                output_handle,
+            )
+            self._prepared_backend_pair = prepared
+        elif prepared.handles != (input_handle, output_handle):
+            raise ValueError("scalar executor is already bound to another slot pair")
+        return prepared
+
+    def _arguments(
+        self,
+        compiled: Callable[[object, object], object],
+        input_handle: CapabilityHandle,
+        output_handle: CapabilityHandle,
+    ) -> tuple[object, object]:
+        argument_kind = getattr(
+            compiled,
+            "argument_kind",
+            "capability_pair",
+        )
+        if argument_kind == "capability_pair":
+            return input_handle, output_handle
+        raise ValueError("unknown compiled scalar argument kind")
+
+    def execute(
+        self,
+        compiled: Callable[[object, object], object],
+        input_handle: CapabilityHandle,
+        output_handle: CapabilityHandle,
+        value: object,
+    ) -> object:
+        self._validate_compiled_registry(compiled)
+        if getattr(compiled, "argument_kind", "capability_pair") == "backend_pair":
+            prepared = self.prepare_backend_pair(
+                compiled,
+                input_handle,
+                output_handle,
+            )
+            with prepared:
+                prepared.write_input(value)
+                compiled(*prepared.execution_handles)
+                return prepared.load_output()
         with self._registry.borrow(input_handle) as input_borrowed:
             with self._registry.borrow(output_handle) as output_borrowed:
                 input_borrowed.write_scalar(value)
@@ -108,8 +172,6 @@ class ScalarExecutor:
                     compiled,
                     input_handle,
                     output_handle,
-                    input_borrowed.execution_handle,
-                    output_borrowed.execution_handle,
                 )
                 compiled(*arguments)
                 guarded_output = self._registry.guard_data_handle(
@@ -133,56 +195,53 @@ class ScalarExecutor:
             raise TypeError("commit boundary required")
         boundary.require_pre_commit()
         try:
-            compiled_registry_id = getattr(
+            self._validate_compiled_registry(compiled)
+            argument_kind = getattr(
                 compiled,
-                "registry_id",
-                self._registry.registry_id,
+                "argument_kind",
+                "capability_pair",
             )
-            if (
-                compiled_registry_id is not None
-                and compiled_registry_id != self._registry.registry_id
-            ):
-                raise ValueError(
-                    "compiled scalar function belongs to another registry"
+            if argument_kind == "backend_pair":
+                prepared = self.prepare_backend_pair(
+                    compiled,
+                    input_handle,
+                    output_handle,
                 )
-            with self._registry.borrow(input_handle) as input_borrowed:
-                with self._registry.borrow(output_handle) as output_borrowed:
-                    input_borrowed.write_scalar(value)
-                    arguments = self._arguments(
+                with prepared:
+                    prepared.write_input(value)
+                    arguments = prepared.execution_handles
+                    execution_result = _execute_compiled_region(
                         compiled,
-                        input_handle,
-                        output_handle,
-                        input_borrowed.execution_handle,
-                        output_borrowed.execution_handle,
+                        arguments,
+                        boundary,
+                        continuation,
                     )
-                    # This explicit transition is the conservative semantic
-                    # entry. After it, no failure may replay the whole UDF.
-                    boundary.commit()
-                    region_result = compiled(*arguments)
-                    if continuation is not None:
-                        side_exit = side_exit_from_cinderx_result(
-                            region_result,
-                            contract=continuation.contract,
-                            boundary=boundary,
+                    if execution_result is not _LOAD_SCALAR_OUTPUT:
+                        return execution_result
+                    result = prepared.load_output()
+            else:
+                with self._registry.borrow(input_handle) as input_borrowed:
+                    with self._registry.borrow(output_handle) as output_borrowed:
+                        input_borrowed.write_scalar(value)
+                        arguments = self._arguments(
+                            compiled,
+                            input_handle,
+                            output_handle,
                         )
-                        if side_exit is not None:
-                            region_result = side_exit
-                    if isinstance(region_result, SideExit):
-                        if region_result.boundary is not boundary:
-                            raise ContinuationError(
-                                "side_exit_boundary_mismatch"
-                            )
-                        if continuation is None:
-                            raise ContinuationError(
-                                "interpreter_continuation_missing"
-                            )
-                        return continuation.resume(region_result)
-                    guarded_output = self._registry.guard_data_handle(
-                        output_handle
-                    )
-                    result = self._registry.data_load_scalar(
-                        guarded_output
-                    )
+                        execution_result = _execute_compiled_region(
+                            compiled,
+                            arguments,
+                            boundary=boundary,
+                            continuation=continuation,
+                        )
+                        if execution_result is not _LOAD_SCALAR_OUTPUT:
+                            return execution_result
+                        guarded_output = self._registry.guard_data_handle(
+                            output_handle
+                        )
+                        result = self._registry.data_load_scalar(
+                            guarded_output
+                        )
         except PreSemanticsExecutionError:
             raise
         except BaseException as error:
@@ -204,6 +263,16 @@ class ScalarProviderVariant:
     executor: ScalarExecutor
     intrinsic_counts: tuple[tuple[str, int], ...]
     continuation_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if getattr(self.compiled, "argument_kind", "capability_pair") == "backend_pair":
+            self.executor.prepare_backend_pair(
+                self.compiled,
+                self.input_handle,
+                self.output_handle,
+            )
+        else:
+            self.preflight_descriptor()
 
     @property
     def code_hash(self) -> str:
@@ -243,14 +312,6 @@ class ScalarProviderVariant:
         boundary: CommitBoundary,
         continuation: InterpreterContinuation[object] | None = None,
     ) -> object:
-        try:
-            self.preflight_descriptor()
-        except PreSemanticsExecutionError:
-            raise
-        except BaseException as error:
-            raise PreSemanticsExecutionError(
-                f"descriptor_preflight_failed:{type(error).__name__}"
-            ) from error
         return self.executor.execute_guarded(
             self.compiled,
             self.input_handle,

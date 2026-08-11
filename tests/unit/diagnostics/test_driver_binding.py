@@ -42,6 +42,10 @@ def string_clean(value: str) -> str:
     return value.strip()
 
 
+def int_identity(value: int) -> int:
+    return value
+
+
 def opaque_float(value: float) -> float:
     print(value)
     return value + 1.0
@@ -60,14 +64,36 @@ def daft_string_method(_instance: object, value: str) -> str:
     return string_clean(value)
 
 
+@functools.wraps(int_identity)
+def daft_int_method(_instance: object, value: int) -> int:
+    return int_identity(value)
+
+
 class _FakeFunc:
     def __init__(self) -> None:
         self._method = daft_string_method
 
 
+class _FakeIntFunc:
+    def __init__(self) -> None:
+        self._method = daft_int_method
+        self.return_dtype = "int64"
+
+
 class _FakePyExpr:
     def _hash(self) -> int:
         return id(self)
+
+    def to_field(self, schema):
+        return _FakeField(next(iter(schema.values())))
+
+
+class _FakeField:
+    def __init__(self, dtype) -> None:
+        self._dtype = dtype
+
+    def dtype(self):
+        return self._dtype
 
 
 class _FakeExpression:
@@ -83,6 +109,11 @@ class _StringDataFrame:
 class _FloatDataFrame:
     def schema(self):
         return {"value": "float64"}
+
+
+class _IntDataFrame:
+    def schema(self):
+        return {"value": "int64"}
 
 
 class DriverDiagnosticBindingTests(unittest.TestCase):
@@ -182,7 +213,11 @@ class DriverDiagnosticBindingTests(unittest.TestCase):
             function = _FakeFunc()
             expression = _FakeExpression()
             record = registry.register(function, function._method)
-            registry.bind_expression(expression, record)
+            registry.bind_expression(
+                expression,
+                record,
+                invocation_args=(),
+            )
 
             finalized = registry.finalize_operation(
                 _StringDataFrame(),
@@ -228,7 +263,7 @@ class DriverDiagnosticBindingTests(unittest.TestCase):
             self.assertEqual(capture_result["stage"], "adapter")
             self.assertEqual(
                 capture_result["reason_code"],
-                "logical_schema_not_float64",
+                "candidate_layout_unavailable",
             )
             chain = read_json_artifact(
                 bundle,
@@ -238,7 +273,7 @@ class DriverDiagnosticBindingTests(unittest.TestCase):
             self.assertEqual(chain["original_bytecode"], "available")
             self.assertEqual(
                 chain["capture"]["unavailable_reason"],
-                "logical_schema_not_float64",
+                "candidate_layout_unavailable",
             )
             self.assertEqual(
                 chain["machine"]["unavailable_reason"],
@@ -257,6 +292,46 @@ class DriverDiagnosticBindingTests(unittest.TestCase):
                 )
             )
             self.assertNotIn("source/source.py", paths)
+
+    def test_provider_ineligible_layout_reports_provider_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = self._full_policy(root, int_identity)
+            registry = CandidateRegistry(
+                MANIFEST_SHA256,
+                diagnostic_policy=policy,
+                diagnostic_run_id="run-a",
+                diagnostic_runtime_mode="auto",
+                diagnostic_process_key="driver-1",
+            )
+            function = _FakeIntFunc()
+            expression = _FakeExpression()
+            record = registry.register(function, function._method)
+            registry.bind_expression(
+                expression,
+                record,
+                invocation_args=(expression,),
+            )
+
+            finalized = registry.finalize_operation(
+                _IntDataFrame(),
+                "with_columns",
+                ({"value": expression},),
+                {},
+            )
+
+            self.assertEqual(finalized, 1)
+            bundles = tuple((root / "diagnostics").glob("diagnostic-*"))
+            self.assertEqual(len(bundles), 1)
+            capture_result = read_json_artifact(
+                read_bundle(bundles[0]),
+                "capture/result.json",
+            )
+            self.assertEqual(capture_result["stage"], "adapter")
+            self.assertEqual(
+                capture_result["reason_code"],
+                "candidate_layout_provider_unavailable",
+            )
 
     def test_semantic_rejection_retains_capture_and_cfg(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -379,18 +454,26 @@ class DriverDiagnosticBindingTests(unittest.TestCase):
             )
             expression = _FakeExpression()
             record = registry.register(affine_float, affine_float)
-            registry.bind_expression(expression, record)
+            affine_float.return_dtype = "float64"
+            registry.bind_expression(
+                expression,
+                record,
+                invocation_args=(expression,),
+            )
 
-            with mock.patch(
-                "python_udf_jit.integration.daft_ray.registry.encode_artifact",
-                side_effect=RuntimeError("encoding_failed"),
-            ):
-                finalized = registry.finalize_operation(
-                    _FloatDataFrame(),
-                    "with_columns",
-                    ({"value": expression},),
-                    {},
-                )
+            try:
+                with mock.patch(
+                    "python_udf_jit.integration.daft_ray.registry.encode_artifact",
+                    side_effect=RuntimeError("encoding_failed"),
+                ):
+                    finalized = registry.finalize_operation(
+                        _FloatDataFrame(),
+                        "with_columns",
+                        ({"value": expression},),
+                        {},
+                    )
+            finally:
+                del affine_float.return_dtype
 
             self.assertEqual(finalized, 1)
             self.assertEqual(registry.diagnostic_failure_count, 0)

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
+import dis
 import json
 import inspect
 import re
 import unittest
 from unittest import mock
 
+from python_udf_jit.compiler import typed_frontend
 from python_udf_jit.compiler.typed_analysis import analyze_typed_module
 from python_udf_jit.compiler.typed_frontend import (
     TypedCaptureError,
@@ -770,6 +772,45 @@ class TypedLoopFrontendTests(unittest.TestCase):
                     numeric_total,
                     input_types=(self._integer_sequence(),),
                 )
+
+    def test_source_identity_tolerates_bytecode_encoding_only_drift(self) -> None:
+        strict_key = typed_frontend._code_semantic_key
+
+        def compiler_specific_key(code):
+            return (*strict_key(code), code is numeric_total.__code__)
+
+        with mock.patch.object(
+            typed_frontend,
+            "_code_semantic_key",
+            side_effect=compiler_specific_key,
+        ):
+            captured = capture_typed_loop(
+                numeric_total,
+                input_types=(self._integer_sequence(),),
+            )
+
+        self.assertEqual(captured.code_sha256, captured.module.function_id)
+
+    def test_normalized_source_identity_preserves_jump_targets(self) -> None:
+        jump = next(
+            instruction
+            for instruction in dis.get_instructions(
+                numeric_total,
+                adaptive=False,
+            )
+            if instruction.opcode in {*dis.hasjabs, *dis.hasjrel}
+        )
+        self.assertIsNotNone(jump.arg)
+        mutated_bytes = bytearray(numeric_total.__code__.co_code)
+        mutated_bytes[jump.offset + 1] = jump.arg - 2
+        mutated = numeric_total.__code__.replace(co_code=bytes(mutated_bytes))
+
+        self.assertNotEqual(
+            typed_frontend._normalized_code_semantic_key(
+                numeric_total.__code__
+            ),
+            typed_frontend._normalized_code_semantic_key(mutated),
+        )
 
     def test_every_operation_has_an_absolute_source_line(self) -> None:
         captured = capture_typed_loop(

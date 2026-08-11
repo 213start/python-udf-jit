@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import operator
 import os
@@ -14,6 +15,9 @@ from python_udf_jit.integration.daft_ray.carrier import (
     CarrierContractError,
     ProductionCarrierState,
     ScalarCallView,
+)
+from python_udf_jit.integration.daft_ray.invocation_layout import (
+    InvocationLayoutContract,
 )
 from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
 
@@ -91,7 +95,7 @@ print(base64.b64encode(wrapper.scalar_call_view().to_bytes()).decode("ascii"))
             ),
         )
         document = json.loads(view.to_bytes())
-        document["schema_version"] = 2
+        document["schema_version"] = 3
 
         with self.assertRaisesRegex(
             CarrierContractError,
@@ -109,6 +113,33 @@ print(base64.b64encode(wrapper.scalar_call_view().to_bytes()).decode("ascii"))
             ScalarCallView.from_bytes(
                 json.dumps(document, sort_keys=True).encode("ascii")
             )
+
+    def test_layout_call_view_uses_explicit_version_two_hash(self):
+        logical_schema = '{"fields":[],"schema_version":1}'
+        layout = InvocationLayoutContract.for_types(
+            ("float64",),
+            "float64",
+            epoch="epoch-a",
+        )
+        view = ScalarCallView.from_carrier(
+            candidate_id="candidate-layout",
+            usage_context="projection",
+            logical_schema=logical_schema,
+            invocation_layout=layout,
+            carrier=ProductionCarrierState.placeholder(
+                "candidate-layout",
+                "c" * 64,
+            ),
+        )
+
+        restored = ScalarCallView.from_bytes(view.to_bytes())
+
+        self.assertEqual(restored.schema_version, 2)
+        self.assertEqual(
+            restored.logical_schema_sha256,
+            hashlib.sha256(logical_schema.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(restored.invocation_layout_sha256, layout.sha256)
 
 
 if __name__ == "__main__":

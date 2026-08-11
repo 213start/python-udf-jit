@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
+import python_udf_jit.runtime.variant as variant_runtime
 from python_udf_jit.runtime.variant import (
     CacheDecision,
     ProcessVariantCache,
@@ -88,6 +90,24 @@ class ProcessVariantCacheTest(unittest.TestCase):
 
         self.assertEqual(result.decision, CacheDecision.MISMATCH)
         self.assertNotEqual(key(self.process).sha256, key(other).sha256)
+
+    def test_sha256_is_cached_without_changing_key_identity(self):
+        variant_key = key(self.process)
+        equivalent = key(self.process)
+        key_hash = hash(variant_key)
+        digest = variant_key.sha256
+
+        with mock.patch.object(
+            variant_runtime.json,
+            "dumps",
+            side_effect=AssertionError("variant digest recomputed"),
+        ):
+            self.assertEqual(variant_key.sha256, digest)
+
+        self.assertEqual(variant_key, equivalent)
+        self.assertEqual(hash(variant_key), key_hash)
+        self.assertEqual(hash(variant_key), hash(equivalent))
+        self.assertEqual({variant_key: "cached"}[equivalent], "cached")
 
 
 if __name__ == "__main__":

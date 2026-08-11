@@ -179,7 +179,9 @@ class DiagnosticSession:
         self._dropped = 0
         self._failures = 0
         self._lock = threading.Lock()
+        self._finalize_lock = threading.Lock()
         self._finalized = False
+        self._stage_artifact_recorded = False
 
     @staticmethod
     def _safe_name(value: str, *, allow_empty: bool = False) -> str:
@@ -306,31 +308,40 @@ class DiagnosticSession:
         return canonical_json_bytes(document)
 
     def finalize(self, status: BundleStatus) -> BundleRef | None:
-        if self._finalized:
-            return None
-        self._finalized = True
-        if self._bundle_writer is None:
-            return None
-        try:
-            with self._lock:
-                degraded = (
-                    self._dropped > 0
-                    or self._failures > 0
-                    or any(profile.failed for profile in self._profiles)
-                )
-            if status is BundleStatus.COMPLETE and degraded:
-                status = BundleStatus.PARTIAL
-            self._bundle_writer.add(
-                "reports/stages.json",
-                "application/json",
-                self._stage_payload(),
-                {"layer": "reports"},
-            )
-            if status is BundleStatus.INCOMPLETE:
-                return self._bundle_writer.abort("diagnostic_incomplete")
-            return self._bundle_writer.complete(status)
-        except Exception:
-            return None
+        with self._finalize_lock:
+            if self._finalized:
+                return None
+            if self._bundle_writer is None:
+                self._finalized = True
+                return None
+            try:
+                with self._lock:
+                    degraded = (
+                        self._dropped > 0
+                        or self._failures > 0
+                        or any(profile.failed for profile in self._profiles)
+                    )
+                if status is BundleStatus.COMPLETE and degraded:
+                    status = BundleStatus.PARTIAL
+                if not self._stage_artifact_recorded:
+                    self._bundle_writer.add(
+                        "reports/stages.json",
+                        "application/json",
+                        self._stage_payload(),
+                        {"layer": "reports"},
+                    )
+                    self._stage_artifact_recorded = True
+                if status is BundleStatus.INCOMPLETE:
+                    bundle_ref = self._bundle_writer.abort(
+                        "diagnostic_incomplete"
+                    )
+                else:
+                    bundle_ref = self._bundle_writer.complete(status)
+            except Exception:
+                self._record_failure()
+                return None
+            self._finalized = True
+            return bundle_ref
 
 
 def open_diagnostic_session(

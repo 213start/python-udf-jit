@@ -320,6 +320,84 @@ class WorkerDiagnosticBindingTests(unittest.TestCase):
             perf_provider.assert_not_called()
             self.assertFalse((root / "diagnostics").exists())
 
+    def test_mismatched_udf_selector_does_not_open_a_worker_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code_hash = code_identity_from_code(_identity.__code__).sha256
+            mismatched_prefix = "0" if not code_hash.startswith("0") else "1"
+            policy = resolve_diagnostic_policy(
+                {
+                    "UDFJIT_DIAGNOSTICS": "summary",
+                    "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
+                    "UDFJIT_DIAGNOSTIC_FILTER": f"udf:{mismatched_prefix}",
+                    "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                    "UDFJIT_DIAGNOSTIC_PERF": "off",
+                    "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                    "UDFJIT_DIAGNOSTIC_MAX_BYTES": "1048576",
+                },
+                DiagnosticRuntimeContext(
+                    workspace_root=root / "workspace",
+                    home_root=root / "home",
+                ),
+            )
+            carrier = ProductionCarrierState.placeholder(
+                "candidate-a",
+                "a" * 64,
+                diagnostic_policy=policy,
+            ).finalize(b"opaque")
+
+            adapter = WorkerScalarAdapter(
+                candidate_id="candidate-a",
+                original_callable=_identity,
+                carrier=carrier,
+                logical_schema="schema",
+                context=self._context(policy),
+            )
+
+            self.assertIsNone(adapter._diagnostic_runtime)
+            self.assertIsNone(adapter._provider_factory._diagnostic_observer)
+            adapter.close()
+            self.assertFalse((root / "diagnostics").exists())
+
+    def test_matching_udf_selector_still_opens_a_worker_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code_hash = code_identity_from_code(_identity.__code__).sha256
+            policy = resolve_diagnostic_policy(
+                {
+                    "UDFJIT_DIAGNOSTICS": "summary",
+                    "UDFJIT_DIAGNOSTIC_DIR": str(root / "diagnostics"),
+                    "UDFJIT_DIAGNOSTIC_FILTER": f"udf:{code_hash[:16]}",
+                    "UDFJIT_DIAGNOSTIC_SOURCE": "ranges",
+                    "UDFJIT_DIAGNOSTIC_PERF": "off",
+                    "UDFJIT_DIAGNOSTIC_SAMPLE_RATE": "1",
+                    "UDFJIT_DIAGNOSTIC_MAX_BYTES": "1048576",
+                },
+                DiagnosticRuntimeContext(
+                    workspace_root=root / "workspace",
+                    home_root=root / "home",
+                ),
+            )
+            carrier = ProductionCarrierState.placeholder(
+                "candidate-a",
+                "a" * 64,
+                diagnostic_policy=policy,
+            ).finalize(b"opaque")
+            adapter = WorkerScalarAdapter(
+                candidate_id="candidate-a",
+                original_callable=_identity,
+                carrier=carrier,
+                logical_schema="schema",
+                context=self._context(policy),
+            )
+
+            self.assertIsNotNone(adapter._diagnostic_runtime)
+            adapter.close()
+            self.assertEqual(
+                len(tuple((root / "diagnostics").glob("diagnostic-*"))),
+                1,
+            )
+
     def test_full_binds_an_observer_and_finalizes_a_private_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

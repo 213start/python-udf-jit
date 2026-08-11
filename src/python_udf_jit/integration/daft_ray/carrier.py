@@ -6,6 +6,10 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from python_udf_jit.integration.daft_ray.invocation_layout import (
+    InvocationLayoutContract,
+)
+
 from python_udf_jit.diagnostics.config import (
     DiagnosticPolicySnapshot,
     OFF_DIAGNOSTIC_POLICY,
@@ -66,6 +70,7 @@ class ScalarCallView:
     content_sha256: str
     policy_sha256: str
     size_bytes: int
+    invocation_layout_sha256: str | None = None
 
     @classmethod
     def from_carrier(
@@ -74,10 +79,11 @@ class ScalarCallView:
         candidate_id: str,
         usage_context: str,
         logical_schema: str,
+        invocation_layout: InvocationLayoutContract | None = None,
         carrier: "ProductionCarrierState",
     ) -> "ScalarCallView":
         view = cls(
-            schema_version=1,
+            schema_version=(1 if invocation_layout is None else 2),
             candidate_id=candidate_id,
             usage_context=usage_context,
             logical_schema_sha256=_sha256(logical_schema.encode("utf-8")),
@@ -86,24 +92,32 @@ class ScalarCallView:
             content_sha256=carrier.handle.content_sha256,
             policy_sha256=carrier.policy.sha256,
             size_bytes=carrier.handle.size_bytes,
+            invocation_layout_sha256=(
+                None if invocation_layout is None else invocation_layout.sha256
+            ),
         )
         view._validate()
         return view
 
     def to_bytes(self) -> bytes:
         self._validate()
+        document = {
+            "candidate_id": self.candidate_id,
+            "carrier_schema_version": self.carrier_schema_version,
+            "content_sha256": self.content_sha256,
+            "handle_kind": self.handle_kind,
+            "logical_schema_sha256": self.logical_schema_sha256,
+            "policy_sha256": self.policy_sha256,
+            "schema_version": self.schema_version,
+            "size_bytes": self.size_bytes,
+            "usage_context": self.usage_context,
+        }
+        if self.schema_version == 2:
+            document["invocation_layout_sha256"] = (
+                self.invocation_layout_sha256
+            )
         return json.dumps(
-            {
-                "candidate_id": self.candidate_id,
-                "carrier_schema_version": self.carrier_schema_version,
-                "content_sha256": self.content_sha256,
-                "handle_kind": self.handle_kind,
-                "logical_schema_sha256": self.logical_schema_sha256,
-                "policy_sha256": self.policy_sha256,
-                "schema_version": self.schema_version,
-                "size_bytes": self.size_bytes,
-                "usage_context": self.usage_context,
-            },
+            document,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -113,6 +127,15 @@ class ScalarCallView:
     def from_bytes(cls, payload: bytes) -> "ScalarCallView":
         try:
             document = json.loads(payload.decode("ascii"))
+            if type(document) is not dict:
+                raise CarrierContractError(
+                    "scalar call view fields do not match the formal schema"
+                )
+            version = document.get("schema_version")
+            if type(version) is not int or version not in {1, 2}:
+                raise CarrierContractError(
+                    "unsupported scalar call view version"
+                )
             expected = {
                 "candidate_id",
                 "carrier_schema_version",
@@ -124,7 +147,9 @@ class ScalarCallView:
                 "size_bytes",
                 "usage_context",
             }
-            if type(document) is not dict or set(document) != expected:
+            if version == 2:
+                expected.add("invocation_layout_sha256")
+            if set(document) != expected:
                 raise CarrierContractError(
                     "scalar call view fields do not match the formal schema"
                 )
@@ -138,6 +163,9 @@ class ScalarCallView:
                 content_sha256=document["content_sha256"],
                 policy_sha256=document["policy_sha256"],
                 size_bytes=document["size_bytes"],
+                invocation_layout_sha256=document.get(
+                    "invocation_layout_sha256"
+                ),
             )
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as error:
             raise CarrierContractError(f"invalid scalar call view: {error}") from error
@@ -147,7 +175,7 @@ class ScalarCallView:
     def _validate(self) -> None:
         if (
             type(self.schema_version) is not int
-            or self.schema_version != 1
+            or self.schema_version not in {1, 2}
             or type(self.carrier_schema_version) is not int
             or self.carrier_schema_version != 1
         ):
@@ -170,6 +198,20 @@ class ScalarCallView:
         _require_sha256(self.logical_schema_sha256, "logical_schema_sha256")
         _require_sha256(self.content_sha256, "content_sha256")
         _require_sha256(self.policy_sha256, "policy_sha256")
+        if self.schema_version == 1:
+            if self.invocation_layout_sha256 is not None:
+                raise CarrierContractError(
+                    "version 1 scalar call view cannot carry a layout hash"
+                )
+        elif type(self.invocation_layout_sha256) is not str:
+            raise CarrierContractError(
+                "version 2 scalar call view requires a layout hash"
+            )
+        else:
+            _require_sha256(
+                self.invocation_layout_sha256,
+                "invocation_layout_sha256",
+            )
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import pickle
 import threading
 import time
@@ -33,13 +35,39 @@ from python_udf_jit.governance.policy import (
     PolicySnapshot,
 )
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
-from python_udf_jit.integration.daft_ray.schema import canonicalize_schema
+from python_udf_jit.integration.daft_ray.invocation_layout import (
+    EXACT_UNICODE_LAYOUT_KIND,
+    SCALAR_SLOT_LAYOUT_KIND,
+    InvocationLayoutContract,
+    InvocationLayoutError,
+    build_invocation_layout,
+)
+from python_udf_jit.integration.daft_ray.schema import (
+    SchemaContractError,
+    canonicalize_schema,
+)
 from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
 from python_udf_jit.protocol.artifact import build_artifact
 from python_udf_jit.protocol.codec import encode_artifact
 
 
 _MAX_EXPRESSION_LINEAGE_BYTES = 1024 * 1024
+
+
+def _diagnostic_logical_schema(schema: Any) -> str:
+    try:
+        return canonicalize_schema(schema)
+    except SchemaContractError as error:
+        return json.dumps(
+            {
+                "fields": [],
+                "schema_version": 1,
+                "unavailable_reason": str(error),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
 
 
 class _BoundedPickleSink:
@@ -70,10 +98,17 @@ class CandidateRecord:
     expires_at: float
     expression_ids: set[int] = field(default_factory=set)
     pyexpr_hashes: set[int] = field(default_factory=set)
+    invocation_args: tuple[Any, ...] = ()
+    invocation_kwargs: dict[str, Any] = field(default_factory=dict)
+    invocation_layout_reject_reason: str | None = None
     finalized: bool = False
     capture_ir: CaptureIR | None = None
     semantic_core_hash: str | None = None
     semantic_region_hash: str | None = None
+
+    @property
+    def invocation_layout(self) -> InvocationLayoutContract | None:
+        return self.wrapper.invocation_layout
 
 
 def _candidate_id(
@@ -126,6 +161,10 @@ class CandidateRegistry:
         self._manifest_sha256 = manifest_sha256
         self._max_candidates = max_candidates
         self._job_namespace = job_namespace
+        self._layout_epoch = os.environ.get(
+            "UDFJIT_CLUSTER_EPOCH",
+            job_namespace,
+        )
         self._ttl_seconds = float(ttl_seconds)
         self._clock = clock
         self._policy = policy
@@ -148,8 +187,6 @@ class CandidateRegistry:
             clock=clock,
         )
         self._records: OrderedDict[int, CandidateRecord] = OrderedDict()
-        self._func_records: dict[int, CandidateRecord] = {}
-        self._func_refs: dict[int, weakref.ReferenceType[Any] | None] = {}
         self._expression_records: dict[int, CandidateRecord] = {}
         self._pyexpr_records: dict[int, CandidateRecord] = {}
         self._expression_refs: dict[int, weakref.ReferenceType[Any] | None] = {}
@@ -164,9 +201,6 @@ class CandidateRegistry:
         record = self._records.pop(registry_key, None)
         if record is None:
             return record
-        if self._func_records.get(record.func_id) is record:
-            self._func_records.pop(record.func_id, None)
-            self._func_refs.pop(record.func_id, None)
         for expression_id in tuple(record.expression_ids):
             if self._expression_records.get(expression_id) is record:
                 self._expression_records.pop(expression_id, None)
@@ -178,12 +212,6 @@ class CandidateRegistry:
         record.expression_ids.clear()
         record.pyexpr_hashes.clear()
         return record
-
-    def _drop_func(self, func_id: int) -> None:
-        with self._lock:
-            record = self._func_records.get(func_id)
-            if record is not None and not record.expression_ids:
-                self._drop_record_locked(record.registry_key)
 
     def _drop_expression(self, expression_id: int) -> None:
         with self._lock:
@@ -197,12 +225,7 @@ class CandidateRegistry:
                 record.pyexpr_hashes.discard(pyexpr_hash)
                 if self._pyexpr_records.get(pyexpr_hash) is record:
                     self._pyexpr_records.pop(pyexpr_hash, None)
-            func_ref = self._func_refs.get(record.func_id)
-            if (
-                not record.expression_ids
-                and func_ref is not None
-                and func_ref() is None
-            ):
+            if not record.expression_ids and not record.finalized:
                 self._drop_record_locked(record.registry_key)
 
     @staticmethod
@@ -219,24 +242,6 @@ class CandidateRegistry:
         with self._lock:
             self._assert_open()
             self._purge_expired_locked()
-            existing = self._func_records.get(func_id)
-            func_ref = self._func_refs.get(func_id)
-            if (
-                existing is not None
-                and func_ref is not None
-                and func_ref() is not func
-            ):
-                if existing.expression_ids:
-                    self._func_records.pop(func_id, None)
-                    self._func_refs.pop(func_id, None)
-                else:
-                    self._drop_record_locked(existing.registry_key)
-                existing = None
-            if existing is not None:
-                self._records.move_to_end(existing.registry_key)
-                existing.expires_at = self._clock() + self._ttl_seconds
-                return existing
-
             self._next_registry_key += 1
             registry_key = self._next_registry_key
             candidate_id = _candidate_id(
@@ -265,10 +270,6 @@ class CandidateRegistry:
                 expires_at=self._clock() + self._ttl_seconds,
             )
             self._records[record.registry_key] = record
-            self._func_records[func_id] = record
-            self._func_refs[func_id] = self._weakref_or_none(
-                func, lambda _ref, key=func_id: self._drop_func(key)
-            )
             self.registration_count += 1
             while len(self._records) > self._max_candidates:
                 evicted_key = next(iter(self._records))
@@ -284,13 +285,22 @@ class CandidateRegistry:
         )
         return record
 
-    def bind_expression(self, expression: Any, record: CandidateRecord) -> None:
+    def bind_expression(
+        self,
+        expression: Any,
+        record: CandidateRecord,
+        *,
+        invocation_args: tuple[Any, ...],
+        invocation_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         expression_id = id(expression)
         with self._lock:
             self._assert_open()
             if self._records.get(record.registry_key) is not record:
                 return
             record.expires_at = self._clock() + self._ttl_seconds
+            record.invocation_args = tuple(invocation_args)
+            record.invocation_kwargs = dict(invocation_kwargs or {})
             pyexpr_hash = self._pyexpr_hash(expression)
             record.expression_ids.add(expression_id)
             self._expression_records[expression_id] = record
@@ -403,7 +413,8 @@ class CandidateRegistry:
         records = self._records_for_expressions(expressions)
         if not records:
             return 0
-        logical_schema = canonicalize_schema(dataframe.schema())
+        framework_schema = dataframe.schema()
+        logical_schema = _diagnostic_logical_schema(framework_schema)
         finalized = 0
         record_driver_diagnostics = self._driver_diagnostics is not None
         for record in records:
@@ -414,25 +425,74 @@ class CandidateRegistry:
                 artifact_bytes: bytes | None = None
                 semantic_source: CaptureIR | CapturedProgram | None = None
                 fallback_identity = None
-                if record_driver_diagnostics:
-                    diagnostic_rejection = (
-                        "adapter",
-                        "logical_schema_not_float64",
-                        "",
+                try:
+                    invocation_layout = build_invocation_layout(
+                        record.capture_callable,
+                        record.invocation_args,
+                        record.invocation_kwargs,
+                        framework_schema,
+                        epoch=self._layout_epoch,
                     )
-                if "float64" in logical_schema.lower():
+                except InvocationLayoutError as error:
+                    invocation_layout = None
+                    record.invocation_layout_reject_reason = str(error)
+                else:
+                    record.invocation_layout_reject_reason = None
+                scalar_capture_eligible = (
+                    invocation_layout is not None
+                    and invocation_layout.layout_kind
+                    == SCALAR_SLOT_LAYOUT_KIND
+                    and invocation_layout.input_types == ("float64",)
+                    and invocation_layout.output_type == "float64"
+                    and invocation_layout.input_nullability == (False,)
+                    and not invocation_layout.output_nullable
+                )
+                if record_driver_diagnostics:
+                    if invocation_layout is None:
+                        diagnostic_rejection = (
+                            "adapter",
+                            "candidate_layout_unavailable",
+                            record.invocation_layout_reject_reason or "",
+                        )
+                    elif (
+                        invocation_layout.layout_kind
+                        != EXACT_UNICODE_LAYOUT_KIND
+                        and not scalar_capture_eligible
+                    ):
+                        diagnostic_rejection = (
+                            "adapter",
+                            "candidate_layout_provider_unavailable",
+                            (
+                                f"{invocation_layout.layout_kind}:"
+                                f"{','.join(invocation_layout.input_types)}"
+                                f"->{invocation_layout.output_type}"
+                            ),
+                        )
+                if (
+                    invocation_layout is not None
+                    and invocation_layout.layout_kind
+                    == EXACT_UNICODE_LAYOUT_KIND
+                ):
+                    # Exact Unicode has a separate Worker provider.  It carries
+                    # no float scalar artifact, but it is a valid finalized
+                    # candidate layout rather than a Driver rejection.
+                    diagnostic_rejection = None
+                elif scalar_capture_eligible:
                     try:
                         request = CaptureRequest(
                             record.capture_callable,
+                            input_types=invocation_layout.input_types,
+                            output_type=invocation_layout.output_type,
                             job_namespace=self._job_namespace,
-                            schema_sha256=hashlib.sha256(
-                                logical_schema.encode("utf-8")
-                            ).hexdigest(),
+                            schema_sha256=invocation_layout.sha256,
                             adapter_abi_sha256=hashlib.sha256(
                                 b"daft-0.7.2-scalar-capture"
                             ).hexdigest(),
                             policy_sha256=hashlib.sha256(
-                                b"python-3.14.3-float64-scalar"
+                                (
+                                    "python-3.14.3-candidate-layout:"
+                                    + invocation_layout.canonical_json
+                                ).encode("ascii")
                             ).hexdigest(),
                             capture_cache=self._capture_cache,
                         )
@@ -587,7 +647,10 @@ class CandidateRegistry:
                                 type(error).__name__,
                             )
                 if not record.wrapper.finalize(
-                    logical_schema, context, artifact_bytes
+                    logical_schema,
+                    context,
+                    artifact_bytes,
+                    invocation_layout=invocation_layout,
                 ):
                     continue
                 record.finalized = True
@@ -654,8 +717,6 @@ class CandidateRegistry:
         with self._lock:
             self._capture_cache.clear_job(self._job_namespace)
             self._records.clear()
-            self._func_records.clear()
-            self._func_refs.clear()
             self._expression_records.clear()
             self._expression_refs.clear()
             self._expression_hashes.clear()

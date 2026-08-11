@@ -14,8 +14,18 @@ def _field_name_hash(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
-def _logical_type(value: Any) -> str:
-    candidate = getattr(value, "dtype", value)
+def canonicalize_logical_type(value: Any) -> str:
+    value_type = type(value)
+    if (
+        isinstance(value, str)
+        or (
+            value_type.__module__.startswith("daft")
+            and value_type.__name__.endswith("DataType")
+        )
+    ):
+        candidate = value
+    else:
+        candidate = getattr(value, "dtype", value)
     if isinstance(candidate, str):
         logical_type = candidate
     elif type(candidate).__module__.startswith("daft"):
@@ -25,7 +35,10 @@ def _logical_type(value: Any) -> str:
     logical_type = logical_type.strip().lower()
     if not logical_type or len(logical_type.encode("utf-8")) > 256:
         raise SchemaContractError("schema_type_invalid")
-    return logical_type
+    return {
+        "boolean": "bool",
+        "utf8": "string",
+    }.get(logical_type, logical_type)
 
 
 def _schema_items(schema: Any) -> tuple[tuple[str, Any], ...]:
@@ -42,12 +55,12 @@ def _schema_items(schema: Any) -> tuple[tuple[str, Any], ...]:
 
 
 def canonicalize_schema(schema: Any) -> str:
-    """Return a deterministic, value-free schema document for Worker binding."""
+    """Return a deterministic, value-free full-schema diagnostic document."""
 
     fields = [
         {
             "name_sha256": _field_name_hash(name),
-            "logical_type": _logical_type(value),
+            "logical_type": canonicalize_logical_type(value),
         }
         for name, value in _schema_items(schema)
     ]

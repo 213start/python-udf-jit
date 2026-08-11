@@ -45,6 +45,10 @@ from python_udf_jit.governance.policy import (
     PolicySnapshot,
 )
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
+from python_udf_jit.integration.daft_ray.invocation_layout import (
+    SCALAR_SLOT_LAYOUT_KIND,
+    InvocationLayoutContract,
+)
 from python_udf_jit.protocol.artifact import PortableUdfArtifact
 from python_udf_jit.protocol.loader import (
     ArtifactLoadError,
@@ -88,7 +92,6 @@ from python_udf_jit.runtime.layout import (
     ProcessIdentity,
     SCALAR_SLOT_ABI_VERSION,
 )
-from python_udf_jit.runtime.physicalize import ScalarPhysicalizer
 from python_udf_jit.runtime.process_governor import ProcessVariantGovernor
 from python_udf_jit.runtime.variant import VariantKey, WorkerProcessKey
 from python_udf_jit.runtime.variant_manager import (
@@ -127,6 +130,13 @@ _CONTINUATION_LIVE_KIND = {
     INT64_SCALAR_TYPE: LiveValueKind.INT64,
     FLOAT32_SCALAR_TYPE: LiveValueKind.FLOAT32,
     FLOAT64_SCALAR_TYPE: LiveValueKind.FLOAT64,
+}
+_SCALAR_PYTHON_TYPES = {
+    BOOL_SCALAR_TYPE: bool,
+    INT32_SCALAR_TYPE: int,
+    INT64_SCALAR_TYPE: int,
+    FLOAT32_SCALAR_TYPE: float,
+    FLOAT64_SCALAR_TYPE: float,
 }
 _STABLE_RUNTIME_REASON_CODES = frozenset(
     {
@@ -172,6 +182,13 @@ def _stable_runtime_reason(reason_code: str) -> str:
     if reason_code in _STABLE_RUNTIME_REASON_CODES:
         return reason_code
     return "pre_semantics_failure"
+
+
+def _release_variant_lease(lease: Any) -> None:
+    try:
+        lease.__exit__(None, None, None)
+    except Exception:
+        pass
 
 
 def _sha256_text(value: str) -> str:
@@ -362,6 +379,25 @@ def _runtime_context_value(context: Any, method: str) -> str:
     return "" if value is None else str(value)
 
 
+def _process_local_ray_task_id() -> str:
+    """Read Ray's already-bound task id without rebuilding RuntimeContext."""
+
+    module = sys.modules.get("ray._private.worker")
+    worker = None if module is None else getattr(module, "global_worker", None)
+    task_id = None if worker is None else getattr(worker, "current_task_id", None)
+    if task_id is None:
+        return ""
+    is_nil = getattr(task_id, "is_nil", None)
+    try:
+        if callable(is_nil) and is_nil():
+            return ""
+        to_hex = getattr(task_id, "hex", None)
+        value = to_hex() if callable(to_hex) else ""
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 @dataclass(frozen=True)
 class WorkerRuntimeContext:
     run_id: str
@@ -463,9 +499,9 @@ class WorkerRuntimeContext:
                 import ray
 
                 partition_id = (
-                    _runtime_context_value(
-                        ray.get_runtime_context(),
-                        "get_task_id",
+                    _process_local_ray_task_id()
+                    or _runtime_context_value(
+                        ray.get_runtime_context(), "get_task_id"
                     )
                     or partition_id
                 )
@@ -490,6 +526,42 @@ class WorkerDiagnosticPerfEvidence:
             and not isinstance(self.raw_perf_data, bytes)
         ):
             raise ValueError("worker_diagnostic_perf_raw_data_invalid")
+
+
+class _DiagnosticFinalizingEventSink:
+    """Publish diagnostic evidence from an event already on the hot path."""
+
+    __slots__ = (
+        "_delegate",
+        "_hot_hit_lock",
+        "_hot_hit_reported",
+        "_on_successful_hit",
+    )
+
+    def __init__(
+        self,
+        delegate: RuntimeEventSink,
+        on_successful_hit: Callable[[], None],
+    ) -> None:
+        self._delegate = delegate
+        self._on_successful_hit = on_successful_hit
+        self._hot_hit_reported = False
+        self._hot_hit_lock = threading.Lock()
+
+    def emit(self, event: RuntimeEvent) -> bool:
+        try:
+            return self._delegate.emit(event)
+        finally:
+            if (
+                not self._hot_hit_reported
+                and event.stage == "execute"
+                and event.decision == "semantic_execute"
+                and event.reason_code == "success"
+            ):
+                with self._hot_hit_lock:
+                    if not self._hot_hit_reported:
+                        self._hot_hit_reported = True
+                        self._on_successful_hit()
 
 
 @dataclass(frozen=True)
@@ -529,6 +601,16 @@ class WorkerGuardOverrides:
     target_python: str | None = None
     target_soabi: str | None = None
     cpu_features: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class _CallableEntryAssumption:
+    """Process-local identity guard that avoids rehashing stable code per row."""
+
+    original_callable: types.FunctionType
+    original_code: types.CodeType
+    user_function: types.FunctionType
+    user_code: types.CodeType
 
 
 def _user_function(original_callable: Callable[..., Any]) -> types.FunctionType:
@@ -829,8 +911,13 @@ def _build_interpreter_continuation(
 
 
 def _extract_scalar_value(
-    original_callable: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> float:
+    original_callable: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    scalar_type: str,
+    nullable: bool,
+) -> object:
     if kwargs:
         raise OuterGuardError(OuterGuardRejectCode.INPUT_SHAPE_MISMATCH)
     wrapped = (
@@ -842,7 +929,12 @@ def _extract_scalar_value(
     if len(args) != expected:
         raise OuterGuardError(OuterGuardRejectCode.INPUT_SHAPE_MISMATCH)
     value = args[-1]
-    if type(value) is not float:
+    if value is None:
+        if nullable:
+            return None
+        raise OuterGuardError(OuterGuardRejectCode.INPUT_TYPE_MISMATCH)
+    expected_type = _SCALAR_PYTHON_TYPES.get(scalar_type)
+    if expected_type is None or type(value) is not expected_type:
         raise OuterGuardError(OuterGuardRejectCode.INPUT_TYPE_MISMATCH)
     return value
 
@@ -857,6 +949,7 @@ class WorkerScalarAdapter:
         original_callable: Callable[..., Any],
         carrier: ProductionCarrierState,
         logical_schema: str,
+        invocation_layout: InvocationLayoutContract | None = None,
         context: WorkerRuntimeContext,
         target_provider: Callable[[], RuntimeTarget] = RuntimeTarget.current,
         provider_factory: ScalarProviderFactory | None = None,
@@ -870,6 +963,14 @@ class WorkerScalarAdapter:
             raise ValueError("invalid_worker_candidate")
         if not carrier.finalized or not logical_schema:
             raise ValueError("worker_candidate_not_finalized")
+        if invocation_layout is not None:
+            if (
+                invocation_layout.layout_kind != SCALAR_SLOT_LAYOUT_KIND
+                or invocation_layout.epoch != context.process.cluster_epoch
+                or invocation_layout.layout_abi_version
+                != SCALAR_SLOT_ABI_VERSION
+            ):
+                raise ValueError("worker_invocation_layout_mismatch")
         if context.process.pid != os.getpid():
             raise ValueError("worker_context_process_mismatch")
         if context.policy.sha256 != carrier.policy.sha256:
@@ -892,6 +993,12 @@ class WorkerScalarAdapter:
         self.original_callable = original_callable
         self.carrier = carrier
         self.logical_schema = logical_schema
+        self.invocation_layout = invocation_layout
+        self._schema_binding = (
+            logical_schema
+            if invocation_layout is None
+            else invocation_layout.canonical_json
+        )
         self.context = context
         self._target_provider = target_provider
         self._diagnostic_perf_provider = diagnostic_perf_provider
@@ -915,6 +1022,13 @@ class WorkerScalarAdapter:
                 artifact_sha256=carrier.handle.content_sha256,
                 user_function=_user_function(original_callable),
             )
+        self._diagnostic_hot_hit_seen = False
+        self._diagnostic_finalized = False
+        self._diagnostic_finalization_lock = (
+            None
+            if self._diagnostic_runtime is None
+            else threading.Lock()
+        )
         if provider_factory is None:
             self._provider_factory = (
                 CinderXScalarProviderFactory()
@@ -925,7 +1039,16 @@ class WorkerScalarAdapter:
             )
         else:
             self._provider_factory = provider_factory
-        self._event_sink = event_sink
+        self._event_sink = (
+            event_sink
+            if self._diagnostic_runtime is None
+            else _DiagnosticFinalizingEventSink(
+                event_sink,
+                lambda: self._finalize_diagnostic_runtime(
+                    after_hot_hit=True
+                ),
+            )
+        )
         self._artifact_loader = artifact_loader
         self._loader_namespace = LoaderNamespace(
             context.run_id,
@@ -953,16 +1076,15 @@ class WorkerScalarAdapter:
                 _release_process_variant_manager,
                 context,
             )
-        self._physicalizer = ScalarPhysicalizer(
-            epoch=context.process.cluster_epoch,
-            process=ProcessIdentity(
-                context.process.pid,
-                context.process.process_generation,
-            ),
-        )
         self._artifact: PortableUdfArtifact | None = None
         self._expectation: OuterGuardExpectation | None = None
+        self._fast_observation: OuterGuardObservation | None = None
+        self._callable_entry_assumption: _CallableEntryAssumption | None = None
         self._key: VariantKey | None = None
+        self._process_identity = ProcessIdentity(
+            context.process.pid,
+            context.process.process_generation,
+        )
         self._continuation_initialized = False
         self._continuation: InterpreterContinuation[object] | None = None
 
@@ -991,6 +1113,49 @@ class WorkerScalarAdapter:
         self._diagnostic_perf_recorded = accepted
         return accepted
 
+    def _finalize_diagnostic_runtime(
+        self,
+        *,
+        after_hot_hit: bool = False,
+        force: bool = False,
+    ) -> None:
+        runtime = self._diagnostic_runtime
+        lock = self._diagnostic_finalization_lock
+        if runtime is None or lock is None or self._diagnostic_finalized:
+            return
+        with lock:
+            if after_hot_hit:
+                self._diagnostic_hot_hit_seen = True
+            if self._diagnostic_finalized:
+                return
+            if not force:
+                if not self._diagnostic_hot_hit_seen:
+                    return
+                if (
+                    self.context.diagnostic_policy.perf_mode
+                    is DiagnosticPerfMode.RECORD
+                    and not self._diagnostic_perf_recorded
+                ):
+                    return
+            try:
+                bundle_ref = runtime.finalize()
+            except Exception:
+                # Diagnostic publication must not change UDF semantics.  Keep
+                # the runtime retryable for close(), and preserve the existing
+                # partial-bundle convention when the recorder is still live.
+                try:
+                    runtime.mark_partial()
+                except Exception:
+                    pass
+                return
+            if bundle_ref is None:
+                try:
+                    runtime.mark_partial()
+                except Exception:
+                    pass
+                return
+            self._diagnostic_finalized = True
+
     def record_diagnostic_perf_evidence(
         self,
         evidence: WorkerDiagnosticPerfEvidence,
@@ -999,7 +1164,10 @@ class WorkerScalarAdapter:
 
         if self._closed:
             return False
-        return self._record_diagnostic_perf_evidence(evidence)
+        accepted = self._record_diagnostic_perf_evidence(evidence)
+        if accepted:
+            self._finalize_diagnostic_runtime()
+        return accepted
 
     @property
     def owner_pid(self) -> int:
@@ -1082,8 +1250,35 @@ class WorkerScalarAdapter:
         identity = _fallback_identity(self.original_callable)
         if identity != artifact.fallback_identity:
             raise OuterGuardError(OuterGuardRejectCode.CALLABLE_MISMATCH)
+        original_callable = self.original_callable
+        user_function = _user_function(original_callable)
+        callable_entry_assumption = _CallableEntryAssumption(
+            original_callable,
+            original_callable.__code__,
+            user_function,
+            user_function.__code__,
+        )
         target = self._target_provider()
-        schema_hash = _sha256_text(self.logical_schema)
+        if self.invocation_layout is not None:
+            expected_inputs = tuple(
+                spec.scalar_type for spec in artifact.input_access_specs
+            )
+            expected_input_nullability = tuple(
+                spec.nullable for spec in artifact.input_access_specs
+            )
+            if (
+                expected_inputs != self.invocation_layout.input_types
+                or expected_input_nullability
+                != self.invocation_layout.input_nullability
+                or artifact.output_access_spec.scalar_type
+                != self.invocation_layout.output_type
+                or artifact.output_access_spec.nullable
+                != self.invocation_layout.output_nullable
+            ):
+                raise OuterGuardError(
+                    OuterGuardRejectCode.SCHEMA_MISMATCH
+                )
+        schema_hash = _sha256_text(self._schema_binding)
         artifact_hash = payload_hash
         if target.python_version != artifact.manifest.target_python:
             raise OuterGuardError(OuterGuardRejectCode.TARGET_PYTHON_MISMATCH)
@@ -1098,6 +1293,17 @@ class WorkerScalarAdapter:
             artifact.manifest.target_python,
             target.cpython_cinderx_soabi,
             target.cpu_features,
+        )
+        fast_observation = OuterGuardObservation(
+            artifact_hash,
+            self.carrier.manifest_sha256,
+            artifact.semantic_core_module.semantic_hash,
+            schema_hash,
+            identity.code_sha256,
+            target.python_version,
+            target.cpython_cinderx_soabi,
+            target.cpu_features,
+            self._process_identity,
         )
         key = VariantKey(
             self.context.process,
@@ -1117,6 +1323,8 @@ class WorkerScalarAdapter:
         )
         self._artifact = artifact
         self._expectation = expectation
+        self._fast_observation = fast_observation
+        self._callable_entry_assumption = callable_entry_assumption
         self._key = key
         self._emit(
             "artifact",
@@ -1139,15 +1347,40 @@ class WorkerScalarAdapter:
             override.experiment_manifest_sha256 or self.carrier.manifest_sha256,
             override.semantic_hash
             or artifact.semantic_core_module.semantic_hash,
-            _sha256_text(override.logical_schema or self.logical_schema),
+            _sha256_text(override.logical_schema or self._schema_binding),
             override.callable_code_sha256 or identity.code_sha256,
             override.target_python or target.python_version,
             override.target_soabi or target.cpython_cinderx_soabi,
             override.cpu_features or target.cpu_features,
-            ProcessIdentity(
-                self.context.process.pid, self.context.process.process_generation
-            ),
+            self._process_identity,
         )
+
+    def _observe_fast(self) -> OuterGuardObservation:
+        """Validate mutable callable references without recomputing code hashes."""
+
+        assumption = self._callable_entry_assumption
+        observation = self._fast_observation
+        current = self.original_callable
+        if (
+            assumption is None
+            or observation is None
+            or current is not assumption.original_callable
+            or type(current) is not types.FunctionType
+            or current.__code__ is not assumption.original_code
+        ):
+            raise OuterGuardError(OuterGuardRejectCode.CALLABLE_MISMATCH)
+        try:
+            user_function = _user_function(current)
+        except ValueError as error:
+            raise OuterGuardError(
+                OuterGuardRejectCode.CALLABLE_MISMATCH
+            ) from error
+        if (
+            user_function is not assumption.user_function
+            or user_function.__code__ is not assumption.user_code
+        ):
+            raise OuterGuardError(OuterGuardRejectCode.CALLABLE_MISMATCH)
+        return observation
 
     def _fallback(
         self,
@@ -1173,7 +1406,7 @@ class WorkerScalarAdapter:
         artifact: PortableUdfArtifact,
         key: VariantKey,
         variant: Any,
-        value: float,
+        value: object,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         continuation: InterpreterContinuation[object] | None,
@@ -1209,27 +1442,20 @@ class WorkerScalarAdapter:
 
         boundary = CommitBoundary()
         try:
-            frame = self._physicalizer.open_call(
-                artifact.input_access_specs[0],
-                artifact.output_access_spec,
-                value,
-                keepalive=args,
-            )
-            with frame:
-                physical_value = frame.load_input()
-                if continuation is None:
-                    result = variant.execute(
-                        physical_value,
-                        boundary=boundary,
-                    )
-                else:
-                    result = variant.execute(
-                        physical_value,
-                        boundary=boundary,
-                        continuation=continuation,
-                    )
-                frame.stage_output(result)
-                result = frame.publish_output()
+            # The Provider variant owns the one process-local ScalarSlot binding.
+            # Its registry validates the Artifact AccessSpecs, borrows the guarded
+            # input/output slots, writes the input once, and publishes the output
+            # only after compiled execution succeeds.  Wrapping that path in a
+            # second ScalarPhysicalizer would create fresh descriptors and
+            # materialize/box the same value again for every row.
+            if continuation is None:
+                result = variant.execute(value, boundary=boundary)
+            else:
+                result = variant.execute(
+                    value,
+                    boundary=boundary,
+                    continuation=continuation,
+                )
         except PreSemanticsExecutionError as error:
             if not boundary.committed:
                 return self._fallback(
@@ -1290,19 +1516,40 @@ class WorkerScalarAdapter:
         guard_overrides: WorkerGuardOverrides | None = None,
     ) -> Any:
         attribution = self.context.event_attribution()
+        variant_lease = None
         try:
-            value = _extract_scalar_value(self.original_callable, args, kwargs)
+            value = None
+            if self.invocation_layout is not None:
+                value = _extract_scalar_value(
+                    self.original_callable,
+                    args,
+                    kwargs,
+                    scalar_type=self.invocation_layout.input_types[0],
+                    nullable=self.invocation_layout.input_nullability[0],
+                )
             artifact, key = self._load_and_reverify(
                 attribution=attribution,
             )
+            if self.invocation_layout is None:
+                input_spec = artifact.input_access_specs[0]
+                value = _extract_scalar_value(
+                    self.original_callable,
+                    args,
+                    kwargs,
+                    scalar_type=input_spec.scalar_type,
+                    nullable=input_spec.nullable,
+                )
             if self._expectation is None:
                 raise RuntimeError("outer_guard_expectation_missing")
+            observation = (
+                self._observe_fast()
+                if guard_overrides is None
+                else self._observe(artifact, guard_overrides)
+            )
             guard_outer_entry(
                 self._expectation,
-                self._observe(artifact, guard_overrides),
-                expected_process=ProcessIdentity(
-                    self.context.process.pid, self.context.process.process_generation
-                ),
+                observation,
+                expected_process=self._process_identity,
             )
             if not self._continuation_initialized:
                 self._continuation = _build_interpreter_continuation(
@@ -1312,60 +1559,76 @@ class WorkerScalarAdapter:
                 self._continuation_initialized = True
             continuation = self._continuation
 
-            def compile_variant() -> ScalarProviderVariant:
-                if continuation is None:
-                    compiled_variant = self._provider_factory.compile(
-                        artifact,
-                        key,
-                    )
-                else:
-                    compiled_variant = self._provider_factory.compile(
-                        artifact,
-                        key,
-                        continuation=continuation,
-                    )
-                production_jit = (
-                    isinstance(
-                        self._provider_factory,
-                        CinderXScalarProviderFactory,
-                    )
-                    and compiled_variant.execution_mode == "cinderx-jit"
-                    and compiled_variant.intrinsic_load_count == 1
-                    and (
-                        compiled_variant.intrinsic_store_count >= 1
-                        or compiled_variant.continuation_enabled
-                    )
-                )
-                self._emit(
-                    "jit" if production_jit else "provider",
-                    "compile",
-                    (
-                        "cinderx_force_compile_verified"
-                        if production_jit
-                        else "non_jit_test_or_interpreter_compile"
-                    ),
-                    key=key,
-                    artifact_hash=self.carrier.handle.content_sha256,
-                    code_hash=compiled_variant.code_hash,
-                    execution_mode=compiled_variant.execution_mode,
-                    attribution=attribution,
-                )
-                return compiled_variant
+            variant_lease = self._variants.acquire(key)
+            try:
+                variant = variant_lease.__enter__()
+            except KeyError:
+                variant_lease = None
 
-            resolution = self._variants.resolve(
-                key,
-                compile_variant,
-            )
-            if resolution.kind is not ResolveKind.HIT:
-                return self._fallback(
-                    args,
-                    kwargs,
-                    resolution.reason_code,
-                    key=key,
-                    attribution=attribution,
+                def compile_variant() -> ScalarProviderVariant:
+                    if continuation is None:
+                        compiled_variant = self._provider_factory.compile(
+                            artifact,
+                            key,
+                        )
+                    else:
+                        compiled_variant = self._provider_factory.compile(
+                            artifact,
+                            key,
+                            continuation=continuation,
+                        )
+                    production_jit = (
+                        isinstance(
+                            self._provider_factory,
+                            CinderXScalarProviderFactory,
+                        )
+                        and compiled_variant.execution_mode == "cinderx-jit"
+                        and compiled_variant.intrinsic_load_count == 1
+                        and (
+                            compiled_variant.intrinsic_store_count >= 1
+                            or compiled_variant.continuation_enabled
+                        )
+                    )
+                    self._emit(
+                        "jit" if production_jit else "provider",
+                        "compile",
+                        (
+                            "cinderx_force_compile_verified"
+                            if production_jit
+                            else "non_jit_test_or_interpreter_compile"
+                        ),
+                        key=key,
+                        artifact_hash=self.carrier.handle.content_sha256,
+                        code_hash=compiled_variant.code_hash,
+                        execution_mode=compiled_variant.execution_mode,
+                        attribution=attribution,
+                    )
+                    return compiled_variant
+
+                resolution = self._variants.resolve(
+                    key,
+                    compile_variant,
                 )
-            if resolution.variant is None:
-                raise OuterGuardError(OuterGuardRejectCode.VARIANT_MISMATCH)
+                if resolution.kind is not ResolveKind.HIT:
+                    return self._fallback(
+                        args,
+                        kwargs,
+                        resolution.reason_code,
+                        key=key,
+                        attribution=attribution,
+                    )
+                if resolution.variant is None:
+                    raise OuterGuardError(
+                        OuterGuardRejectCode.VARIANT_MISMATCH
+                    )
+                variant_lease = self._variants.acquire(key)
+                try:
+                    variant = variant_lease.__enter__()
+                except KeyError:
+                    variant_lease = None
+                    raise OuterGuardError(
+                        OuterGuardRejectCode.VARIANT_MISMATCH
+                    )
         except OuterGuardError as error:
             return self._fallback(
                 args,
@@ -1399,17 +1662,6 @@ class WorkerScalarAdapter:
                 attribution=attribution,
             )
 
-        lease = self._variants.acquire(key)
-        try:
-            variant = lease.__enter__()
-        except KeyError:
-            return self._fallback(
-                args,
-                kwargs,
-                "variant_unavailable",
-                key=key,
-                attribution=attribution,
-            )
         try:
             return self._execute_variant(
                 artifact=artifact,
@@ -1422,7 +1674,8 @@ class WorkerScalarAdapter:
                 attribution=attribution,
             )
         finally:
-            lease.__exit__(None, None, None)
+            if variant_lease is not None:
+                _release_variant_lease(variant_lease)
 
     def close(self) -> None:
         if self._closed:
@@ -1445,9 +1698,7 @@ class WorkerScalarAdapter:
             self._variants.close()
         elif self._release_finalizer is not None:
             self._release_finalizer()
-        self._physicalizer.close()
-        if self._diagnostic_runtime is not None:
-            self._diagnostic_runtime.finalize()
+        self._finalize_diagnostic_runtime(force=True)
 
 
 def build_default_worker_adapter(wrapper: Any) -> WorkerScalarAdapter:
@@ -1456,6 +1707,7 @@ def build_default_worker_adapter(wrapper: Any) -> WorkerScalarAdapter:
         original_callable=wrapper.original_callable,
         carrier=wrapper.carrier,
         logical_schema=wrapper.logical_schema,
+        invocation_layout=wrapper.invocation_layout,
         context=WorkerRuntimeContext.from_environment(
             policy=wrapper.carrier.policy,
         ),

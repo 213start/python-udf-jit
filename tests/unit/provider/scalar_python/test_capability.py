@@ -134,6 +134,73 @@ class CapabilityTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "has not been initialized"):
                 self.registry.data_load_f64(guarded)
 
+    def test_prepared_pair_keeps_row_borrows_and_static_descriptor_guards(self):
+        output_backend = LocalScalarSlotBackend()
+        output_handle = self.registry.register(
+            output_backend,
+            access_id="prepared-output",
+        )
+        pair = self.registry.prepare_pair(self.handle, output_handle)
+
+        with pair:
+            pair.write_input(4.25)
+            input_backend, borrowed_output = pair.execution_handles
+            self.assertEqual(input_backend.load_f64(), 4.25)
+            borrowed_output.write_f64(8.5)
+            self.assertEqual(pair.load_output(), 8.5)
+            with self.assertRaises(CapabilityError) as raised:
+                self.registry.register(
+                    LocalScalarSlotBackend(),
+                    access_id="blocked-during-pair-borrow",
+                )
+            self.assertEqual(raised.exception.code, CapabilityRejectCode.IN_USE)
+
+        with pair:
+            with self.assertRaisesRegex(RuntimeError, "has not been initialized"):
+                pair.load_output()
+
+        entry = self.registry._entries[self.handle.access_id]
+        original_descriptor = entry.descriptor
+        entry.descriptor = dataclasses.replace(
+            original_descriptor,
+            epoch="tampered-epoch",
+        )
+        try:
+            with self.assertRaises(CapabilityError) as raised:
+                with pair:
+                    pass
+            self.assertEqual(
+                raised.exception.code,
+                CapabilityRejectCode.DESCRIPTOR_MISMATCH,
+            )
+        finally:
+            entry.descriptor = original_descriptor
+            self.registry.release(output_handle)
+
+    def test_prepared_pair_rejects_re_registered_handle_generation(self):
+        output_handle = self.registry.register(
+            LocalScalarSlotBackend(),
+            access_id="prepared-output",
+        )
+        pair = self.registry.prepare_pair(self.handle, output_handle)
+        old_handle = self.handle
+        self.registry.release(old_handle)
+        self.handle = self.registry.register(
+            LocalScalarSlotBackend(),
+            access_id=old_handle.access_id,
+        )
+
+        try:
+            with self.assertRaises(CapabilityError) as raised:
+                with pair:
+                    pass
+            self.assertEqual(
+                raised.exception.code,
+                CapabilityRejectCode.GENERATION_MISMATCH,
+            )
+        finally:
+            self.registry.release(output_handle)
+
     def test_explicit_keepalive_is_held_only_for_active_borrow(self):
         self.registry.release(self.handle)
         backend = _KeepaliveBackend()

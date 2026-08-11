@@ -22,6 +22,7 @@ from python_udf_jit.runtime.continuation import (
     CommitBoundary,
     CommitPhase,
 )
+from python_udf_jit.runtime.guards import guard_descriptor
 from python_udf_jit.runtime.layout import CinderXScalarSlotBackend, LocalScalarSlotBackend
 
 
@@ -157,6 +158,81 @@ class _DiagnosticObserver:
 
 
 class ExecutorTest(unittest.TestCase):
+    def test_backend_pair_prepares_static_capability_guards_once(self):
+        fake = _FakeCinderjit()
+        with patch.dict(sys.modules, {"cinderjit": fake}):
+            registry = CapabilityRegistry(epoch="epoch-a")
+            input_handle = registry.register(CinderXScalarSlotBackend())
+            output_handle = registry.register(CinderXScalarSlotBackend())
+            module = lower_capture(capture(CaptureRequest(affine)))
+            compiled = compile_scalar_region(
+                module,
+                form_verified_region(module),
+                hooks=ScalarLoweringHooks(
+                    fake._udf_guard_data_handle,
+                    fake._udf_data_is_null,
+                    fake._udf_data_load_f64,
+                    fake._udf_data_store_f64,
+                    fake._udf_data_store_null,
+                ),
+            )
+            executor = ScalarExecutor(registry)
+
+            with patch(
+                "python_udf_jit.provider.scalar_python.capability.guard_descriptor",
+                wraps=guard_descriptor,
+            ) as descriptor_guard, patch(
+                "python_udf_jit.provider.scalar_python.capability.secrets.token_hex",
+                wraps=__import__("secrets").token_hex,
+            ) as token_hex:
+                self.assertEqual(
+                    executor.execute(compiled, input_handle, output_handle, 2.0),
+                    7.0,
+                )
+                token_hex.reset_mock()
+                self.assertEqual(
+                    executor.execute(compiled, input_handle, output_handle, 3.0),
+                    9.0,
+                )
+
+            self.assertEqual(descriptor_guard.call_count, 2)
+            token_hex.assert_not_called()
+            self.assertEqual(
+                [name for name, *_ in fake.calls].count("begin"),
+                4,
+            )
+            self.assertEqual(
+                [name for name, *_ in fake.calls].count("end"),
+                4,
+            )
+            registry.release(output_handle)
+            registry.release(input_handle)
+
+    def test_backend_pair_failure_is_post_commit_and_releases_borrows(self):
+        registry = CapabilityRegistry(epoch="epoch-a")
+        input_handle = registry.register(LocalScalarSlotBackend())
+        output_handle = registry.register(LocalScalarSlotBackend())
+        boundary = CommitBoundary()
+
+        def compiled(_input, _output):
+            raise ArithmeticError("semantic failure")
+
+        compiled.argument_kind = "backend_pair"
+        compiled.registry_id = registry.registry_id
+
+        with self.assertRaisesRegex(ArithmeticError, "semantic failure"):
+            ScalarExecutor(registry).execute_guarded(
+                compiled,
+                input_handle,
+                output_handle,
+                1.0,
+                boundary=boundary,
+            )
+
+        self.assertIs(boundary.phase, CommitPhase.COMMITTED)
+        registry.release(output_handle)
+        registry.release(input_handle)
+
     def test_guarded_setup_failure_stays_before_explicit_commit(self):
         registry = CapabilityRegistry(epoch="epoch-a")
         input_handle = registry.register(LocalScalarSlotBackend())

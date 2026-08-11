@@ -17,6 +17,9 @@ from python_udf_jit.integration.daft_ray.objectref_bridge import (
     clear_driver_artifact_references,
     driver_artifact_references,
 )
+from python_udf_jit.integration.daft_ray.invocation_layout import (
+    InvocationLayoutContract,
+)
 from python_udf_jit.integration.daft_ray.wrapper import (
     WRAPPER_SERIALIZATION_VERSION,
     FallbackOnlyWrapper,
@@ -72,6 +75,14 @@ def make_wrapper(original=operator.add):
         candidate_id="candidate-test",
         original_callable=original,
         carrier=ProductionCarrierState.placeholder("candidate-test", "b" * 64),
+    )
+
+
+def exact_unicode_layout() -> InvocationLayoutContract:
+    return InvocationLayoutContract.for_types(
+        ("string",),
+        "string",
+        epoch="layout-epoch",
     )
 
 
@@ -239,14 +250,59 @@ class WrapperSerializationTest(unittest.TestCase):
 
         original = CountingCallable()
         wrapper = make_wrapper(original)
-        wrapper.finalize("{'text': 'String'}", "filter")
+        wrapper.finalize(
+            "{'text': 'String', 'unrelated': 'Float64'}",
+            "filter",
+            invocation_layout=exact_unicode_layout(),
+        )
         adapter = _TypedAdapter(TypedLoopInvocation(True, 42, "typed_loop_hit"))
         wrapper._typed_loop_adapter = adapter
 
-        with mock.patch.dict(os.environ, {"UDFJIT_MODE": "auto"}):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UDFJIT_MODE": "auto",
+                "UDFJIT_CLUSTER_EPOCH": "layout-epoch",
+            },
+        ):
             result = wrapper(21)
 
         self.assertEqual(result, 42)
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(original.calls, 0)
+
+    def test_exact_unicode_constructs_adapter_on_first_wrapper_call(self):
+        from python_udf_jit.integration.daft_ray.typed_loop_worker import (
+            TypedLoopInvocation,
+        )
+
+        original = CountingCallable()
+        wrapper = make_wrapper(original)
+        wrapper.finalize(
+            "{'text': 'String'}",
+            "projection",
+            invocation_layout=exact_unicode_layout(),
+        )
+        adapter = _TypedAdapter(
+            TypedLoopInvocation(True, "compiled", "typed_loop_hit")
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UDFJIT_MODE": "auto",
+                "UDFJIT_CLUSTER_EPOCH": "layout-epoch",
+            },
+        ):
+            with mock.patch(
+                "python_udf_jit.integration.daft_ray.typed_loop_worker."
+                "build_worker_typed_loop_adapter",
+                return_value=adapter,
+            ) as build:
+                result = wrapper("a")
+
+        self.assertEqual(result, "compiled")
+        build.assert_called_once_with(wrapper)
         self.assertEqual(adapter.calls, 1)
         self.assertEqual(original.calls, 0)
 
@@ -257,17 +313,52 @@ class WrapperSerializationTest(unittest.TestCase):
 
         original = CountingCallable()
         wrapper = make_wrapper(original)
-        wrapper.finalize("{'text': 'String'}", "filter")
+        wrapper.finalize(
+            "{'text': 'String'}",
+            "filter",
+            invocation_layout=exact_unicode_layout(),
+        )
         adapter = _TypedAdapter(
             TypedLoopInvocation(False, reason_code="predicate_unsupported")
         )
         wrapper._typed_loop_adapter = adapter
 
-        with mock.patch.dict(os.environ, {"UDFJIT_MODE": "auto"}):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UDFJIT_MODE": "auto",
+                "UDFJIT_CLUSTER_EPOCH": "layout-epoch",
+            },
+        ):
             result = wrapper(21)
 
         self.assertEqual(result, 42)
         self.assertEqual(adapter.calls, 1)
+        self.assertEqual(original.calls, 1)
+
+    def test_auto_string_layout_epoch_mismatch_skips_adapter_construction(self):
+        original = CountingCallable()
+        wrapper = make_wrapper(original)
+        wrapper.finalize(
+            "{'text': 'String'}",
+            "filter",
+            invocation_layout=exact_unicode_layout(),
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UDFJIT_MODE": "auto",
+                "UDFJIT_CLUSTER_EPOCH": "other-epoch",
+            },
+        ):
+            with mock.patch(
+                "python_udf_jit.integration.daft_ray.typed_loop_worker."
+                "build_worker_typed_loop_adapter",
+            ) as build:
+                result = wrapper(21)
+
+        self.assertEqual(result, 42)
+        build.assert_not_called()
         self.assertEqual(original.calls, 1)
 
     def test_terminal_typed_decline_bypasses_future_adapter_and_events(self):
@@ -277,7 +368,11 @@ class WrapperSerializationTest(unittest.TestCase):
 
         original = CountingCallable()
         wrapper = make_wrapper(original)
-        wrapper.finalize("{'text': 'String'}", "filter")
+        wrapper.finalize(
+            "{'text': 'String'}",
+            "filter",
+            invocation_layout=exact_unicode_layout(),
+        )
         adapter = _TypedAdapter(
             TypedLoopInvocation(
                 False,
@@ -287,7 +382,13 @@ class WrapperSerializationTest(unittest.TestCase):
         )
         wrapper._typed_loop_adapter = adapter
 
-        with mock.patch.dict(os.environ, {"UDFJIT_MODE": "auto"}):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UDFJIT_MODE": "auto",
+                "UDFJIT_CLUSTER_EPOCH": "layout-epoch",
+            },
+        ):
             with mock.patch(
                 "python_udf_jit.integration.daft_ray.wrapper.events.try_emit"
             ) as emit:

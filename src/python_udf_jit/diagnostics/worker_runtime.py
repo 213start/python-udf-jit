@@ -165,6 +165,7 @@ def _selector_matches(
     *,
     candidate_id: str,
     artifact_sha256: str,
+    user_function: FunctionType,
 ) -> bool:
     kind, separator, value = selector.partition(":")
     if not separator or not value:
@@ -173,8 +174,15 @@ def _selector_matches(
         return artifact_sha256.startswith(value)
     if kind == "candidate":
         return candidate_id == value
-    if kind in {"udf", "region"}:
-        # These identities become available after artifact re-verification.
+    if kind == "udf":
+        # The original user function is already resolved by the Worker adapter,
+        # so reject a mismatched code identity before opening a private bundle.
+        # The semantic function identity is rechecked after artifact loading.
+        return code_identity_from_code(
+            user_function.__code__
+        ).sha256.startswith(value)
+    if kind == "region":
+        # Region identities become available after artifact re-verification.
         return True
     raise ValueError("diagnostic_selector_unsupported")
 
@@ -1366,7 +1374,6 @@ class WorkerDiagnosticRuntime:
         with self._lock:
             if self._finalized:
                 return None
-            self._finalized = True
             status = (
                 BundleStatus.PARTIAL
                 if (
@@ -1378,7 +1385,12 @@ class WorkerDiagnosticRuntime:
                 )
                 else BundleStatus.COMPLETE
             )
-        return self._session.finalize(status)
+            bundle_ref = self._session.finalize(status)
+            if bundle_ref is None:
+                self._partial = True
+                return None
+            self._finalized = True
+            return bundle_ref
 
 
 def open_worker_diagnostic_runtime(
@@ -1398,6 +1410,7 @@ def open_worker_diagnostic_runtime(
         policy.selector,
         candidate_id=candidate_id,
         artifact_sha256=artifact_sha256,
+        user_function=user_function,
     ):
         return None
     return WorkerDiagnosticRuntime(

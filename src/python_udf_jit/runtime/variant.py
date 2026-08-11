@@ -6,6 +6,7 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import cached_property
 from typing import Callable, Generic, TypeVar
 
 
@@ -80,7 +81,7 @@ class VariantKey:
         if tuple(sorted(set(self.cpu_features))) != self.cpu_features:
             raise ValueError("CPU features must be sorted and unique")
 
-    @property
+    @cached_property
     def sha256(self) -> str:
         document = {
             "actor_worker_id": self.process.actor_worker_id,

@@ -83,6 +83,16 @@ def _remap_text(text: str) -> str:
     return text.translate(table)
 
 
+def _remap_text_with_unused_options(
+    text: str,
+    *,
+    marker: str = "unused",
+    **_extras: object,
+) -> str:
+    table = str.maketrans({"α": "a", "β": "b", "→": ">"})
+    return text.translate(table)
+
+
 _SPACE_RUN = re.compile(r"\s+")
 
 
@@ -149,6 +159,22 @@ class _ValueBackend:
 
 
 class WorkerTypedLoopAdapterTests(unittest.TestCase):
+    def test_unused_variadics_do_not_block_exact_unicode_layout(self) -> None:
+        backend = _Backend()
+        adapter = WorkerTypedLoopAdapter(
+            _remap_text_with_unused_options,
+            candidate_id="candidate-generic-layout-test",
+            call_threshold=1,
+            backend=backend,
+        )
+
+        result = adapter.invoke(("α→β",), {})
+
+        self.assertTrue(result.handled)
+        self.assertEqual(result.value, "a>b")
+        self.assertEqual(adapter.snapshot().compile_successes, 1)
+        self.assertEqual(backend.calls, 1)
+
     def test_value_cache_backend_supersedes_invariant_helper_backend(self) -> None:
         invariant_backend = _InvariantBackend()
         value_backend = _ValueBackend()

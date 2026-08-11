@@ -4,6 +4,7 @@ import __future__
 import ast
 import builtins
 import copy
+import dis
 import functools
 import hashlib
 import inspect
@@ -12,7 +13,8 @@ import re
 import sys
 import textwrap
 import types
-from collections.abc import Mapping
+from bisect import bisect_left
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from python_udf_jit.compiler.core_ir import (
@@ -304,8 +306,19 @@ def _function_node(source: str, function: types.FunctionType) -> ast.FunctionDef
     node = candidates[0]
     if node.name != function.__name__:
         _fail("source_function_identity_mismatch")
-    if node.args.vararg is not None or node.args.kwarg is not None:
-        _fail("function_signature_unsupported")
+    variadic_names = {
+        argument.arg
+        for argument in (node.args.vararg, node.args.kwarg)
+        if argument is not None
+    }
+    loaded_names = {
+        candidate.id
+        for candidate in ast.walk(node)
+        if isinstance(candidate, ast.Name) and isinstance(candidate.ctx, ast.Load)
+    }
+    used_variadics = sorted(variadic_names & loaded_names)
+    if used_variadics:
+        _fail("variadic_parameter_used", used_variadics[0])
     return node
 
 
@@ -317,15 +330,26 @@ def _future_flags(code: types.CodeType) -> int:
     )
 
 
-def _code_constant_key(value: object) -> object:
+def _constant_key(
+    value: object,
+    code_key: Callable[[types.CodeType], tuple[object, ...]],
+) -> object:
     if isinstance(value, types.CodeType):
-        return _code_semantic_key(value)
+        return code_key(value)
     if isinstance(value, tuple):
-        return ("tuple", tuple(_code_constant_key(item) for item in value))
+        return (
+            "tuple",
+            tuple(_constant_key(item, code_key) for item in value),
+        )
     if isinstance(value, frozenset):
         return (
             "frozenset",
-            tuple(sorted(repr(_code_constant_key(item)) for item in value)),
+            tuple(
+                sorted(
+                    repr(_constant_key(item, code_key))
+                    for item in value
+                )
+            ),
         )
     if type(value) is float:
         return ("float", value.hex())
@@ -334,6 +358,10 @@ def _code_constant_key(value: object) -> object:
     except TypeError:
         return (type(value).__qualname__, repr(value))
     return (type(value).__qualname__, value)
+
+
+def _code_constant_key(value: object) -> object:
+    return _constant_key(value, _code_semantic_key)
 
 
 def _code_semantic_key(code: types.CodeType) -> tuple[object, ...]:
@@ -351,6 +379,87 @@ def _code_semantic_key(code: types.CodeType) -> tuple[object, ...]:
         code.co_cellvars,
         tuple(_code_constant_key(value) for value in code.co_consts),
         getattr(code, "co_exceptiontable", b""),
+    )
+
+
+def _normalized_code_constant_key(value: object) -> object:
+    return _constant_key(value, _normalized_code_semantic_key)
+
+
+def _normalized_instruction_key(
+    instruction: dis.Instruction,
+    instruction_index: Callable[[int], int],
+) -> tuple[str, object]:
+    if instruction.opcode in dis.hasjabs or instruction.opcode in dis.hasjrel:
+        target = instruction.argval
+        argument: object = (
+            "jump_target",
+            instruction_index(target)
+            if type(target) is int
+            else instruction.argrepr,
+        )
+    elif instruction.opname == "LOAD_CONST":
+        argument = _normalized_code_constant_key(instruction.argval)
+    elif instruction.arg is None:
+        argument = None
+    elif type(instruction.argval) in {type(None), bool, int, float, str, bytes}:
+        argument = instruction.argval
+    else:
+        argument = instruction.argrepr
+    return instruction.opname, argument
+
+
+def _normalized_code_semantic_key(
+    code: types.CodeType,
+) -> tuple[object, ...]:
+    """Compare source semantics across compatible CPython bytecode encodings.
+
+    CPython micro releases may fold the internal ``PUSH_NULL`` call marker into
+    ``LOAD_ATTR`` without changing source semantics.  Offset-bearing jumps and
+    exception-table entries move with that encoding.  This key removes only
+    those interpreter-internal positions while retaining opcodes, operands,
+    constants, scope layout, and normalized exception regions.
+    """
+
+    instructions = tuple(
+        instruction
+        for instruction in dis.get_instructions(code, adaptive=False)
+        if instruction.opname != "PUSH_NULL"
+    )
+    instruction_offsets = tuple(item.offset for item in instructions)
+
+    def instruction_index(offset: int) -> int:
+        return bisect_left(instruction_offsets, offset)
+
+    exception_entries = tuple(
+        (
+            instruction_index(entry.start),
+            instruction_index(entry.end),
+            instruction_index(entry.target),
+            entry.depth,
+            entry.lasti,
+        )
+        for entry in dis.Bytecode(code).exception_entries
+    )
+    return (
+        code.co_argcount,
+        code.co_posonlyargcount,
+        code.co_kwonlyargcount,
+        code.co_nlocals,
+        code.co_stacksize,
+        code.co_flags,
+        code.co_names,
+        code.co_varnames,
+        code.co_freevars,
+        code.co_cellvars,
+        tuple(
+            _normalized_code_constant_key(value) for value in code.co_consts
+        ),
+        tuple(
+            _normalized_instruction_key(item, instruction_index)
+            for item in instructions
+        ),
+        exception_entries,
     )
 
 
@@ -397,8 +506,15 @@ def _validate_source_identity(
         if code.co_name == function.__code__.co_name
     )
     live_key = _code_semantic_key(function.__code__)
-    if not any(_code_semantic_key(code) == live_key for code in candidates):
-        _fail("source_code_identity_mismatch")
+    if any(_code_semantic_key(code) == live_key for code in candidates):
+        return
+    live_normalized = _normalized_code_semantic_key(function.__code__)
+    if any(
+        _normalized_code_semantic_key(code) == live_normalized
+        for code in candidates
+    ):
+        return
+    _fail("source_code_identity_mismatch")
 
 
 def _portable_dependency(

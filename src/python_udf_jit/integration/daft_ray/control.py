@@ -163,7 +163,12 @@ def install_daft_control_hooks(
                     _CALL_STATE.active_func_ids = active
 
             try:
-                registry.bind_expression(expression, record)
+                registry.bind_expression(
+                    expression,
+                    record,
+                    invocation_args=args,
+                    invocation_kwargs=kwargs,
+                )
             except Exception:
                 _emit_fail_open("expression_binding_failed")
             return expression

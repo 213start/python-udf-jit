@@ -48,7 +48,12 @@ class WorkerPythonRegionContinuationIntegrationTest(unittest.TestCase):
         func = FakeFunc(daft_opaque_middle_method)
         record = registry.register(func, daft_method)
         expression = FakeExpression(record.wrapper)
-        registry.bind_expression(expression, record)
+        input_expression = FakeExpression()
+        registry.bind_expression(
+            expression,
+            record,
+            invocation_args=(input_expression,),
+        )
         self.assertEqual(
             registry.finalize_operation(
                 FakeFloatDataFrame(),
