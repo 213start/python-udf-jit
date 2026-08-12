@@ -5,6 +5,7 @@ import functools
 import gc
 import inspect
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -27,6 +28,7 @@ from python_udf_jit.integration.daft_ray.control import (
     install_default_daft_hooks,
     uninstall_daft_control_hooks,
 )
+from python_udf_jit.integration.daft_ray.columnar import ColumnarBatchWrapper
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
 from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
 from python_udf_jit.protocol.codec import decode_artifact
@@ -165,6 +167,20 @@ class RecursiveFakeFunc(FakeFunc):
         return super().__call__(*args, **kwargs)
 
 
+class ColumnarFakeFunc(FakeFunc):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_batch = False
+        self.is_async = False
+        self.is_generator = False
+        self.batch_size = None
+        self.call_option_history = []
+
+    def __call__(self, *args, **kwargs):
+        self.call_option_history.append((self.is_batch, self.use_process))
+        return super().__call__(*args, **kwargs)
+
+
 class FakeDataFrame:
     def __init__(self):
         self.original_with_columns_count = 0
@@ -237,12 +253,14 @@ class ControlHookTest(unittest.TestCase):
         uninstall_daft_control_hooks(FakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RaisingFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RecursiveFakeFunc, FakeDataFrame)
+        uninstall_daft_control_hooks(ColumnarFakeFunc, FakeDataFrame)
         clear_events()
 
     def tearDown(self):
         uninstall_daft_control_hooks(FakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RaisingFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RecursiveFakeFunc, FakeDataFrame)
+        uninstall_daft_control_hooks(ColumnarFakeFunc, FakeDataFrame)
         clear_events()
 
     def test_off_mode_leaves_framework_methods_untouched(self):
@@ -453,6 +471,61 @@ class ControlHookTest(unittest.TestCase):
         self.assertIs(expression.worker_callable.original_callable, original_method)
         self.assertEqual(expression.worker_callable(None, 41), 42)
         self.assertEqual(registry.registration_count, 1)
+
+    def test_columnar_feature_off_keeps_scalar_expression_and_options(self):
+        _, _registry = install(func_class=ColumnarFakeFunc)
+        func = ColumnarFakeFunc(on_error=None, use_process=True)
+        before = (func.is_batch, func.use_process, func._method)
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "0"}):
+            expression = func(FakeExpression())
+        self.assertIsInstance(expression.worker_callable, FallbackOnlyWrapper)
+        self.assertEqual((func.is_batch, func.use_process, func._method), before)
+
+    def test_columnar_feature_on_builds_batch_expression_and_restores_options(self):
+        _, registry = install(func_class=ColumnarFakeFunc)
+        func = ColumnarFakeFunc(on_error=None, use_process=True)
+        original_method = func._method
+        with (
+            mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.columnar."
+                "columnar_boundary_proven",
+                return_value=True,
+            ),
+        ):
+            expression = func(FakeExpression())
+        self.assertIsInstance(expression.worker_callable, ColumnarBatchWrapper)
+        self.assertIs(func._method, original_method)
+        self.assertFalse(func.is_batch)
+        self.assertTrue(func.use_process)
+        FakeDataFrame().with_columns({"value": expression})
+        self.assertEqual(registry.finalization_count, 1)
+        self.assertIsNotNone(expression.worker_callable.scalar_wrapper.invocation_layout)
+
+    def test_columnar_feature_preserves_process_policy_in_expression(self):
+        _, _registry = install(func_class=ColumnarFakeFunc)
+        func = ColumnarFakeFunc(on_error=None, use_process=None)
+        with (
+            mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.columnar."
+                "columnar_boundary_proven",
+                return_value=True,
+            ),
+        ):
+            func(FakeExpression())
+        self.assertEqual(func.call_option_history, [(True, None)])
+        self.assertFalse(func.is_batch)
+        self.assertIsNone(func.use_process)
+
+    def test_columnar_rejects_nonraising_on_error_without_mutation(self):
+        _, _registry = install(func_class=ColumnarFakeFunc)
+        func = ColumnarFakeFunc(on_error="log")
+        before = (func.is_batch, func.use_process, func._method)
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}):
+            expression = func(FakeExpression())
+        self.assertIsInstance(expression.worker_callable, FallbackOnlyWrapper)
+        self.assertEqual((func.is_batch, func.use_process, func._method), before)
 
     def test_with_column_delegation_finalizes_exactly_once(self):
         _, registry = install()

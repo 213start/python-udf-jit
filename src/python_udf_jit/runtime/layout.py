@@ -12,6 +12,7 @@ from python_udf_jit.runtime.ownership import AccessMode, OwnershipKind
 
 
 SCALAR_SLOT_ABI_VERSION = 1
+ARROW_BATCH_ABI_VERSION = 1
 SCALAR_LAYOUT_KIND = "scalar_slot"
 VECTOR_LAYOUT_KIND = "arrow_array"
 BATCH_VIEW_LAYOUT = "batch_view"
@@ -109,6 +110,129 @@ class ProcessIdentity:
         if not isinstance(document, dict) or set(document) != {"pid", "generation"}:
             raise ValueError("invalid process identity fields")
         return cls(document["pid"], document["generation"])  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class ArrowBatchDescriptor:
+    """Serializable, address-free description of a borrowed Arrow batch.
+
+    Buffer addresses and Python object identities deliberately stay out of this
+    value.  A process-local borrow scope owns the corresponding Arrow object and
+    is the only authority that may perform a data load.
+    """
+
+    abi_version: int
+    physical_type: str
+    length: int
+    offset: int
+    chunk_lengths: tuple[int, ...]
+    chunk_offsets: tuple[int, ...]
+    null_count: int
+    validity_buffer_count: int
+    offset_width_bits: int
+    epoch: str
+    borrow_id: str
+    process: ProcessIdentity
+    ownership: str = OwnershipKind.BORROWED_INPUT.value
+    access_mode: str = AccessMode.READ.value
+    layout_kind: str = VECTOR_LAYOUT_KIND
+    descriptor_generation: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.abi_version) is not int
+            or self.abi_version != ARROW_BATCH_ABI_VERSION
+            or type(self.length) is not int
+            or self.length < 0
+            or type(self.offset) is not int
+            or self.offset < 0
+            or not self.chunk_lengths
+            or any(type(value) is not int or value < 0 for value in self.chunk_lengths)
+            or sum(self.chunk_lengths) != self.length
+            or len(self.chunk_offsets) != len(self.chunk_lengths)
+            or any(type(value) is not int or value < 0 for value in self.chunk_offsets)
+            or type(self.null_count) is not int
+            or not 0 <= self.null_count <= self.length
+            or type(self.validity_buffer_count) is not int
+            or not 0 <= self.validity_buffer_count <= len(self.chunk_lengths)
+            or self.offset_width_bits not in {0, 32, 64}
+            or type(self.descriptor_generation) is not int
+            or self.descriptor_generation <= 0
+        ):
+            raise ValueError("invalid Arrow batch descriptor dimensions")
+        for value, field in (
+            (self.physical_type, "Arrow physical type"),
+            (self.epoch, "Arrow descriptor epoch"),
+            (self.borrow_id, "Arrow borrow id"),
+            (self.layout_kind, "Arrow layout kind"),
+            (self.ownership, "Arrow ownership"),
+            (self.access_mode, "Arrow access mode"),
+        ):
+            _non_empty_string(value, field)
+        if (
+            not isinstance(self.process, ProcessIdentity)
+            or self.layout_kind != VECTOR_LAYOUT_KIND
+            or self.ownership != OwnershipKind.BORROWED_INPUT.value
+            or self.access_mode != AccessMode.READ.value
+        ):
+            raise ValueError("invalid Arrow batch descriptor authority")
+
+    @property
+    def chunk_count(self) -> int:
+        return len(self.chunk_lengths)
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "abi_version": self.abi_version,
+            "access_mode": self.access_mode,
+            "borrow_id": self.borrow_id,
+            "chunk_lengths": list(self.chunk_lengths),
+            "chunk_offsets": list(self.chunk_offsets),
+            "descriptor_generation": self.descriptor_generation,
+            "epoch": self.epoch,
+            "layout_kind": self.layout_kind,
+            "length": self.length,
+            "null_count": self.null_count,
+            "offset": self.offset,
+            "offset_width_bits": self.offset_width_bits,
+            "ownership": self.ownership,
+            "physical_type": self.physical_type,
+            "process": self.process.to_document(),
+            "validity_buffer_count": self.validity_buffer_count,
+        }
+
+    @classmethod
+    def from_document(cls, document: object) -> "ArrowBatchDescriptor":
+        expected = {
+            "abi_version", "access_mode", "borrow_id", "chunk_lengths",
+            "chunk_offsets", "descriptor_generation", "epoch", "layout_kind",
+            "length", "null_count", "offset", "offset_width_bits", "ownership",
+            "physical_type", "process", "validity_buffer_count",
+        }
+        if not isinstance(document, dict) or set(document) != expected:
+            raise ValueError("invalid Arrow batch descriptor fields")
+        chunk_lengths = document["chunk_lengths"]
+        chunk_offsets = document["chunk_offsets"]
+        if not isinstance(chunk_lengths, list) or not isinstance(chunk_offsets, list):
+            raise ValueError("invalid Arrow batch descriptor chunks")
+        return cls(
+            abi_version=document["abi_version"],  # type: ignore[arg-type]
+            physical_type=document["physical_type"],  # type: ignore[arg-type]
+            length=document["length"],  # type: ignore[arg-type]
+            offset=document["offset"],  # type: ignore[arg-type]
+            chunk_lengths=tuple(chunk_lengths),  # type: ignore[arg-type]
+            chunk_offsets=tuple(chunk_offsets),  # type: ignore[arg-type]
+            null_count=document["null_count"],  # type: ignore[arg-type]
+            validity_buffer_count=document["validity_buffer_count"],  # type: ignore[arg-type]
+            offset_width_bits=document["offset_width_bits"],  # type: ignore[arg-type]
+            epoch=document["epoch"],  # type: ignore[arg-type]
+            borrow_id=document["borrow_id"],  # type: ignore[arg-type]
+            process=ProcessIdentity.from_document(document["process"]),
+            ownership=document["ownership"],  # type: ignore[arg-type]
+            access_mode=document["access_mode"],  # type: ignore[arg-type]
+            layout_kind=document["layout_kind"],  # type: ignore[arg-type]
+            descriptor_generation=document["descriptor_generation"],  # type: ignore[arg-type]
+        )
 
 
 @dataclass(frozen=True)

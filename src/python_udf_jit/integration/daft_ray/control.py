@@ -35,6 +35,7 @@ _INSTALL_LOCK = threading.RLock()
 _CALL_LOCK = threading.RLock()
 _CALL_STATE = threading.local()
 _DEFAULT_REGISTRY: CandidateRegistry | None = None
+_MISSING = object()
 
 
 class HookStatus(StrEnum):
@@ -81,6 +82,36 @@ def _contains_expression(value: Any, expression_class: type[Any]) -> bool:
         elif isinstance(current, (list, tuple)):
             pending.extend(current)
     return False
+
+
+def _columnar_scalar_call_eligible(
+    func: Any,
+    original_callable: Any,
+    kwargs: dict[str, Any],
+) -> bool:
+    """Conservative, name-free gate for transparent scalar-to-batch lifting."""
+
+    if os.environ.get("UDFJIT_COLUMNAR", "0") != "1" or kwargs:
+        return False
+    try:
+        option_proof = bool(
+            not object.__getattribute__(func, "is_batch")
+            and not object.__getattribute__(func, "is_async")
+            and not object.__getattribute__(func, "is_generator")
+            and object.__getattribute__(func, "on_error") in {None, "raise"}
+        )
+    except (AttributeError, TypeError):
+        return False
+    if not option_proof:
+        return False
+    try:
+        from python_udf_jit.integration.daft_ray.columnar import (
+            columnar_boundary_proven,
+        )
+
+        return columnar_boundary_proven(func, original_callable)
+    except Exception:
+        return False
 
 
 def install_daft_control_hooks(
@@ -146,10 +177,28 @@ def install_daft_control_hooks(
                 active.add(id(self))
                 _CALL_STATE.active_func_ids = active
                 original_callable = self._method
+                use_columnar_batch = _columnar_scalar_call_eligible(
+                    self,
+                    original_callable,
+                    kwargs,
+                )
+                original_is_batch = getattr(self, "is_batch", _MISSING)
                 try:
                     record = registry.register(self, original_callable)
-                    self._method = record.wrapper
+                    if use_columnar_batch:
+                        from python_udf_jit.integration.daft_ray.columnar import (
+                            ColumnarBatchWrapper,
+                        )
+
+                        record.batch_wrapper = ColumnarBatchWrapper(record.wrapper)
+                        self._method = record.batch_wrapper
+                        self.is_batch = True
+                    else:
+                        self._method = record.wrapper
                 except Exception:
+                    self._method = original_callable
+                    if original_is_batch is not _MISSING:
+                        self.is_batch = original_is_batch
                     active.remove(id(self))
                     _CALL_STATE.active_func_ids = active
                     _emit_fail_open("candidate_registration_failed")
@@ -159,6 +208,11 @@ def install_daft_control_hooks(
                     expression = original_func_call(self, *args, **kwargs)
                 finally:
                     self._method = original_callable
+                    if use_columnar_batch:
+                        if original_is_batch is _MISSING:
+                            del self.is_batch
+                        else:
+                            self.is_batch = original_is_batch
                     active.remove(id(self))
                     _CALL_STATE.active_func_ids = active
 

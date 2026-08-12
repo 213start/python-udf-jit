@@ -96,6 +96,7 @@ class CandidateRecord:
     capture_callable: Any
     job_namespace: str
     expires_at: float
+    batch_wrapper: Any | None = None
     expression_ids: set[int] = field(default_factory=set)
     pyexpr_hashes: set[int] = field(default_factory=set)
     invocation_args: tuple[Any, ...] = ()

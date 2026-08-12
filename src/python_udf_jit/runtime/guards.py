@@ -4,9 +4,11 @@ from enum import StrEnum
 from dataclasses import dataclass
 
 from python_udf_jit.runtime.layout import (
+    ARROW_BATCH_ABI_VERSION,
     FLOAT64_SCALAR_TYPE,
     SCALAR_LAYOUT_KIND,
     SCALAR_SLOT_ABI_VERSION,
+    ArrowBatchDescriptor,
     ProcessIdentity,
     ScalarSlotDescriptor,
 )
@@ -26,6 +28,7 @@ class DescriptorRejectCode(StrEnum):
     EPOCH_MISMATCH = "epoch_mismatch"
     ACCESS_MISMATCH = "access_mismatch"
     PROCESS_MISMATCH = "process_mismatch"
+    BORROW_EXPIRED = "borrow_expired"
 
 
 class DescriptorGuardError(ValueError):
@@ -192,6 +195,46 @@ def guard_descriptor(
     if descriptor.epoch != expected_epoch:
         raise DescriptorGuardError(DescriptorRejectCode.EPOCH_MISMATCH)
     if descriptor.access_id != expected_access_id:
+        raise DescriptorGuardError(DescriptorRejectCode.ACCESS_MISMATCH)
+    if descriptor.process != expected_process:
+        raise DescriptorGuardError(DescriptorRejectCode.PROCESS_MISMATCH)
+    return descriptor
+
+
+def guard_arrow_batch_descriptor(
+    descriptor: object,
+    *,
+    expected_epoch: str,
+    expected_borrow_id: str,
+    expected_process: ProcessIdentity,
+    expected_physical_type: str | None = None,
+    expected_length: int | None = None,
+    expected_descriptor_generation: int = 1,
+) -> ArrowBatchDescriptor:
+    """Validate all portable Arrow authority before the first buffer load."""
+
+    if not isinstance(descriptor, ArrowBatchDescriptor):
+        raise DescriptorGuardError(DescriptorRejectCode.INVALID_DESCRIPTOR)
+    if descriptor.abi_version != ARROW_BATCH_ABI_VERSION:
+        raise DescriptorGuardError(DescriptorRejectCode.ABI_MISMATCH)
+    if descriptor.layout_kind != "arrow_array":
+        raise DescriptorGuardError(DescriptorRejectCode.LAYOUT_MISMATCH)
+    if (
+        expected_physical_type is not None
+        and descriptor.physical_type != expected_physical_type
+    ):
+        raise DescriptorGuardError(DescriptorRejectCode.TYPE_MISMATCH)
+    if descriptor.ownership != OwnershipKind.BORROWED_INPUT.value:
+        raise DescriptorGuardError(DescriptorRejectCode.OWNERSHIP_MISMATCH)
+    if descriptor.access_mode != AccessMode.READ.value:
+        raise DescriptorGuardError(DescriptorRejectCode.ACCESS_MODE_MISMATCH)
+    if expected_length is not None and descriptor.length != expected_length:
+        raise DescriptorGuardError(DescriptorRejectCode.CAPACITY_MISMATCH)
+    if descriptor.descriptor_generation != expected_descriptor_generation:
+        raise DescriptorGuardError(DescriptorRejectCode.GENERATION_MISMATCH)
+    if descriptor.epoch != expected_epoch:
+        raise DescriptorGuardError(DescriptorRejectCode.EPOCH_MISMATCH)
+    if descriptor.borrow_id != expected_borrow_id:
         raise DescriptorGuardError(DescriptorRejectCode.ACCESS_MISMATCH)
     if descriptor.process != expected_process:
         raise DescriptorGuardError(DescriptorRejectCode.PROCESS_MISMATCH)
