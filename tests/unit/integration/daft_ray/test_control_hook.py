@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import functools
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -26,7 +27,10 @@ from python_udf_jit.integration.daft_ray.control import (
     uninstall_daft_control_hooks,
 )
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
-from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
+from python_udf_jit.integration.daft_ray.wrapper import (
+    BatchExecutionWrapper,
+    FallbackOnlyWrapper,
+)
 from python_udf_jit.protocol.codec import decode_artifact
 
 
@@ -36,6 +40,13 @@ ROOT = Path(__file__).resolve().parents[4]
 
 def add_one(_instance: object, value: int) -> int:
     return value + 1
+
+
+_VALIDATED_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+
+
+def clean_url(value: str) -> str:
+    return _VALIDATED_URL_RE.sub("", value)
 
 
 def affine(value: float) -> float:
@@ -86,6 +97,14 @@ class FakeExpression:
         self._expr = FakePyExpr()
 
 
+class FakeSeries:
+    def __init__(self, values):
+        self._values = list(values)
+
+    def to_pylist(self):
+        return list(self._values)
+
+
 class FakeComposedExpression(FakeExpression):
     def __init__(self, child):
         super().__init__()
@@ -112,6 +131,21 @@ class FakeFunc:
         if any(isinstance(value, FakeExpression) for value in (*args, *kwargs.values())):
             return FakeExpression(self._method)
         return self._method(None, *args, **kwargs)
+
+
+class BatchAwareFakeFunc(FakeFunc):
+    def __init__(
+        self,
+        method=add_one,
+        *,
+        is_batch=False,
+        batch_size=None,
+        return_dtype="String",
+    ):
+        super().__init__(method)
+        self.is_batch = is_batch
+        self.batch_size = batch_size
+        self.return_dtype = return_dtype
 
 
 class RaisingFakeFunc(FakeFunc):
@@ -195,12 +229,14 @@ def install(*, mode="observe", registry=None, target=None, func_class=FakeFunc):
 class ControlHookTest(unittest.TestCase):
     def setUp(self):
         uninstall_daft_control_hooks(FakeFunc, FakeDataFrame)
+        uninstall_daft_control_hooks(BatchAwareFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RaisingFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RecursiveFakeFunc, FakeDataFrame)
         clear_events()
 
     def tearDown(self):
         uninstall_daft_control_hooks(FakeFunc, FakeDataFrame)
+        uninstall_daft_control_hooks(BatchAwareFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RaisingFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RecursiveFakeFunc, FakeDataFrame)
         clear_events()
@@ -413,6 +449,107 @@ class ControlHookTest(unittest.TestCase):
         self.assertIs(expression.worker_callable.original_callable, original_method)
         self.assertEqual(expression.worker_callable(None, 41), 42)
         self.assertEqual(registry.registration_count, 1)
+
+    def test_force_batch_leaves_non_kernel_scalar_func_on_original_row_path(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "UDFJIT_BATCH_MODE": "force",
+                "UDFJIT_BATCH_MAX_ROWS": "7",
+            },
+            clear=False,
+        ):
+            _, registry = install(func_class=BatchAwareFakeFunc)
+            func = BatchAwareFakeFunc()
+            original_method = func._method
+
+            expression = func(FakeExpression())
+
+        self.assertIs(func._method, original_method)
+        self.assertFalse(func.is_batch)
+        self.assertIsNone(func.batch_size)
+        self.assertIs(expression.worker_callable, original_method)
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_force_batch_attaches_validated_regex_kernel(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"UDFJIT_BATCH_MODE": "force"},
+            clear=False,
+        ):
+            _, _ = install(func_class=BatchAwareFakeFunc)
+            func = BatchAwareFakeFunc(method=clean_url)
+
+            expression = func(FakeExpression())
+
+        wrapper = expression.worker_callable
+        self.assertIsInstance(wrapper, BatchExecutionWrapper)
+        self.assertIsNotNone(wrapper.batch_kernel)
+        self.assertEqual(wrapper.batch_kernel.kind, "arrow_regex_sub")
+
+    def test_force_batch_leaves_boolean_func_on_original_row_path(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"UDFJIT_BATCH_MODE": "force"},
+            clear=False,
+        ):
+            _, registry = install(func_class=BatchAwareFakeFunc)
+            func = BatchAwareFakeFunc(return_dtype="Bool")
+            original_method = func._method
+
+            expression = func(FakeExpression())
+
+        self.assertIs(expression.worker_callable, original_method)
+        self.assertFalse(func.is_batch)
+        self.assertIsNone(func.batch_size)
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_force_batch_leaves_unknown_dtype_on_original_row_path(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"UDFJIT_BATCH_MODE": "force"},
+            clear=False,
+        ):
+            _, registry = install(func_class=BatchAwareFakeFunc)
+            func = BatchAwareFakeFunc(return_dtype=None)
+            original_method = func._method
+
+            expression = func(FakeExpression())
+
+        self.assertIs(expression.worker_callable, original_method)
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_force_batch_leaves_unapproved_numeric_dtype_on_original_path(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"UDFJIT_BATCH_MODE": "force"},
+            clear=False,
+        ):
+            _, registry = install(func_class=BatchAwareFakeFunc)
+            func = BatchAwareFakeFunc(return_dtype="Int64")
+            original_method = func._method
+
+            expression = func(FakeExpression())
+
+        self.assertIs(expression.worker_callable, original_method)
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_force_batch_leaves_existing_batch_func_on_original_hot_path(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"UDFJIT_BATCH_MODE": "force"},
+            clear=False,
+        ):
+            _, registry = install(func_class=BatchAwareFakeFunc)
+            func = BatchAwareFakeFunc(is_batch=True, batch_size=11)
+            original_method = func._method
+
+            expression = func(FakeExpression())
+
+        self.assertIs(expression.worker_callable, original_method)
+        self.assertTrue(func.is_batch)
+        self.assertEqual(func.batch_size, 11)
+        self.assertEqual(registry.registration_count, 0)
 
     def test_with_column_delegation_finalizes_exactly_once(self):
         _, registry = install()

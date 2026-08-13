@@ -13,12 +13,15 @@ from python_udf_jit.integration.daft_ray.carrier import (
     ObjectRefArtifactHandle,
     ProductionCarrierState,
 )
+from python_udf_jit.integration.daft_ray.batch_kernel import RegexSubBatchKernel
 from python_udf_jit.integration.daft_ray.objectref_bridge import (
     clear_driver_artifact_references,
     driver_artifact_references,
 )
 from python_udf_jit.integration.daft_ray.wrapper import (
+    BATCH_WRAPPER_SERIALIZATION_VERSION,
     WRAPPER_SERIALIZATION_VERSION,
+    BatchExecutionWrapper,
     FallbackOnlyWrapper,
 )
 
@@ -31,6 +34,18 @@ def fail_original(value):
     raise OriginalFailure(f"original:{value}")
 
 
+def add_one(_receiver, value):
+    return value + 1
+
+
+class FakeSeries:
+    def __init__(self, values):
+        self.values = list(values)
+
+    def to_pylist(self):
+        return list(self.values)
+
+
 class CountingCallable:
     def __init__(self):
         self.calls = 0
@@ -38,6 +53,29 @@ class CountingCallable:
     def __call__(self, value):
         self.calls += 1
         return value * 2
+
+
+class CountingReceiverCallable:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, _receiver, value):
+        self.calls += 1
+        return value.upper()
+
+
+class UpperBatchKernel:
+    kind = "test_upper"
+
+    def invoke(self, values):
+        return [value.upper() if value is not None else None for value in values]
+
+
+class FailingBatchKernel:
+    kind = "test_failure"
+
+    def invoke(self, _values):
+        raise RuntimeError("kernel unavailable")
 
 
 class _Adapter:
@@ -89,6 +127,69 @@ class WrapperSerializationTest(unittest.TestCase):
         self.assertEqual(restored.candidate_id, wrapper.candidate_id)
         self.assertEqual(restored.carrier.state_sha256, wrapper.carrier.state_sha256)
         self.assertEqual(restored(19, 23), 42)
+
+    def test_batch_wrapper_pickle_roundtrip_preserves_serial_envelope(self):
+        scalar = make_wrapper(add_one)
+        wrapper = BatchExecutionWrapper("candidate-test", scalar)
+
+        restored = pickle.loads(pickle.dumps(wrapper))
+
+        self.assertEqual(
+            restored(None, FakeSeries([1, None, 3])),
+            [2, None, 4],
+        )
+        self.assertEqual(
+            restored.__getstate__()["_serialization_version"],
+            BATCH_WRAPPER_SERIALIZATION_VERSION,
+        )
+
+    def test_batch_wrapper_pickle_roundtrip_preserves_kernel_descriptor(self):
+        wrapper = BatchExecutionWrapper(
+            "candidate-test",
+            make_wrapper(add_one),
+            RegexSubBatchKernel(r"https?://\S+", "", False),
+        )
+
+        restored = pickle.loads(pickle.dumps(wrapper))
+
+        self.assertEqual(restored.batch_kernel, wrapper.batch_kernel)
+
+    def test_batch_kernel_hit_avoids_scalar_wrapper(self):
+        original = CountingReceiverCallable()
+        wrapper = BatchExecutionWrapper(
+            "candidate-test",
+            make_wrapper(original),
+            UpperBatchKernel(),
+        )
+
+        output = wrapper(None, FakeSeries(["a", None, "b"]))
+
+        self.assertEqual(output, ["A", None, "B"])
+        self.assertEqual(original.calls, 0)
+
+    def test_batch_kernel_failure_falls_back_before_scalar_execution(self):
+        original = CountingReceiverCallable()
+        wrapper = BatchExecutionWrapper(
+            "candidate-test",
+            make_wrapper(original),
+            FailingBatchKernel(),
+        )
+
+        output = wrapper(None, FakeSeries(["a", None, "b"]))
+
+        self.assertEqual(output, ["A", None, "B"])
+        self.assertEqual(original.calls, 2)
+
+    def test_batch_wrapper_rejects_unsupported_serialization_version(self):
+        wrapper = BatchExecutionWrapper("candidate-test", make_wrapper(add_one))
+        state = wrapper.__getstate__()
+        state["_serialization_version"] = BATCH_WRAPPER_SERIALIZATION_VERSION + 1
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "batch_wrapper_serialization_version_unsupported",
+        ):
+            wrapper.__setstate__(state)
 
     def test_pickle_roundtrip_drops_process_local_worker_adapter(self):
         wrapper = make_wrapper()

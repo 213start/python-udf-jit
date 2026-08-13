@@ -34,7 +34,10 @@ from python_udf_jit.governance.policy import (
 )
 from python_udf_jit.integration.daft_ray.carrier import ProductionCarrierState
 from python_udf_jit.integration.daft_ray.schema import canonicalize_schema
-from python_udf_jit.integration.daft_ray.wrapper import FallbackOnlyWrapper
+from python_udf_jit.integration.daft_ray.wrapper import (
+    BatchExecutionWrapper,
+    FallbackOnlyWrapper,
+)
 from python_udf_jit.protocol.artifact import build_artifact
 from python_udf_jit.protocol.codec import encode_artifact
 
@@ -65,6 +68,7 @@ class CandidateRecord:
     func_id: int
     candidate_id: str
     wrapper: FallbackOnlyWrapper
+    batch_wrapper: BatchExecutionWrapper | None
     capture_callable: Any
     job_namespace: str
     expires_at: float
@@ -260,6 +264,7 @@ class CandidateRegistry:
                 func_id=func_id,
                 candidate_id=candidate_id,
                 wrapper=wrapper,
+                batch_wrapper=None,
                 capture_callable=func,
                 job_namespace=self._job_namespace,
                 expires_at=self._clock() + self._ttl_seconds,

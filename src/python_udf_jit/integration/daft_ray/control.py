@@ -20,13 +20,16 @@ from python_udf_jit.diagnostics.events import DecisionEvent
 from python_udf_jit.integration.daft_ray.compatibility import (
     DAFT_V0_7_2_TARGET,
     CompatibilityTarget,
+    target_for_objects,
     validate_daft_compatibility,
     validate_func_instance,
 )
+from python_udf_jit.integration.daft_ray.batch_kernel import build_batch_kernel
 from python_udf_jit.integration.daft_ray.objectref_bridge import (
     install_daft_objectref_bridge,
 )
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
+from python_udf_jit.integration.daft_ray.wrapper import BatchExecutionWrapper
 
 
 _HOOK_MARKER = "__python_udf_jit_u2_hook__"
@@ -81,6 +84,34 @@ def _contains_expression(value: Any, expression_class: type[Any]) -> bool:
         elif isinstance(current, (list, tuple)):
             pending.extend(current)
     return False
+
+
+def _batch_positive_int(name: str, default: int, maximum: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if 1 <= value <= maximum else default
+
+
+def _forced_batch_size() -> int | None:
+    if os.environ.get("UDFJIT_BATCH_MODE", "off").strip() != "force":
+        return None
+    return _batch_positive_int("UDFJIT_BATCH_MAX_ROWS", 128, 1_048_576)
+
+
+def _forced_batch_eligible(func: Any, *, has_explicit_kernel: bool) -> bool:
+    """仅显式批 Kernel 才被强制批化；无 Kernel 的函数一律回退原始行式执行。
+
+    此前按 return_dtype（string/list）宽放门禁：无 Kernel 的普通 mapper 也被
+    物理化为 batch UDF 并走 scalar envelope（批输入 + 批内逐行重放原函数），
+    对无批计算收益的算子引入纯包装开销（实测 10k/50k 全部劣化）。
+    改为严格门禁后，无 Kernel 的函数保持原 `@daft.func` 行式路径，不再 envelope。
+    """
+    return has_explicit_kernel
 
 
 def install_daft_control_hooks(
@@ -138,6 +169,23 @@ def install_daft_control_hooks(
                 _emit_fail_open(instance_report.reason)
                 return original_func_call(self, *args, **kwargs)
 
+            forced_batch_size = _forced_batch_size()
+            original_callable = self._method
+            batch_kernel = None
+            if (
+                forced_batch_size is not None
+                and os.environ.get("UDFJIT_BATCH_KERNEL_MODE", "auto").strip() != "off"
+            ):
+                batch_kernel = build_batch_kernel(original_callable)
+            if forced_batch_size is not None and not _forced_batch_eligible(
+                self,
+                has_explicit_kernel=batch_kernel is not None,
+            ):
+                return original_func_call(self, *args, **kwargs)
+            original_is_batch = bool(getattr(self, "is_batch", False))
+            if forced_batch_size is not None and original_is_batch and batch_kernel is None:
+                return original_func_call(self, *args, **kwargs)
+
             with _CALL_LOCK:
                 active = getattr(_CALL_STATE, "active_func_ids", set())
                 if id(self) in active:
@@ -145,11 +193,27 @@ def install_daft_control_hooks(
                 active = set(active)
                 active.add(id(self))
                 _CALL_STATE.active_func_ids = active
-                original_callable = self._method
+                original_is_batch_value = getattr(self, "is_batch", None)
+                original_batch_size = getattr(self, "batch_size", None)
                 try:
                     record = registry.register(self, original_callable)
-                    self._method = record.wrapper
+                    if forced_batch_size is None:
+                        self._method = record.wrapper
+                    else:
+                        if record.batch_wrapper is None:
+                            record.batch_wrapper = BatchExecutionWrapper(
+                                candidate_id=record.candidate_id,
+                                scalar_wrapper=record.wrapper,
+                                batch_kernel=batch_kernel,
+                            )
+                        self._method = record.batch_wrapper
+                        self.is_batch = True
+                        self.batch_size = forced_batch_size
                 except Exception:
+                    if original_is_batch_value is not None:
+                        self.is_batch = original_is_batch_value
+                    if hasattr(self, "batch_size"):
+                        self.batch_size = original_batch_size
                     active.remove(id(self))
                     _CALL_STATE.active_func_ids = active
                     _emit_fail_open("candidate_registration_failed")
@@ -159,6 +223,10 @@ def install_daft_control_hooks(
                     expression = original_func_call(self, *args, **kwargs)
                 finally:
                     self._method = original_callable
+                    if original_is_batch_value is not None:
+                        self.is_batch = original_is_batch_value
+                    if hasattr(self, "batch_size"):
+                        self.batch_size = original_batch_size
                     active.remove(id(self))
                     _CALL_STATE.active_func_ids = active
 
@@ -254,21 +322,34 @@ def install_default_daft_hooks(daft_module: Any) -> HookResult:
             ),
         )
     try:
-        flotilla_module = importlib.import_module(
-            "daft.runners.flotilla"
-        )
-        bridge = install_daft_objectref_bridge(
-            flotilla_module
-        )
-        if not bridge.installed:
-            _emit_fail_open(bridge.reason)
-            return HookResult(
-                HookStatus.ERROR,
-                bridge.reason,
+        batch_observe = mode == "observe" and _forced_batch_size() is not None
+        if not batch_observe:
+            flotilla_module = importlib.import_module(
+                "daft.runners.flotilla"
             )
+            bridge = install_daft_objectref_bridge(
+                flotilla_module
+            )
+            if not bridge.installed:
+                _emit_fail_open(bridge.reason)
+                return HookResult(
+                    HookStatus.ERROR,
+                    bridge.reason,
+                )
         udf_module = importlib.import_module("daft.udf.udf_v2")
         dataframe_module = importlib.import_module("daft.dataframe.dataframe")
         expressions_module = importlib.import_module("daft.expressions.expressions")
+        target = DAFT_V0_7_2_TARGET
+        if batch_observe and os.environ.get("UDFJIT_BATCH_RUNTIME_TARGET", "0") == "1":
+            runtime_target = target_for_objects(
+                daft_module,
+                udf_module.Func,
+                dataframe_module.DataFrame,
+            )
+            target = runtime_target._replace(
+                func_private_fields=DAFT_V0_7_2_TARGET.func_private_fields,
+                func_option_fields=DAFT_V0_7_2_TARGET.func_option_fields,
+            )
         if _DEFAULT_REGISTRY is None:
             _DEFAULT_REGISTRY = CandidateRegistry(
                 manifest_sha256,
@@ -291,6 +372,7 @@ def install_default_daft_hooks(daft_module: Any) -> HookResult:
             expression_class=expressions_module.Expression,
             mode=mode,
             registry=_DEFAULT_REGISTRY,
+            target=target,
         )
     except Exception as error:
         _emit_fail_open(f"hook_install_failed:{type(error).__name__}")
