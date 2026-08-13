@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import secrets
+import time
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -41,6 +43,19 @@ class ColumnarRuntimeCounters:
     native_batch_batches: int = 0
     native_batch_rows: int = 0
     native_batch_unavailable_batches: int = 0
+    dictionary_batches: int = 0
+    dictionary_rows: int = 0
+    dictionary_unique_values: int = 0
+    dictionary_python_unique_rows: int = 0
+    dictionary_python_output_rows: int = 0
+    dictionary_unavailable_batches: int = 0
+    dictionary_disabled_batches: int = 0
+    full_python_materializations: int = 0
+    full_python_materialized_rows: int = 0
+    dictionary_encode_ns: int = 0
+    dictionary_unique_materialize_ns: int = 0
+    dictionary_target_ns: int = 0
+    dictionary_reconstruct_ns: int = 0
     python_scalar_fallback_rows: int = 0
     precommit_failures: int = 0
     published_batches: int = 0
@@ -261,6 +276,28 @@ def _physical_types_for_logical(logical_type: str) -> frozenset[str]:
     }.get(logical_type, frozenset())
 
 
+def _physical_type_matches_logical(
+    physical_type: str,
+    logical_type: str,
+    *,
+    allow_dictionary: bool,
+) -> bool:
+    if physical_type in _physical_types_for_logical(logical_type):
+        return True
+    if (
+        not allow_dictionary
+        or logical_type != "string"
+        or not physical_type.startswith("dictionary<")
+    ):
+        return False
+    # Do not admit dictionary values of arbitrary Python/object types. The
+    # descriptor is address-free and the Arrow-domain helper performs the
+    # corresponding runtime structural checks before semantic entry.
+    return physical_type.startswith("dictionary<values=string,") or (
+        physical_type.startswith("dictionary<values=large_string,")
+    )
+
+
 def _arrow_output_type(pa: Any, logical_type: str) -> Any:
     factory = {
         "string": "large_string",
@@ -273,6 +310,81 @@ def _arrow_output_type(pa: Any, logical_type: str) -> Any:
     if factory is None:
         raise TypeError("columnar_output_type_unsupported")
     return getattr(pa, factory)()
+
+
+@dataclass(frozen=True)
+class _ArrowDictionaryDomain:
+    dictionary: Any
+    indices: Any
+    row_count: int
+    unique_count: int
+
+
+class _DictionaryDomainRefusal(ValueError):
+    pass
+
+
+def _arrow_dictionary_domain(array: Any, compute: Any) -> _ArrowDictionaryDomain:
+    current = array
+    if _physical_type(current).startswith("dictionary<"):
+        current = compute.dictionary_decode(current)
+    combiner = getattr(current, "combine_chunks", None)
+    if callable(combiner):
+        current = combiner()
+    if _physical_type(current) not in {"string", "large_string"}:
+        raise _DictionaryDomainRefusal("dictionary_value_type_unsupported")
+    if int(getattr(current, "null_count", 0)) != 0:
+        raise _DictionaryDomainRefusal("dictionary_input_nullable")
+    encoded = compute.dictionary_encode(current)
+    combiner = getattr(encoded, "combine_chunks", None)
+    if callable(combiner):
+        encoded = combiner()
+    dictionary = getattr(encoded, "dictionary", None)
+    indices = getattr(encoded, "indices", None)
+    if dictionary is None or indices is None:
+        raise _DictionaryDomainRefusal("dictionary_encoding_invalid")
+    if _physical_type(dictionary) not in {"string", "large_string"}:
+        raise _DictionaryDomainRefusal("dictionary_value_type_unsupported")
+    row_count = len(array)
+    unique_count = len(dictionary)
+    if len(indices) != row_count:
+        raise _DictionaryDomainRefusal("dictionary_index_length_mismatch")
+    if int(getattr(dictionary, "null_count", 0)) != 0 or int(
+        getattr(indices, "null_count", 0)
+    ) != 0:
+        raise _DictionaryDomainRefusal("dictionary_null_unsupported")
+    return _ArrowDictionaryDomain(
+        dictionary,
+        indices,
+        row_count,
+        unique_count,
+    )
+
+
+def _dictionary_domain_profitable(
+    domain: _ArrowDictionaryDomain,
+    *,
+    capacity: int,
+) -> bool:
+    return (
+        type(capacity) is int
+        and 0 < domain.unique_count <= capacity
+        and domain.unique_count * 2 <= domain.row_count
+    )
+
+
+def _diagnostic_phase_start(enabled: bool) -> int:
+    return time.perf_counter_ns() if enabled else 0
+
+
+def _diagnostic_phase_finish(
+    enabled: bool,
+    started: int,
+    counter_name: str,
+) -> None:
+    if enabled:
+        elapsed = time.perf_counter_ns() - started
+        setattr(_COUNTERS, counter_name, getattr(_COUNTERS, counter_name) + elapsed)
 
 
 @dataclass
@@ -390,6 +502,16 @@ class ColumnarBatchWrapper:
         semantic_entry = False
         counted_rows = False
         native_accounted = False
+        dictionary_accounted = False
+        dictionary_enabled = (
+            os.environ.get("UDFJIT_COLUMNAR_DICTIONARY", "1") == "1"
+        )
+        diagnostic_timing = bool(
+            os.environ.get("UDFJIT_COLUMNAR_DIAGNOSTIC_DIR", "").strip()
+        )
+        if not dictionary_enabled:
+            _COUNTERS.dictionary_disabled_batches += 1
+            dictionary_accounted = True
         try:
             layout = getattr(self.scalar_wrapper, "invocation_layout", None)
             epoch = getattr(layout, "epoch", "")
@@ -411,8 +533,10 @@ class ColumnarBatchWrapper:
                 ):
                     descriptor = scope.descriptor
                     assert descriptor is not None
-                    if descriptor.physical_type not in _physical_types_for_logical(
-                        logical_type
+                    if not _physical_type_matches_logical(
+                        descriptor.physical_type,
+                        logical_type,
+                        allow_dictionary=dictionary_enabled,
                     ):
                         raise TypeError("columnar_input_physical_type_mismatch")
                 native_executor, native_process = (
@@ -422,10 +546,161 @@ class ColumnarBatchWrapper:
                     _COUNTERS.native_batch_unavailable_batches += 1
                     native_accounted = True
                 _COUNTERS.arrow_borrows += len(scopes)
-                columns = tuple(scope.load_pylist() for scope in scopes)
-                _COUNTERS.materializations += len(columns)
                 _COUNTERS.rows += row_count
                 counted_rows = True
+
+                dictionary_capacity = (
+                    getattr(native_executor, "dictionary_capacity", None)
+                    if native_executor is not None
+                    else None
+                )
+                dictionary_layout_eligible = (
+                    dictionary_enabled
+                    and native_executor is not None
+                    and type(dictionary_capacity) is int
+                    and len(arrows) == 1
+                    and tuple(layout.input_types) == ("string",)
+                    and layout.output_type == "string"
+                    and tuple(layout.input_nullability) == (False,)
+                    and not layout.output_nullable
+                    and scopes[0].descriptor is not None
+                    and scopes[0].descriptor.null_count == 0
+                )
+                if dictionary_layout_eligible:
+                    try:
+                        import pyarrow as pa
+
+                        compute = importlib.import_module("pyarrow.compute")
+
+                        started = _diagnostic_phase_start(diagnostic_timing)
+                        try:
+                            domain = _arrow_dictionary_domain(
+                                arrows[0],
+                                compute,
+                            )
+                        finally:
+                            _diagnostic_phase_finish(
+                                diagnostic_timing,
+                                started,
+                                "dictionary_encode_ns",
+                            )
+                        if not _dictionary_domain_profitable(
+                            domain,
+                            capacity=dictionary_capacity,
+                        ):
+                            raise _DictionaryDomainRefusal(
+                                "dictionary_domain_unprofitable"
+                            )
+                        loader = getattr(domain.dictionary, "to_pylist", None)
+                        if not callable(loader):
+                            raise _DictionaryDomainRefusal(
+                                "dictionary_pylist_loader_unavailable"
+                            )
+                        started = _diagnostic_phase_start(diagnostic_timing)
+                        try:
+                            unique_values = list(loader())
+                            if (
+                                len(unique_values) != domain.unique_count
+                                or any(
+                                    type(value) is not str
+                                    for value in unique_values
+                                )
+                            ):
+                                raise _DictionaryDomainRefusal(
+                                    "dictionary_unique_values_invalid"
+                                )
+                        finally:
+                            _diagnostic_phase_finish(
+                                diagnostic_timing,
+                                started,
+                                "dictionary_unique_materialize_ns",
+                            )
+                    except Exception:
+                        # No target has been called: the existing guarded full
+                        # batch loop remains a legal whole-batch fallback.
+                        domain = None
+                        _COUNTERS.dictionary_unavailable_batches += 1
+                        dictionary_accounted = True
+                    else:
+                        _COUNTERS.materializations += 1
+                        _COUNTERS.dictionary_python_unique_rows += len(
+                            unique_values
+                        )
+                        if not native_executor.guards_match(native_process):
+                            domain = None
+                            unique_values = []
+                            _COUNTERS.dictionary_unavailable_batches += 1
+                            dictionary_accounted = True
+                        else:
+                            semantic_entry = True
+                            dictionary_accounted = True
+                            native_accounted = True
+                            _COUNTERS.dictionary_batches += 1
+                            _COUNTERS.dictionary_rows += row_count
+                            _COUNTERS.dictionary_unique_values += (
+                                domain.unique_count
+                            )
+                            _COUNTERS.native_batch_batches += 1
+                            _COUNTERS.native_batch_rows += row_count
+                            started = _diagnostic_phase_start(diagnostic_timing)
+                            try:
+                                unique_outputs = native_executor.invoke(
+                                    (unique_values,)
+                                )
+                            finally:
+                                _diagnostic_phase_finish(
+                                    diagnostic_timing,
+                                    started,
+                                    "dictionary_target_ns",
+                                )
+                            if (
+                                len(unique_outputs) != domain.unique_count
+                                or any(
+                                    type(value) is not str
+                                    for value in unique_outputs
+                                )
+                            ):
+                                raise TypeError(
+                                    "dictionary_unique_outputs_invalid"
+                                )
+                            _COUNTERS.dictionary_python_output_rows += len(
+                                unique_outputs
+                            )
+                            started = _diagnostic_phase_start(diagnostic_timing)
+                            try:
+                                unique_output_array = pa.array(
+                                    unique_outputs,
+                                    type=_arrow_output_type(
+                                        pa,
+                                        layout.output_type,
+                                    ),
+                                )
+                                result = compute.take(
+                                    unique_output_array,
+                                    domain.indices,
+                                )
+                                if len(result) != row_count:
+                                    raise ValueError(
+                                        "columnar_output_length_mismatch"
+                                    )
+                            finally:
+                                _diagnostic_phase_finish(
+                                    diagnostic_timing,
+                                    started,
+                                    "dictionary_reconstruct_ns",
+                                )
+                            _COUNTERS.published_batches += 1
+                            return result
+
+                if dictionary_enabled and not dictionary_accounted:
+                    _COUNTERS.dictionary_unavailable_batches += 1
+                    dictionary_accounted = True
+                columns = tuple(scope.load_pylist() for scope in scopes)
+                _COUNTERS.materializations += len(columns)
+                _COUNTERS.full_python_materializations += len(columns)
+                _COUNTERS.full_python_materialized_rows += (
+                    row_count * len(columns)
+                )
                 if (
                     native_executor is not None
                     and native_executor.guards_match(native_process)
@@ -441,6 +716,8 @@ class ColumnarBatchWrapper:
                         native_accounted = True
                     semantic_entry = True
                     outputs = self._invoke_scalar_rows(daft_instance, columns)
+                _COUNTERS.full_python_materializations += 1
+                _COUNTERS.full_python_materialized_rows += len(outputs)
             import pyarrow as pa
 
             result = pa.array(
@@ -458,6 +735,9 @@ class ColumnarBatchWrapper:
             if not native_accounted:
                 _COUNTERS.native_batch_unavailable_batches += 1
                 native_accounted = True
+            if dictionary_enabled and not dictionary_accounted:
+                _COUNTERS.dictionary_unavailable_batches += 1
+                dictionary_accounted = True
             _COUNTERS.precommit_failures += 1
             # A framework-compatible Arrow value is still required.  Recover
             # only before semantic entry and evaluate the original callable in
@@ -471,8 +751,14 @@ class ColumnarBatchWrapper:
                 if not counted_rows:
                     _COUNTERS.rows += row_count
                 _COUNTERS.materializations += len(columns)
+                _COUNTERS.full_python_materializations += len(columns)
+                _COUNTERS.full_python_materialized_rows += (
+                    row_count * len(columns)
+                )
             semantic_entry = True
             outputs = self._invoke_scalar_rows(daft_instance, columns)
+            _COUNTERS.full_python_materializations += 1
+            _COUNTERS.full_python_materialized_rows += len(outputs)
             import pyarrow as pa
 
             layout = getattr(self.scalar_wrapper, "invocation_layout", None)

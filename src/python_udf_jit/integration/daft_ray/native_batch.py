@@ -152,6 +152,7 @@ class NativeBatchExecutor:
         runtime_guard: Any | None,
         watcher_snapshots: tuple[_WatcherSnapshot, ...],
         batch_loop: Callable[[list[object]], list[object]],
+        dictionary_capacity: int | None,
     ) -> None:
         self.owner_pid = process.pid
         self.process_generation = process.generation
@@ -160,6 +161,7 @@ class NativeBatchExecutor:
         self._runtime_guard = runtime_guard
         self._watcher_snapshots = watcher_snapshots
         self._batch_loop = batch_loop
+        self.dictionary_capacity = dictionary_capacity
 
     def __getstate__(self) -> object:
         raise TypeError("native batch executor is process-local")
@@ -290,6 +292,19 @@ def build_native_batch_executor(
             runtime_guard=runtime_guard,
             watcher_snapshots=watcher_snapshots,
             batch_loop=batch_loop,
+            dictionary_capacity=(
+                value_plan.capacity
+                if (
+                    value_plan is not None
+                    and value_plan.input_type == "exact_unicode"
+                    and value_plan.result_type == "exact_unicode"
+                    # A dynamic entry guard must be observed on every logical
+                    # row. Collapsing duplicate lanes would weaken that temporal
+                    # contract, so only unguarded value plans are eligible.
+                    and value_plan.entry_guard is None
+                )
+                else None
+            ),
         )
         return executor if executor.guards_match(process) else None
     except Exception:

@@ -35,6 +35,7 @@ from python_udf_jit.runtime.guards import (
 from python_udf_jit.runtime.layout import ArrowBatchDescriptor
 from tests.unit.compiler.test_invariant_calls import (
     _choose_location,
+    _index_external_record,
     _render_frozen_record,
 )
 
@@ -86,6 +87,34 @@ class FakeArrowArray:
     def to_pylist(self):
         return list(self.values)
 
+    def slice(self, offset, length=None):
+        values = (
+            self.values[offset:]
+            if length is None
+            else self.values[offset:offset + length]
+        )
+        return FakeArrowArray(
+            values,
+            physical_type=self.type,
+            offset=self.offset + offset,
+        )
+
+
+class FakeDictionaryArray(FakeArrowArray):
+    def __init__(self, dictionary, indices, *, offset=0):
+        self.dictionary = FakeArrowArray(dictionary)
+        self.indices = FakeArrowArray(indices, physical_type="int32")
+        super().__init__(
+            [self.dictionary.values[index] for index in self.indices.values],
+            physical_type=(
+                "dictionary<values=large_string, indices=int32, ordered=0>"
+            ),
+            offset=offset,
+        )
+
+    def combine_chunks(self):
+        return self
+
 
 class FakeChunkedArray:
     def __init__(self, chunks):
@@ -100,6 +129,9 @@ class FakeChunkedArray:
     def to_pylist(self):
         return [value for chunk in self.chunks for value in chunk.to_pylist()]
 
+    def combine_chunks(self):
+        return FakeArrowArray(fake_arrow_values(self))
+
 
 class FakeSeries:
     def __init__(self, array):
@@ -113,11 +145,49 @@ class GuardOrderedArrowArray(FakeArrowArray):
     def __init__(self, values, executor):
         super().__init__(values)
         self.executor = executor
+        self.dictionary_encode_calls = 0
 
     def to_pylist(self):
         if not self.executor.guard_checked:
             raise AssertionError("native guard must dominate Arrow data load")
         return super().to_pylist()
+
+
+def fake_arrow_values(array):
+    if isinstance(array, FakeChunkedArray):
+        return [value for chunk in array.chunks for value in chunk.values]
+    return list(array.values)
+
+
+class FakeArrowCompute:
+    @staticmethod
+    def dictionary_decode(array):
+        return FakeArrowArray(fake_arrow_values(array))
+
+    @staticmethod
+    def dictionary_encode(array):
+        executor = getattr(array, "executor", None)
+        if executor is not None and not executor.guard_checked:
+            raise AssertionError("native guard must dominate dictionary encode")
+        if hasattr(array, "dictionary_encode_calls"):
+            array.dictionary_encode_calls += 1
+        dictionary = []
+        positions = {}
+        indices = []
+        for value in fake_arrow_values(array):
+            if value not in positions:
+                positions[value] = len(dictionary)
+                dictionary.append(value)
+            indices.append(positions[value])
+        return FakeDictionaryArray(dictionary, indices)
+
+    @staticmethod
+    def take(values, indices):
+        source = fake_arrow_values(values)
+        return FakeArrowArray(
+            [source[index] for index in fake_arrow_values(indices)],
+            physical_type=values.type,
+        )
 
 
 class FakePyArrow:
@@ -130,13 +200,31 @@ class FakePyArrow:
         return FakeArrowArray(values, physical_type=type or "large_string")
 
 
+def fake_pyarrow_modules():
+    # PyArrow 22 does not expose ``compute`` after only ``import pyarrow``.
+    # Production code must import the submodule explicitly.
+    return {
+        "pyarrow": FakePyArrow,
+        "pyarrow.compute": FakeArrowCompute,
+    }
+
+
 class FakeNativeExecutor:
-    def __init__(self, function, *, process_matches=True, guards_match=True):
+    def __init__(
+        self,
+        function,
+        *,
+        process_matches=True,
+        guards_match=True,
+        dictionary_capacity=None,
+    ):
         self.function = function
         self.process_matches = process_matches
         self.guard_result = guards_match
         self.guard_checked = False
         self.invocations = 0
+        self.dictionary_capacity = dictionary_capacity
+        self.invocation_columns = []
 
     def matches_process(self, _process):
         return self.process_matches
@@ -147,6 +235,7 @@ class FakeNativeExecutor:
 
     def invoke(self, columns):
         self.invocations += 1
+        self.invocation_columns.append(tuple(list(column) for column in columns))
         return [self.function(value) for value in columns[0]]
 
 
@@ -270,7 +359,7 @@ class ColumnarBatchTest(unittest.TestCase):
     def test_batch_preserves_receiver_null_order_and_output_type(self):
         wrapper = make_batch_wrapper()
         with (
-            mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}),
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
             mock.patch.dict(os.environ, {"UDFJIT_MODE": "off"}),
         ):
             result = wrapper(object(), FakeSeries(FakeArrowArray(["a", None, "b"])))
@@ -300,7 +389,7 @@ class ColumnarBatchTest(unittest.TestCase):
         executor = FakeNativeExecutor(str.upper)
         wrapper._native_batch_executor = executor
         array = GuardOrderedArrowArray(["a", "b", "c"], executor)
-        with mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}):
+        with mock.patch.dict(sys.modules, fake_pyarrow_modules()):
             result = wrapper(object(), FakeSeries(array))
         self.assertEqual(result.to_pylist(), ["A", "B", "C"])
         self.assertEqual(executor.invocations, 1)
@@ -313,6 +402,286 @@ class ColumnarBatchTest(unittest.TestCase):
         self.assertEqual(counters["python_scalar_fallback_rows"], 0)
         self.assertEqual(counters["vector_batches"], 0)
         self.assertEqual(counters["vector_unavailable_batches"], 1)
+
+    def test_dictionary_domain_invokes_only_first_occurrence_unique_values(self):
+        scalar_calls = []
+        target_calls = []
+
+        def scalar_receiver(_receiver, value):
+            scalar_calls.append(value)
+            return value
+
+        def target(value):
+            target_calls.append(value)
+            return value.upper()
+
+        wrapper = make_batch_wrapper(scalar_receiver)
+        executor = FakeNativeExecutor(target, dictionary_capacity=16)
+        wrapper._native_batch_executor = executor
+        values = ["a", "b", "a", "a", "b", "a"]
+        array = GuardOrderedArrowArray(values, executor)
+        with (
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "UDFJIT_COLUMNAR_DICTIONARY": "1",
+                    "UDFJIT_COLUMNAR_DIAGNOSTIC_DIR": "",
+                },
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.columnar."
+                "time.perf_counter_ns",
+                side_effect=AssertionError("timer used with diagnostics off"),
+            ),
+        ):
+            result = wrapper(object(), FakeSeries(array))
+
+        self.assertEqual(result.to_pylist(), ["A", "B", "A", "A", "B", "A"])
+        self.assertEqual(target_calls, ["a", "b"])
+        self.assertEqual(executor.invocation_columns, [(["a", "b"],)])
+        self.assertEqual(array.dictionary_encode_calls, 1)
+        self.assertEqual(scalar_calls, [])
+        counters = snapshot_columnar_counters()
+        self.assertEqual(counters["dictionary_batches"], 1)
+        self.assertEqual(counters["dictionary_rows"], 6)
+        self.assertEqual(counters["dictionary_unique_values"], 2)
+        self.assertEqual(counters["dictionary_python_unique_rows"], 2)
+        self.assertEqual(counters["dictionary_python_output_rows"], 2)
+        self.assertEqual(counters["full_python_materializations"], 0)
+        self.assertEqual(counters["full_python_materialized_rows"], 0)
+        self.assertEqual(counters["native_batch_rows"], 6)
+        self.assertEqual(counters["vector_batches"], 0)
+        self.assertEqual(counters["dictionary_encode_ns"], 0)
+        self.assertEqual(counters["dictionary_target_ns"], 0)
+
+    def test_dictionary_toggle_zero_preserves_full_materialization_path(self):
+        wrapper = make_batch_wrapper()
+        executor = FakeNativeExecutor(str.upper, dictionary_capacity=16)
+        wrapper._native_batch_executor = executor
+        values = ["a", "b", "a", "a", "b", "a"]
+        with (
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+            mock.patch.dict(
+                os.environ,
+                {"UDFJIT_COLUMNAR_DICTIONARY": "0"},
+            ),
+        ):
+            result = wrapper(object(), FakeSeries(FakeArrowArray(values)))
+
+        self.assertEqual(result.to_pylist(), [value.upper() for value in values])
+        self.assertEqual(executor.invocation_columns, [(values,)])
+        counters = snapshot_columnar_counters()
+        self.assertEqual(counters["dictionary_batches"], 0)
+        self.assertEqual(counters["dictionary_disabled_batches"], 1)
+        self.assertEqual(counters["full_python_materializations"], 2)
+        self.assertEqual(counters["full_python_materialized_rows"], 12)
+
+    def test_dictionary_domain_is_enabled_by_default_at_batch_boundary(self):
+        wrapper = make_batch_wrapper()
+        executor = FakeNativeExecutor(str.upper, dictionary_capacity=16)
+        wrapper._native_batch_executor = executor
+        with (
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            result = wrapper(
+                object(),
+                FakeSeries(FakeArrowArray(["a", "a", "a", "a"])),
+            )
+        self.assertEqual(result.to_pylist(), ["A"] * 4)
+        self.assertEqual(executor.invocation_columns, [(["a"],)])
+        self.assertEqual(snapshot_columnar_counters()["dictionary_batches"], 1)
+
+    def test_dictionary_domain_refuses_null_without_semantic_weakening(self):
+        wrapper = make_batch_wrapper()
+        executor = FakeNativeExecutor(
+            lambda value: "NULL-CALLED" if value is None else value.upper(),
+            dictionary_capacity=16,
+        )
+        wrapper._native_batch_executor = executor
+        values = ["a", None, "a", None]
+        with (
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+            mock.patch.dict(
+                os.environ,
+                {"UDFJIT_COLUMNAR_DICTIONARY": "1"},
+            ),
+        ):
+            result = wrapper(object(), FakeSeries(FakeArrowArray(values)))
+        self.assertEqual(
+            result.to_pylist(),
+            ["A", "NULL-CALLED", "A", "NULL-CALLED"],
+        )
+        self.assertEqual(executor.invocation_columns, [(values,)])
+        counters = snapshot_columnar_counters()
+        self.assertEqual(counters["dictionary_batches"], 0)
+        self.assertEqual(counters["dictionary_unavailable_batches"], 1)
+        self.assertEqual(counters["full_python_materializations"], 2)
+
+    def test_dictionary_diagnostics_record_each_phase_only_when_enabled(self):
+        wrapper = make_batch_wrapper()
+        wrapper._native_batch_executor = FakeNativeExecutor(
+            str.upper,
+            dictionary_capacity=16,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "UDFJIT_COLUMNAR_DICTIONARY": "1",
+                        "UDFJIT_COLUMNAR_DIAGNOSTIC_DIR": directory,
+                    },
+                ),
+            ):
+                wrapper(
+                    object(),
+                    FakeSeries(FakeArrowArray(["a", "b", "a", "a"])),
+                )
+        counters = snapshot_columnar_counters()
+        for name in (
+            "dictionary_encode_ns",
+            "dictionary_unique_materialize_ns",
+            "dictionary_target_ns",
+            "dictionary_reconstruct_ns",
+        ):
+            self.assertGreater(counters[name], 0)
+
+    def test_dictionary_domain_refuses_all_unique_and_capacity_miss(self):
+        for values, capacity in (
+            (["a", "b", "c", "d"], 16),
+            (["a", "b", "c", "a", "b", "c"], 2),
+        ):
+            with self.subTest(values=values, capacity=capacity):
+                reset_columnar_counters_for_testing()
+                wrapper = make_batch_wrapper()
+                executor = FakeNativeExecutor(str.upper, dictionary_capacity=capacity)
+                wrapper._native_batch_executor = executor
+                with (
+                    mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+                    mock.patch.dict(
+                        os.environ,
+                        {"UDFJIT_COLUMNAR_DICTIONARY": "1"},
+                    ),
+                ):
+                    result = wrapper(object(), FakeSeries(FakeArrowArray(values)))
+                self.assertEqual(
+                    result.to_pylist(),
+                    [value.upper() for value in values],
+                )
+                self.assertEqual(executor.invocation_columns, [(values,)])
+                counters = snapshot_columnar_counters()
+                self.assertEqual(counters["dictionary_batches"], 0)
+                self.assertEqual(counters["dictionary_unavailable_batches"], 1)
+                self.assertEqual(counters["full_python_materializations"], 2)
+
+    def test_dictionary_domain_handles_sliced_chunked_and_dictionary_inputs(self):
+        inputs = (
+            FakeChunkedArray(
+                (
+                    FakeArrowArray(["unused", "a", "b"], offset=3).slice(1),
+                    FakeArrowArray(["a", "a"]),
+                )
+            ),
+            FakeDictionaryArray(["a", "b"], [0, 1, 0, 0], offset=7),
+        )
+        for array in inputs:
+            with self.subTest(physical_type=str(array.type)):
+                reset_columnar_counters_for_testing()
+                wrapper = make_batch_wrapper()
+                executor = FakeNativeExecutor(str.upper, dictionary_capacity=16)
+                wrapper._native_batch_executor = executor
+                with (
+                    mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+                    mock.patch.dict(
+                        os.environ,
+                        {"UDFJIT_COLUMNAR_DICTIONARY": "1"},
+                    ),
+                ):
+                    result = wrapper(object(), FakeSeries(array))
+                self.assertEqual(result.to_pylist(), ["A", "B", "A", "A"])
+                self.assertEqual(executor.invocation_columns, [(["a", "b"],)])
+                self.assertEqual(
+                    snapshot_columnar_counters()["full_python_materializations"],
+                    0,
+                )
+
+    def test_dictionary_guard_miss_precedes_encode_and_falls_back_once(self):
+        scalar_calls = []
+
+        def scalar_receiver(_receiver, value):
+            scalar_calls.append(value)
+            return value.upper()
+
+        wrapper = make_batch_wrapper(scalar_receiver)
+        executor = FakeNativeExecutor(
+            str.upper,
+            guards_match=False,
+            dictionary_capacity=16,
+        )
+        wrapper._native_batch_executor = executor
+        array = GuardOrderedArrowArray(["a", "a", "a", "a"], executor)
+        with (
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+            mock.patch.dict(
+                os.environ,
+                {"UDFJIT_COLUMNAR_DICTIONARY": "1", "UDFJIT_MODE": "off"},
+            ),
+        ):
+            result = wrapper(object(), FakeSeries(array))
+        self.assertEqual(result.to_pylist(), ["A"] * 4)
+        self.assertEqual(scalar_calls, ["a"] * 4)
+        self.assertEqual(executor.invocations, 0)
+        self.assertEqual(array.dictionary_encode_calls, 0)
+        counters = snapshot_columnar_counters()
+        self.assertEqual(counters["dictionary_batches"], 0)
+        self.assertEqual(counters["dictionary_unavailable_batches"], 1)
+
+    def test_dictionary_target_exceptions_keep_unique_first_occurrence_order(self):
+        for values, failure, expected_calls in (
+            (["bad", "bad", "ok", "bad"], "bad", ["bad"]),
+            (["a", "a", "bad", "a"], "bad", ["a", "bad"]),
+        ):
+            with self.subTest(values=values):
+                reset_columnar_counters_for_testing()
+                scalar_calls = []
+                target_calls = []
+
+                def scalar_receiver(_receiver, value):
+                    scalar_calls.append(value)
+                    return value
+
+                def target(value):
+                    target_calls.append(value)
+                    if value == failure:
+                        raise ValueError("dictionary-target-error")
+                    return value.upper()
+
+                wrapper = make_batch_wrapper(scalar_receiver)
+                wrapper._native_batch_executor = FakeNativeExecutor(
+                    target,
+                    dictionary_capacity=16,
+                )
+                with (
+                    mock.patch.dict(sys.modules, fake_pyarrow_modules()),
+                    mock.patch.dict(
+                        os.environ,
+                        {"UDFJIT_COLUMNAR_DICTIONARY": "1"},
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "dictionary-target-error",
+                    ):
+                        wrapper(object(), FakeSeries(FakeArrowArray(values)))
+                self.assertEqual(target_calls, expected_calls)
+                self.assertEqual(scalar_calls, [])
+                counters = snapshot_columnar_counters()
+                self.assertEqual(counters["dictionary_batches"], 1)
+                self.assertEqual(counters["published_batches"], 0)
+                self.assertEqual(counters["postcommit_replays"], 0)
 
     def test_native_compile_rejection_is_precommit_scalar_fallback(self):
         scalar_calls = []
@@ -328,7 +697,7 @@ class ColumnarBatchTest(unittest.TestCase):
                 "build_native_batch_executor",
                 return_value=None,
             ) as build,
-            mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}),
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
             mock.patch.dict(os.environ, {"UDFJIT_MODE": "off"}),
         ):
             result = wrapper(object(), FakeSeries(FakeArrowArray(["a", "b"])))
@@ -350,7 +719,7 @@ class ColumnarBatchTest(unittest.TestCase):
                 "build_native_batch_executor",
                 return_value=rebuilt,
             ) as build,
-            mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}),
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
         ):
             result = wrapper(object(), FakeSeries(FakeArrowArray(["a"])))
         self.assertEqual(result.to_pylist(), ["A"])
@@ -375,7 +744,7 @@ class ColumnarBatchTest(unittest.TestCase):
         wrapper = make_batch_wrapper(scalar_receiver)
         executor = FakeNativeExecutor(native_target)
         wrapper._native_batch_executor = executor
-        with mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}):
+        with mock.patch.dict(sys.modules, fake_pyarrow_modules()):
             with self.assertRaisesRegex(ValueError, "native-bad-row"):
                 wrapper(
                     object(),
@@ -404,6 +773,7 @@ class ColumnarBatchTest(unittest.TestCase):
         self.assertIsNotNone(executor)
         self.assertIn(remap_text, jit.force_calls)
         self.assertEqual(len(jit.force_calls), 2)
+        self.assertIsNone(executor.dictionary_capacity)
         self.assertEqual(executor.invoke((["α", "β"],)), ["a", "b"])
         with self.assertRaises(TypeError):
             pickle.dumps(executor)
@@ -442,9 +812,28 @@ class ColumnarBatchTest(unittest.TestCase):
             self.assertIn(_choose_location, jit.force_calls)
             self.assertIn("__udfjit_value_cache__", vars(_render_frozen_record))
             self.assertIn("__udfjit_invariant_cache__", vars(_choose_location))
+            self.assertEqual(executor.dictionary_capacity, 16_384)
         finally:
             vars(_render_frozen_record).pop("__udfjit_value_cache__", None)
             vars(_choose_location).pop("__udfjit_invariant_cache__", None)
+
+    def test_guarded_value_plan_refuses_dictionary_domain_reuse(self):
+        wrapper = make_batch_wrapper(receiver_trampoline(_index_external_record))
+        jit = FakeCinderXJit()
+        try:
+            with mock.patch(
+                "python_udf_jit.integration.daft_ray.native_batch."
+                "importlib.import_module",
+                side_effect=fake_cinderx_imports(jit),
+            ):
+                executor = build_native_batch_executor(
+                    wrapper.scalar_wrapper,
+                    process=_process_identity(),
+                )
+            self.assertIsNotNone(executor)
+            self.assertIsNone(executor.dictionary_capacity)
+        finally:
+            vars(_index_external_record).pop("__udfjit_value_cache__", None)
 
     def test_live_target_code_drift_falls_back_before_arrow_load(self):
         wrapper = make_batch_wrapper(receiver_trampoline(remap_text))
@@ -480,7 +869,7 @@ class ColumnarBatchTest(unittest.TestCase):
         try:
             array = GuardOrderedArrowArray(["α"], tracking)
             with (
-                mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}),
+                mock.patch.dict(sys.modules, fake_pyarrow_modules()),
                 mock.patch.dict(os.environ, {"UDFJIT_MODE": "off"}),
             ):
                 result = wrapper(object(), FakeSeries(array))
@@ -503,7 +892,7 @@ class ColumnarBatchTest(unittest.TestCase):
         wrapper = make_batch_wrapper(receiver)
         series = FakeSeries(FakeArrowArray(["a", "b"], physical_type="opaque"))
         with (
-            mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}),
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
             mock.patch.dict(os.environ, {"UDFJIT_MODE": "off"}),
         ):
             result = wrapper(object(), series)
@@ -524,7 +913,7 @@ class ColumnarBatchTest(unittest.TestCase):
 
         wrapper = make_two_input_batch_wrapper(receiver)
         with (
-            mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}),
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
             mock.patch.dict(os.environ, {"UDFJIT_MODE": "off"}),
         ):
             with self.assertRaisesRegex(
@@ -550,7 +939,7 @@ class ColumnarBatchTest(unittest.TestCase):
 
         wrapper = make_batch_wrapper(receiver)
         with (
-            mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}),
+            mock.patch.dict(sys.modules, fake_pyarrow_modules()),
             mock.patch.dict(os.environ, {"UDFJIT_MODE": "off"}),
         ):
             with self.assertRaisesRegex(ValueError, "bad-row"):
@@ -564,7 +953,7 @@ class ColumnarBatchTest(unittest.TestCase):
         wrapper = pickle.loads(pickle.dumps(make_batch_wrapper()))
         with tempfile.TemporaryDirectory() as directory:
             with (
-                mock.patch.dict(sys.modules, {"pyarrow": FakePyArrow}),
+                mock.patch.dict(sys.modules, fake_pyarrow_modules()),
                 mock.patch.dict(
                     os.environ,
                     {
