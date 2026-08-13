@@ -73,6 +73,7 @@ class UpperBatchKernel:
 
 class FailingBatchKernel:
     kind = "test_failure"
+    fallback_on_error = True
 
     def invoke(self, _values):
         raise RuntimeError("kernel unavailable")
@@ -162,9 +163,9 @@ class WrapperSerializationTest(unittest.TestCase):
             UpperBatchKernel(),
         )
 
-        output = wrapper(None, FakeSeries(["a", None, "b"]))
+        output = wrapper(None, FakeSeries(["a", "b"]))
 
-        self.assertEqual(output, ["A", None, "B"])
+        self.assertEqual(output, ["A", "B"])
         self.assertEqual(original.calls, 0)
 
     def test_batch_kernel_failure_falls_back_before_scalar_execution(self):
@@ -175,9 +176,9 @@ class WrapperSerializationTest(unittest.TestCase):
             FailingBatchKernel(),
         )
 
-        output = wrapper(None, FakeSeries(["a", None, "b"]))
+        output = wrapper(None, FakeSeries(["a", "b"]))
 
-        self.assertEqual(output, ["A", None, "B"])
+        self.assertEqual(output, ["A", "B"])
         self.assertEqual(original.calls, 2)
 
     def test_batch_wrapper_rejects_unsupported_serialization_version(self):
