@@ -191,13 +191,21 @@ def validate_func_instance(
             if name.startswith("_") and not name.startswith("__")
         )
     )
-    if private_fields != tuple(sorted(target.func_private_fields)):
-        return CompatibilityReport(False, "func_private_fields_mismatch")
-    missing_options = tuple(
-        field for field in target.func_option_fields if field not in namespace
-    )
-    if missing_options:
-        return CompatibilityReport(False, "func_option_fields_mismatch")
-    if not callable(namespace.get("_method")):
-        return CompatibilityReport(False, "func_method_invalid")
-    return CompatibilityReport(True, "compatible")
+    if private_fields == tuple(sorted(target.func_private_fields)):
+        missing_options = tuple(
+            field for field in target.func_option_fields if field not in namespace
+        )
+        if missing_options:
+            return CompatibilityReport(False, "func_option_fields_mismatch")
+        if not callable(namespace.get("_method")):
+            return CompatibilityReport(False, "func_method_invalid")
+        return CompatibilityReport(True, "compatible")
+    # 原生 batch UDF 形态（`@daft.udf` / `@daft.func.batch`）：私有字段为空、
+    # 无 `_method` 替换缝，但带 `inner`/`wrapped_inner` 批处理函数与 batch_size。
+    # 这类函数已经是 Daft 原生批 UDF（is_batch 路径），UDF JIT 应放行以便对
+    # 批内函数（inner）做透明形态识别，而不是在识别前回退为原始执行。
+    if private_fields == ():
+        inner = namespace.get("inner") or namespace.get("wrapped_inner")
+        if callable(inner) and "batch_size" in namespace:
+            return CompatibilityReport(True, "compatible_native_batch_udf")
+    return CompatibilityReport(False, "func_private_fields_mismatch")

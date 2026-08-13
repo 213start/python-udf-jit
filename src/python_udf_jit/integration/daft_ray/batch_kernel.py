@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+import os
+from pathlib import Path
 import re
 from types import FunctionType
 from typing import Any, Callable, Protocol, runtime_checkable
@@ -313,6 +315,55 @@ def _build_regex_kernel(descriptor: tuple[str, bool, str]) -> BatchKernel:
     return RegexSubBatchKernel(pattern, replacement, ignore_case)
 
 
+# ---------------------------------------------------------------------------
+# 成本门禁（静态成本表）：识别到 Kernel 后查表，Arrow 批实现比 Python 标量
+# 更快（speedup >= 阈值）才替换；更慢/未维护成本数据的形态一律回退原始行式。
+#
+# speedup 数据来自 10k 单算子 microbench（microbench_fineweb_arrow_kernels.py）：
+#   speedup = 标量耗时 / Arrow 批耗时；<1 表示 Arrow 更慢（HTML 0.223x、NFKC 0.385x）。
+# 指纹 key 与 `_kernel_fingerprint` 一致（regex 用 pattern:ignore_case:replacement）。
+# ---------------------------------------------------------------------------
+
+_COST_GATE_MIN_SPEEDUP = 1.05
+
+# 静态成本表：kernel 指纹 -> Arrow/Scalar 速度比（来自 10k microbench 实测）
+_COST_SPEEDUP_TABLE: dict[str, float] = {
+    "regex:https?://\\S+|www\\.\\S+:True:": 5.863,  # clean_links -> 替换
+    "regex:[\\w.+-]+@[\\w.-]+\\.\\w+:False:": 10.276,  # clean_email -> 替换
+    "regex:(?i)(copyright\\s*\\(?c\\)?|©|\\(c\\)|all rights reserved)[^\\n.]*\\.?:True:": 7.753,  # clean_copyright -> 替换
+    "regex:<[^>]+>:False:": 0.223,  # clean_html -> Arrow 更慢，回退
+    "normalize:NFKC": 0.385,  # fix_unicode -> Arrow 更慢，回退
+}
+
+
+def _kernel_fingerprint(kernel: BatchKernel) -> str:
+    """Kernel 稳定指纹（kind + 参数），用于成本表查找。"""
+    if isinstance(kernel, RegexSubBatchKernel):
+        return f"regex:{kernel.pattern}:{kernel.ignore_case}:{kernel.replacement}"
+    if isinstance(kernel, NormalizeBatchKernel):
+        return f"normalize:{kernel.form}"
+    if isinstance(kernel, TranslateBatchKernel):
+        return f"translate:{kernel.mapping}"
+    if isinstance(kernel, LengthFilterBatchKernel):
+        return f"length:{kernel.min_length}:{kernel.max_length}"
+    return f"callable:{kernel.kind}"
+
+
+def _cost_gate_passes(
+    kernel: BatchKernel,
+    original_callable: Callable[..., Any] | None = None,
+) -> bool:
+    """查静态成本表：Arrow 批实现更快（speedup >= 阈值）才允许替换。
+
+    成本表中无该形态数据时默认回退（不替换），避免未经验证的劣化。
+    """
+    fingerprint = _kernel_fingerprint(kernel)
+    speedup = _COST_SPEEDUP_TABLE.get(fingerprint)
+    if speedup is None:
+        return False
+    return speedup >= _COST_GATE_MIN_SPEEDUP
+
+
 def build_batch_kernel(
     original_callable: Callable[..., Any],
 ) -> BatchKernel | None:
@@ -321,21 +372,29 @@ def build_batch_kernel(
     不依赖算子名、不依赖显式注册、不依赖白名单；任何匹配通用形态的
     函数（regex-sub / unicode-normalize / maketrans-translate / 长度区间）
     都自动获得对应的 Arrow 批 Kernel。
+
+    识别到 Kernel 后再过成本门禁（UDFJIT_COST_SAMPLE_PATH 样本微测）：
+    若 Arrow 批实现不比 Python 标量更快（speedup < 1.05），拒绝该 Kernel
+    返回 None —— 无 Kernel 即回退原始行式，不做批输入/批处理替换。
     """
     leaf = _transparent_leaf(original_callable)
     if leaf is None:
         return None
     regex = _regex_sub_descriptor(leaf)
     if regex is not None:
-        return _build_regex_kernel(regex)
+        kernel = _build_regex_kernel(regex)
+        return kernel if _cost_gate_passes(kernel, original_callable) else None
     form = _normalize_descriptor(leaf)
     if form is not None:
-        return NormalizeBatchKernel(form)
+        kernel = NormalizeBatchKernel(form)
+        return kernel if _cost_gate_passes(kernel, original_callable) else None
     mapping = _translate_descriptor(leaf)
     if mapping is not None:
-        return TranslateBatchKernel(mapping)
+        kernel = TranslateBatchKernel(mapping)
+        return kernel if _cost_gate_passes(kernel, original_callable) else None
     bounds = _length_filter_descriptor(leaf)
     if bounds is not None:
         low, high = bounds
-        return LengthFilterBatchKernel(low, high)
+        kernel = LengthFilterBatchKernel(low, high)
+        return kernel if _cost_gate_passes(kernel, original_callable) else None
     return None

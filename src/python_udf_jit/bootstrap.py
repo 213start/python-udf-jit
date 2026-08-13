@@ -96,10 +96,10 @@ def bootstrap_from_environment() -> PostImportHook | None:
 
     def install(module: ModuleType) -> None:
         from python_udf_jit.integration.daft_ray.control import (
-            install_default_daft_hooks,
+            install_default_daft_hooks_with_legacy,
         )
 
-        result = install_default_daft_hooks(module)
+        result = install_default_daft_hooks_with_legacy(module)
         if (
             os.environ.get("UDFJIT_DIAGNOSTICS", "off") != "off"
             and result.status.value not in {"installed", "already_installed"}

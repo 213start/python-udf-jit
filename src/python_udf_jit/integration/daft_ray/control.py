@@ -114,6 +114,48 @@ def _forced_batch_eligible(func: Any, *, has_explicit_kernel: bool) -> bool:
     return has_explicit_kernel
 
 
+def _native_batch_inner(func: Any) -> Callable[..., Any] | None:
+    """取 Daft 原生 batch UDF（`@daft.udf` / `@daft.func.batch`）的批内函数。
+
+    这类对象私有字段为空、无 `_method` 替换缝，批处理逻辑在 `inner`/
+    `wrapped_inner` 中；UDF JIT 对批内函数做透明形态识别，命中 Kernel 后
+    用 kernel 包装替换 `inner`，保持 Daft 批输入热路径的同时替换批内计算。
+    """
+    try:
+        namespace = object.__getattribute__(func, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    if type(namespace) is not dict:
+        return None
+    inner = namespace.get("inner") or namespace.get("wrapped_inner")
+    return inner if callable(inner) else None
+
+
+def _kernel_native_batch_inner(
+    batch_kernel: Any,
+    batch_size: int,
+) -> Callable[..., Any]:
+    """把原生 batch UDF 的批内函数替换为透明识别 Kernel 的批执行包装。
+
+    返回函数签名与 Daft `@daft.udf` 的 `inner` 一致：接收 Series（或 list），
+    整批调用 kernel.invoke，不再批内逐元素重放原业务函数。
+    """
+
+    def kernel_inner(series: Any) -> list[Any]:
+        values = (
+            series.to_pylist()
+            if hasattr(series, "to_pylist")
+            else list(series)
+        )
+        if not values:
+            return []
+        return batch_kernel.invoke(values)
+
+    kernel_inner.__name__ = "kernel_batch_inner"
+    kernel_inner.__qualname__ = "kernel_batch_inner"
+    return kernel_inner
+
+
 def install_daft_control_hooks(
     *,
     daft_module: Any,
@@ -170,7 +212,10 @@ def install_daft_control_hooks(
                 return original_func_call(self, *args, **kwargs)
 
             forced_batch_size = _forced_batch_size()
-            original_callable = self._method
+            native_inner = _native_batch_inner(self)
+            original_callable = (
+                native_inner if native_inner is not None else self._method
+            )
             batch_kernel = None
             if (
                 forced_batch_size is not None
@@ -184,6 +229,18 @@ def install_daft_control_hooks(
                 return original_func_call(self, *args, **kwargs)
             original_is_batch = bool(getattr(self, "is_batch", False))
             if forced_batch_size is not None and original_is_batch and batch_kernel is None:
+                return original_func_call(self, *args, **kwargs)
+            if (
+                native_inner is not None
+                and batch_kernel is not None
+                and forced_batch_size is not None
+            ):
+                # 原生 batch UDF：保持 Daft 批输入热路径，仅把批内逐元素计算
+                # 替换为透明识别的批 Kernel（命中 inner 闭包捕获的业务函数）。
+                namespace = object.__getattribute__(self, "__dict__")
+                namespace["inner"] = _kernel_native_batch_inner(
+                    batch_kernel, forced_batch_size
+                )
                 return original_func_call(self, *args, **kwargs)
 
             with _CALL_LOCK:
@@ -285,6 +342,82 @@ def uninstall_daft_control_hooks(
                 )
 
 
+def install_legacy_udf_hooks(
+    legacy_udf_class: type[Any],
+    *,
+    mode: str,
+) -> HookResult:
+    """劫持 Daft `@daft.udf`（daft.udf.legacy.UDF）的 `__call__`。
+
+    legacy UDF 是 VOLC_BATCH_MAPPER_UDF=1 时业务仓使用的原生批 UDF 形态：
+    私有字段为空、无 `_method` 替换缝，批处理逻辑在 `inner`/`wrapped_inner` 中。
+    现有 Func hook（`install_daft_control_hooks`）只劫持 `@daft.func`（udf_v2.Func），
+    对 legacy UDF 完全不感知，导致 D 组（batch开/UDF开）的批内计算从未进入识别。
+
+    本 hook：在 `legacy.UDF.__call__` 构造 Expression 前，用 `_native_batch_inner`
+    取批内函数做透明形态识别（build_batch_kernel），命中 Kernel 后把
+    `inner` 与 `wrapped_inner.inner` 替换为 kernel 包装，保持 Daft 批输入热路径，
+    仅替换批内逐元素计算为真正批 Kernel。
+    """
+
+    if mode == "off":
+        return HookResult(HookStatus.DISABLED, "mode_off")
+    if mode not in {"observe", "auto"}:
+        return HookResult(HookStatus.DISABLED, "invalid_mode")
+
+    with _INSTALL_LOCK:
+        original_func_call = legacy_udf_class.__call__
+        if getattr(original_func_call, _HOOK_MARKER, False):
+            return HookResult(HookStatus.ALREADY_INSTALLED, "hooks_already_installed")
+
+        @functools.wraps(original_func_call)
+        def wrapped_func_call(self, *args: Any, **kwargs: Any) -> Any:
+            forced_batch_size = _forced_batch_size()
+            if forced_batch_size is None:
+                return original_func_call(self, *args, **kwargs)
+            if (
+                os.environ.get("UDFJIT_BATCH_KERNEL_MODE", "auto").strip() == "off"
+            ):
+                return original_func_call(self, *args, **kwargs)
+            native_inner = _native_batch_inner(self)
+            if native_inner is None:
+                return original_func_call(self, *args, **kwargs)
+            try:
+                batch_kernel = build_batch_kernel(native_inner)
+            except Exception:
+                _emit_fail_open("legacy_udf_kernel_build_failed")
+                return original_func_call(self, *args, **kwargs)
+            if batch_kernel is None:
+                return original_func_call(self, *args, **kwargs)
+            try:
+                namespace = object.__getattribute__(self, "__dict__")
+                kernel_inner = _kernel_native_batch_inner(
+                    batch_kernel, forced_batch_size
+                )
+                # 只替换真正的批函数 `inner`。`wrapped_inner.inner` 是工厂
+                # （UninitializedUdf.initialize 调用它返回批函数），必须保持工厂
+                # 语义：实测 `wrapped_inner.inner() is namespace["inner"]`，
+                # 因此替换 inner 后工厂调用自然返回 kernel 包装。
+                namespace["inner"] = kernel_inner
+            except Exception:
+                _emit_fail_open("legacy_udf_inner_replace_failed")
+            return original_func_call(self, *args, **kwargs)
+
+        setattr(wrapped_func_call, _HOOK_MARKER, True)
+        setattr(wrapped_func_call, _ORIGINAL_METHOD, original_func_call)
+        legacy_udf_class.__call__ = wrapped_func_call
+        return HookResult(HookStatus.INSTALLED, "legacy_udf_hooks_installed")
+
+
+def uninstall_legacy_udf_hooks(legacy_udf_class: type[Any]) -> None:
+    """卸载 legacy UDF hook（与 uninstall_daft_control_hooks 对称）。"""
+
+    with _INSTALL_LOCK:
+        func_method = legacy_udf_class.__call__
+        if getattr(func_method, _HOOK_MARKER, False):
+            legacy_udf_class.__call__ = getattr(func_method, _ORIGINAL_METHOD)
+
+
 def _manifest_sha256_from_environment() -> str | None:
     explicit = os.environ.get("UDFJIT_MANIFEST_SHA256", "")
     if explicit:
@@ -377,3 +510,31 @@ def install_default_daft_hooks(daft_module: Any) -> HookResult:
     except Exception as error:
         _emit_fail_open(f"hook_install_failed:{type(error).__name__}")
         return HookResult(HookStatus.ERROR, "hook_install_failed")
+
+
+def install_default_daft_hooks_with_legacy(daft_module: Any) -> HookResult:
+    """安装 Func hook + legacy `@daft.udf` hook。
+
+    legacy UDF（daft.udf.legacy.UDF）是 VOLC_BATCH_MAPPER_UDF=1 时业务仓的原生批
+    UDF 形态；Func hook 对它不感知，需额外劫持其 `__call__` 才能对批内函数做透明
+    识别。legacy hook 失败只 fail-open，不影响主 Func hook 安装。
+    """
+
+    result = install_default_daft_hooks(daft_module)
+    if result.status not in (HookStatus.INSTALLED, HookStatus.ALREADY_INSTALLED):
+        return result
+    try:
+        legacy_udf_module = importlib.import_module("daft.udf.legacy")
+        legacy_result = install_legacy_udf_hooks(
+            legacy_udf_module.UDF,
+            mode=os.environ.get("UDFJIT_MODE", "off"),
+        )
+        if legacy_result.status == HookStatus.INSTALLED:
+            return HookResult(
+                HookStatus.INSTALLED,
+                f"{result.reason};{legacy_result.reason}",
+            )
+        return result
+    except Exception as error:
+        _emit_fail_open(f"legacy_udf_hook_install_failed:{type(error).__name__}")
+        return result
