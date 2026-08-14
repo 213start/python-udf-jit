@@ -26,6 +26,10 @@ from python_udf_jit.integration.daft_ray.compatibility import (
 from python_udf_jit.integration.daft_ray.objectref_bridge import (
     install_daft_objectref_bridge,
 )
+from python_udf_jit.integration.daft_ray.native_expression import (
+    NativeExpressionCandidate,
+    NativeExpressionLineageRegistry,
+)
 from python_udf_jit.integration.daft_ray.registry import CandidateRegistry
 
 
@@ -36,6 +40,78 @@ _CALL_LOCK = threading.RLock()
 _CALL_STATE = threading.local()
 _DEFAULT_REGISTRY: CandidateRegistry | None = None
 _MISSING = object()
+_NO_NATIVE_EXPRESSION = object()
+
+_LINEAGE_PRESERVING_METHODS = {
+    "__getitem__",
+    "agg",
+    "agg_concat",
+    "agg_list",
+    "agg_set",
+    "any_value",
+    "count",
+    "describe",
+    "distinct",
+    "drop_duplicates",
+    "drop_nan",
+    "drop_null",
+    "exclude",
+    "explode",
+    "filter",
+    "into_batches",
+    "into_partitions",
+    "limit",
+    "max",
+    "mean",
+    "melt",
+    "min",
+    "offset",
+    "pivot",
+    "repartition",
+    "sample",
+    "sort",
+    "stddev",
+    "sum",
+    "summarize",
+    "unique",
+    "unpivot",
+    "with_column",
+    "with_column_renamed",
+    "with_columns_renamed",
+}
+_LINEAGE_TERMINAL_METHODS = {
+    "__len__",
+    "collect",
+    "count_rows",
+    "show",
+    "to_arrow",
+    "to_dask_dataframe",
+    "to_pandas",
+    "to_pydict",
+    "to_pylist",
+    "to_ray_dataset",
+    "to_torch_iter_dataset",
+    "to_torch_map_dataset",
+}
+_LINEAGE_FORCE_FALLBACK_METHODS = {
+    "__iter__",
+    "concat",
+    "except_all",
+    "except_distinct",
+    "groupby",
+    "intersect",
+    "intersect_all",
+    "iter_partitions",
+    "iter_rows",
+    "join",
+    "pipe",
+    "transform",
+    "to_arrow_iter",
+    "union",
+    "union_all",
+    "union_all_by_name",
+    "union_by_name",
+}
 
 
 class HookStatus(StrEnum):
@@ -50,6 +126,14 @@ class HookStatus(StrEnum):
 class HookResult:
     status: HookStatus
     reason: str
+
+
+@dataclass(frozen=True)
+class _NativeExpressionProof:
+    expression: Any
+    wrapper_guard: Any
+    semantic_guard: Any
+    kind: str
 
 
 def _emit_fail_open(reason_code: str) -> None:
@@ -91,7 +175,10 @@ def _columnar_scalar_call_eligible(
 ) -> bool:
     """Conservative, name-free gate for transparent scalar-to-batch lifting."""
 
-    if os.environ.get("UDFJIT_COLUMNAR", "0") != "1" or kwargs:
+    columnar_mode = os.environ.get("UDFJIT_COLUMNAR", "0")
+    if columnar_mode == "native-expr":
+        return False
+    if columnar_mode != "1" or kwargs:
         return False
     try:
         option_proof = bool(
@@ -114,6 +201,388 @@ def _columnar_scalar_call_eligible(
         return False
 
 
+def _native_expression_lowering(
+    daft_module: Any,
+    original_func_call: Any,
+    func: Any,
+    original_callable: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Any:
+    """Lower a structurally proven unary transform into Daft's expression IR."""
+
+    if os.environ.get("UDFJIT_COLUMNAR", "0") not in {"1", "native-expr"}:
+        return _NO_NATIVE_EXPRESSION
+    if len(args) != 1 or kwargs:
+        return _NO_NATIVE_EXPRESSION
+    try:
+        if (
+            object.__getattribute__(func, "is_batch")
+            or object.__getattribute__(func, "is_async")
+            or object.__getattribute__(func, "is_generator")
+            or object.__getattribute__(func, "on_error") not in {None, "raise"}
+        ):
+            return _NO_NATIVE_EXPRESSION
+        from python_udf_jit.compiler.vector_predicate import (
+            capture_string_length_predicate,
+            capture_string_transform,
+        )
+        from python_udf_jit.integration.daft_ray.schema import (
+            canonicalize_logical_type,
+        )
+        from python_udf_jit.integration.daft_ray.typed_loop_worker import (
+            resolve_typed_loop_callable,
+        )
+
+        resolved = resolve_typed_loop_callable(original_callable)
+        output_type = canonicalize_logical_type(func.return_dtype)
+        if output_type == "string":
+            plan = capture_string_transform(resolved.function)
+        elif output_type == "bool":
+            plan = capture_string_length_predicate(
+                resolved.function,
+                bound_arguments=resolved.bound_arguments,
+            )
+        else:
+            return _NO_NATIVE_EXPRESSION
+
+        # Constructing a Daft batch UDF is observable framework work even when
+        # its expression is later discarded. Prove a supported native shape
+        # first so unsupported UDFs retain the exact feature-off plan.
+        expression = _native_expression_nonnull_guard(
+            daft_module,
+            original_func_call,
+            func,
+            args[0],
+            resolved.function,
+            resolved.bound_arguments,
+        )
+        if output_type == "string":
+            if plan.kind == "translation":
+                for source, replacement in plan.replacements:
+                    expression = expression.replace(source, replacement)
+                return _NativeExpressionProof(
+                    expression,
+                    resolved.wrapper_guard,
+                    plan,
+                    "translation",
+                )
+            if plan.kind == "whitespace":
+                result = expression.regexp_replace(
+                    plan.arrow_pattern,
+                    " ",
+                ).lstrip().rstrip()
+                return _NativeExpressionProof(
+                    result,
+                    resolved.wrapper_guard,
+                    plan,
+                    "whitespace",
+                )
+            if plan.kind == "regex":
+                result = expression.regexp_replace(
+                    plan.pattern,
+                    plan.replacement,
+                )
+                return _NativeExpressionProof(
+                    result,
+                    resolved.wrapper_guard,
+                    plan,
+                    "regex",
+                )
+        elif output_type == "bool":
+            length = expression.length()
+            lower = (
+                length >= plan.lower
+                if plan.lower_inclusive
+                else length > plan.lower
+            )
+            upper = (
+                length <= plan.upper
+                if plan.upper_inclusive
+                else length < plan.upper
+            )
+            result = lower & upper
+            return _NativeExpressionProof(
+                result,
+                resolved.wrapper_guard,
+                plan,
+                "length",
+            )
+    except Exception:
+        pass
+    return _NO_NATIVE_EXPRESSION
+
+
+def _validate_native_expression_nonnull_series(
+    series: Any,
+    target: Any,
+    bound_arguments: dict[str, object],
+) -> Any:
+    """Borrow a non-null Arrow batch or reproduce the first null-lane error."""
+
+    array = series.to_arrow()
+    null_count = int(getattr(array, "null_count", 0))
+    if os.environ.get("UDFJIT_COLUMNAR_DIAGNOSTIC_DIR", "").strip():
+        from python_udf_jit.integration.daft_ray.columnar import (
+            record_native_expression_null_guard,
+        )
+
+        record_native_expression_null_guard(
+            rows=len(array),
+            null_miss=bool(null_count),
+        )
+    if null_count:
+        # Captured native-expression regions are pure exact-string operations;
+        # null is their only value-dependent exceptional lane. Invoke the live
+        # scalar authority at the first null to preserve its exception.
+        for index, value in enumerate(array.to_pylist()):
+            if value is None:
+                try:
+                    target(value, **bound_arguments)
+                except Exception as error:
+                    # Daft 0.7.2 row UDFs report one indexed PyO3 error inside
+                    # a ComputeError. Batch UDF exceptions otherwise escape as
+                    # the raw Python type, so reconstruct that public boundary.
+                    from daft.exceptions import DaftCoreException
+
+                    raise DaftCoreException(
+                        "DaftError::ComputeError Error processing some rows:\n"
+                        f"{index}: DaftError::PyO3Error "
+                        f"{type(error).__name__}: {error}"
+                    ) from None
+                raise TypeError("native_expression_null_contract_failed")
+    return array
+
+
+def _native_expression_nonnull_guard(
+    daft_module: Any,
+    original_func_call: Any,
+    func: Any,
+    expression: Any,
+    target: Any,
+    bound_arguments: Any,
+) -> Any:
+    """Insert one transparent Arrow-batch null guard before native lowering."""
+
+    func_factory = getattr(daft_module, "func", None)
+    batch = getattr(func_factory, "batch", None)
+    if not callable(batch):
+        # Unit-test framework doubles have no batch decorator. Real Daft 0.7.2
+        # compatibility validation requires it before this path is installed.
+        return expression
+    frozen_arguments = dict(bound_arguments)
+
+    def validate_nonnull(series):
+        return _validate_native_expression_nonnull_series(
+            series,
+            target,
+            frozen_arguments,
+        )
+
+    validate_nonnull.__name__ = getattr(target, "__name__", "validate_nonnull")
+    validate_nonnull.__qualname__ = getattr(
+        target,
+        "__qualname__",
+        validate_nonnull.__name__,
+    )
+
+    batch_options = {
+        "return_dtype": daft_module.DataType.string(),
+        "on_error": "raise",
+    }
+    try:
+        process_policy = object.__getattribute__(func, "use_process")
+    except (AttributeError, TypeError):
+        process_policy = None
+    if process_policy is not None:
+        if type(process_policy) is not bool:
+            raise TypeError("native_expression_process_policy_invalid")
+        batch_options["use_process"] = process_policy
+    validator = batch(**batch_options)(validate_nonnull)
+    return original_func_call(validator, expression)
+
+
+def _record_native_expression_lowering(kind: str) -> None:
+    if not os.environ.get("UDFJIT_COLUMNAR_DIAGNOSTIC_DIR", "").strip():
+        return
+    from python_udf_jit.integration.daft_ray.columnar import (
+        record_native_expression_lowering,
+    )
+
+    record_native_expression_lowering(kind)
+
+
+def _record_native_expression_guard(
+    *,
+    checks: int,
+    misses: int,
+    rebuilt: bool,
+) -> None:
+    if not os.environ.get("UDFJIT_COLUMNAR_DIAGNOSTIC_DIR", "").strip():
+        return
+    from python_udf_jit.integration.daft_ray.columnar import (
+        record_native_expression_guard,
+    )
+
+    record_native_expression_guard(
+        checks=checks,
+        misses=misses,
+        rebuilt=rebuilt,
+    )
+
+
+def _lineage_bypass_enabled() -> bool:
+    return bool(getattr(_CALL_STATE, "native_lineage_bypass", False))
+
+
+def _with_lineage_bypass(callable_object, *args, **kwargs):
+    previous = _lineage_bypass_enabled()
+    _CALL_STATE.native_lineage_bypass = True
+    try:
+        return callable_object(*args, **kwargs)
+    finally:
+        _CALL_STATE.native_lineage_bypass = previous
+
+
+def _install_native_expression_lineage_hooks(
+    dataframe_class: type[Any],
+    lineage: NativeExpressionLineageRegistry,
+) -> None:
+    wrapped_names = {"where", "select", "with_columns"}
+
+    def install_preserving(name: str) -> None:
+        if name in wrapped_names or not hasattr(dataframe_class, name):
+            return
+        original = getattr(dataframe_class, name)
+        if not callable(original) or getattr(original, _HOOK_MARKER, False):
+            return
+
+        @functools.wraps(original)
+        def wrapped(self, *args, **kwargs):
+            if _lineage_bypass_enabled() or lineage.bypass_enabled():
+                return original(self, *args, **kwargs)
+            candidates = lineage.candidates_for(
+                (*args, kwargs),
+                dataframe=self,
+            )
+            native_args = lineage.native_arguments(args, candidates)
+            native_kwargs = lineage.native_arguments(kwargs, candidates)
+            result = original(self, *native_args, **native_kwargs)
+            lineage.bind_operation(
+                result,
+                parent=self,
+                operation=original,
+                args=args,
+                kwargs=kwargs,
+                candidates=candidates,
+            )
+            return result
+
+        setattr(wrapped, _HOOK_MARKER, True)
+        setattr(wrapped, _ORIGINAL_METHOD, original)
+        setattr(dataframe_class, name, wrapped)
+
+    def install_terminal(name: str) -> None:
+        if not hasattr(dataframe_class, name):
+            return
+        original = getattr(dataframe_class, name)
+        if not callable(original) or getattr(original, _HOOK_MARKER, False):
+            return
+
+        @functools.wraps(original)
+        def wrapped(self, *args, **kwargs):
+            if _lineage_bypass_enabled() or not lineage.has_lineage(self):
+                return original(self, *args, **kwargs)
+            try:
+                if object.__getattribute__(self, "_result") is not None:
+                    return original(self, *args, **kwargs)
+            except (AttributeError, TypeError):
+                pass
+            resolution = lineage.resolve(self)
+            _record_native_expression_guard(
+                checks=resolution.guard_checks,
+                misses=resolution.guard_misses,
+                rebuilt=resolution.rebuilt,
+            )
+            return _with_lineage_bypass(
+                original,
+                resolution.dataframe,
+                *args,
+                **kwargs,
+            )
+
+        setattr(wrapped, _HOOK_MARKER, True)
+        setattr(wrapped, _ORIGINAL_METHOD, original)
+        setattr(dataframe_class, name, wrapped)
+
+    def install_force_fallback(name: str) -> None:
+        if not hasattr(dataframe_class, name):
+            return
+        original = getattr(dataframe_class, name)
+        if not callable(original) or getattr(original, _HOOK_MARKER, False):
+            return
+
+        @functools.wraps(original)
+        def wrapped(self, *args, **kwargs):
+            if _lineage_bypass_enabled() or not (
+                lineage.has_lineage(self)
+                or lineage.has_lineage_in(args)
+                or lineage.has_lineage_in(kwargs)
+            ):
+                return original(self, *args, **kwargs)
+            parent = lineage.resolve(self, force_fallback=True)
+            resolved_args = lineage.resolve_value(
+                args,
+                force_fallback=True,
+            )
+            resolved_kwargs = lineage.resolve_value(
+                kwargs,
+                force_fallback=True,
+            )
+            _record_native_expression_guard(
+                checks=(
+                    parent.guard_checks
+                    + resolved_args.guard_checks
+                    + resolved_kwargs.guard_checks
+                ),
+                misses=(
+                    parent.guard_misses
+                    + resolved_args.guard_misses
+                    + resolved_kwargs.guard_misses
+                ),
+                rebuilt=bool(
+                    parent.rebuilt
+                    or resolved_args.rebuilt
+                    or resolved_kwargs.rebuilt
+                ),
+            )
+            return _with_lineage_bypass(
+                original,
+                parent.dataframe,
+                *resolved_args.value,
+                **resolved_kwargs.value,
+            )
+
+        setattr(wrapped, _HOOK_MARKER, True)
+        setattr(wrapped, _ORIGINAL_METHOD, original)
+        setattr(dataframe_class, name, wrapped)
+
+    for method_name in _LINEAGE_PRESERVING_METHODS:
+        install_preserving(method_name)
+    terminal_methods = {
+        *_LINEAGE_TERMINAL_METHODS,
+        *(
+            name
+            for name in dir(dataframe_class)
+            if name.startswith("write_")
+        ),
+    }
+    for method_name in terminal_methods:
+        install_terminal(method_name)
+    for method_name in _LINEAGE_FORCE_FALLBACK_METHODS:
+        install_force_fallback(method_name)
+
+
 def install_daft_control_hooks(
     *,
     daft_module: Any,
@@ -130,6 +599,11 @@ def install_daft_control_hooks(
         return HookResult(HookStatus.DISABLED, "invalid_mode")
 
     with _INSTALL_LOCK:
+        native_lineage = NativeExpressionLineageRegistry(
+            expression_class,
+            dataframe_class,
+        )
+        native_lineage_active = False
         func_method = func_class.__call__
         dataframe_methods = {
             name: getattr(dataframe_class, name)
@@ -157,6 +631,7 @@ def install_daft_control_hooks(
 
         @functools.wraps(original_func_call)
         def wrapped_func_call(self, *args, **kwargs):
+            nonlocal native_lineage_active
             expression_values = (*args, *kwargs.values())
             if not any(
                 _contains_expression(value, expression_class)
@@ -177,6 +652,45 @@ def install_daft_control_hooks(
                 active.add(id(self))
                 _CALL_STATE.active_func_ids = active
                 original_callable = self._method
+                native_proof = _native_expression_lowering(
+                    daft_module,
+                    original_func_call,
+                    self,
+                    original_callable,
+                    args,
+                    kwargs,
+                )
+                if native_proof is not _NO_NATIVE_EXPRESSION:
+                    try:
+                        if not native_lineage_active:
+                            _install_native_expression_lineage_hooks(
+                                dataframe_class,
+                                native_lineage,
+                            )
+                            native_lineage_active = True
+                        fallback_expression = original_func_call(
+                            self,
+                            *args,
+                            **kwargs,
+                        )
+                        native_lineage.bind_candidate(
+                            fallback_expression,
+                            NativeExpressionCandidate(
+                                native_expression=native_proof.expression,
+                                input_expression=args[0],
+                                wrapper_guard=native_proof.wrapper_guard,
+                                semantic_guard=native_proof.semantic_guard,
+                                kind=native_proof.kind,
+                            ),
+                        )
+                        _record_native_expression_lowering(native_proof.kind)
+                    except Exception:
+                        active.remove(id(self))
+                        _CALL_STATE.active_func_ids = active
+                        return original_func_call(self, *args, **kwargs)
+                    active.remove(id(self))
+                    _CALL_STATE.active_func_ids = active
+                    return fallback_expression
                 use_columnar_batch = _columnar_scalar_call_eligible(
                     self,
                     original_callable,
@@ -234,6 +748,8 @@ def install_daft_control_hooks(
             def make_operation_wrapper(name, original):
                 @functools.wraps(original)
                 def wrapped(self, *args, **kwargs):
+                    if native_lineage.bypass_enabled():
+                        return original(self, *args, **kwargs)
                     try:
                         registry.finalize_operation(
                             self,
@@ -243,7 +759,27 @@ def install_daft_control_hooks(
                         )
                     except Exception:
                         _emit_fail_open("operation_finalization_failed")
-                    return original(self, *args, **kwargs)
+                    if not native_lineage_active:
+                        return original(self, *args, **kwargs)
+                    candidates = native_lineage.candidates_for(
+                        (*args, kwargs),
+                        dataframe=self,
+                    )
+                    native_args = native_lineage.native_arguments(args, candidates)
+                    native_kwargs = native_lineage.native_arguments(
+                        kwargs,
+                        candidates,
+                    )
+                    result = original(self, *native_args, **native_kwargs)
+                    native_lineage.bind_operation(
+                        result,
+                        parent=self,
+                        operation=original,
+                        args=args,
+                        kwargs=kwargs,
+                        candidates=candidates,
+                    )
+                    return result
 
                 setattr(wrapped, _HOOK_MARKER, True)
                 setattr(wrapped, _ORIGINAL_METHOD, original)
@@ -266,7 +802,22 @@ def uninstall_daft_control_hooks(
         func_method = func_class.__call__
         if getattr(func_method, _HOOK_MARKER, False):
             func_class.__call__ = getattr(func_method, _ORIGINAL_METHOD)
-        for operation_name in ("where", "select", "with_columns"):
+        method_names = {
+            "where",
+            "select",
+            "with_columns",
+            *_LINEAGE_PRESERVING_METHODS,
+            *_LINEAGE_TERMINAL_METHODS,
+            *_LINEAGE_FORCE_FALLBACK_METHODS,
+            *(
+                name
+                for name in dir(dataframe_class)
+                if name.startswith("write_")
+            ),
+        }
+        for operation_name in method_names:
+            if not hasattr(dataframe_class, operation_name):
+                continue
             dataframe_method = getattr(dataframe_class, operation_name)
             if getattr(dataframe_method, _HOOK_MARKER, False):
                 setattr(

@@ -4,9 +4,13 @@ import json
 import functools
 import os
 import pickle
+import re
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -57,6 +61,16 @@ def remap_text(value: str) -> str:
 def effectful_text(value: str) -> str:
     print(value)
     return value
+
+
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_strip_join(value: str) -> str:
+    if not value or not value.strip():
+        return value
+    parts = _SENTENCE_RE.split(value)
+    return "\n\n".join(part.strip() for part in parts if part.strip())
 
 
 def replacement_remap_text(value: str) -> str:
@@ -244,6 +258,7 @@ class FakeCinderXJit:
         self.accept = accept
         self.compiled = set()
         self.force_calls = []
+        self.suppressed = set()
 
     def force_compile(self, function):
         self.force_calls.append(function)
@@ -253,6 +268,10 @@ class FakeCinderXJit:
 
     def is_jit_compiled(self, function):
         return id(function) in self.compiled
+
+    def jit_suppress(self, function):
+        self.suppressed.add(function)
+        return function
 
 
 def fake_cinderx_imports(jit):
@@ -302,9 +321,9 @@ class ColumnarBatchTest(unittest.TestCase):
     def setUp(self):
         reset_columnar_counters_for_testing()
 
-    def test_boundary_admission_comes_from_typed_effect_proof(self):
+    def test_boundary_requires_an_executable_backend_not_typed_semantics(self):
         func = SimpleNamespace(return_dtype="string")
-        self.assertTrue(
+        self.assertFalse(
             columnar_boundary_proven(func, receiver_trampoline(remap_text))
         )
         self.assertFalse(
@@ -314,6 +333,19 @@ class ColumnarBatchTest(unittest.TestCase):
             columnar_boundary_proven(
                 SimpleNamespace(return_dtype="int64"),
                 receiver_trampoline(remap_text),
+            )
+        )
+        self.assertFalse(
+            columnar_boundary_proven(
+                func, receiver_trampoline(split_strip_join)
+            )
+        )
+
+    def test_boundary_accepts_guarded_value_cache_backend(self):
+        self.assertTrue(
+            columnar_boundary_proven(
+                SimpleNamespace(return_dtype="string"),
+                receiver_trampoline(_render_frozen_record),
             )
         )
 
@@ -727,6 +759,101 @@ class ColumnarBatchTest(unittest.TestCase):
         self.assertEqual(rebuilt.invocations, 1)
         build.assert_called_once()
 
+    def test_native_executor_lazy_build_is_process_serialized(self):
+        wrapper = make_batch_wrapper()
+        executor = FakeNativeExecutor(str.upper)
+
+        def slow_build(*_args, **_kwargs):
+            # Release the GIL long enough for a second Daft CPU thread to see
+            # the same uninitialized wrapper. The production resolver must
+            # still perform exactly one process-local CinderX build.
+            time.sleep(0.05)
+            return executor
+
+        with mock.patch(
+            "python_udf_jit.integration.daft_ray.native_batch."
+            "build_native_batch_executor",
+            side_effect=slow_build,
+        ) as build:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                resolved = tuple(
+                    pool.map(
+                        lambda _index: wrapper._resolve_native_batch_executor()[0],
+                        range(4),
+                    )
+                )
+
+        self.assertEqual(resolved, (executor,) * 4)
+        build.assert_called_once()
+
+    def test_distinct_native_executor_builds_never_overlap_process_jit_state(self):
+        wrappers = (make_batch_wrapper(), make_batch_wrapper())
+        active = 0
+        max_active = 0
+        state_lock = threading.Lock()
+
+        def slow_build(*_args, **_kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return FakeNativeExecutor(str.upper)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        with mock.patch(
+            "python_udf_jit.integration.daft_ray.native_batch."
+            "build_native_batch_executor",
+            side_effect=slow_build,
+        ) as build:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                resolved = tuple(
+                    pool.map(
+                        lambda wrapper: wrapper._resolve_native_batch_executor()[0],
+                        wrappers,
+                    )
+                )
+
+        self.assertTrue(all(executor is not None for executor in resolved))
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(max_active, 1)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
+    def test_forked_child_resets_inherited_process_jit_locks(self):
+        import python_udf_jit.integration.daft_ray.columnar as columnar_module
+
+        held = columnar_module._NATIVE_BATCH_BUILD_LOCK
+        held.acquire()
+        read_fd, write_fd = os.pipe()
+        try:
+            child = os.fork()
+            if child == 0:
+                os.close(read_fd)
+                try:
+                    acquired = columnar_module._NATIVE_BATCH_BUILD_LOCK.acquire(
+                        timeout=0.5
+                    )
+                    os.write(write_fd, b"1" if acquired else b"0")
+                    if acquired:
+                        columnar_module._NATIVE_BATCH_BUILD_LOCK.release()
+                finally:
+                    os.close(write_fd)
+                    os._exit(0)
+            os.close(write_fd)
+            write_fd = -1
+            self.assertEqual(os.read(read_fd, 1), b"1")
+            waited, status = os.waitpid(child, 0)
+            self.assertEqual(waited, child)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        finally:
+            held.release()
+            os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
     def test_business_exception_in_native_batch_is_not_scalar_replayed(self):
         scalar_calls = []
         native_calls = []
@@ -758,7 +885,7 @@ class ColumnarBatchTest(unittest.TestCase):
         self.assertEqual(counters["published_batches"], 0)
         self.assertEqual(counters["postcommit_replays"], 0)
 
-    def test_builder_force_compiles_exact_target_and_batch_loop(self):
+    def test_builder_refuses_typed_semantics_without_executable_backend(self):
         wrapper = make_batch_wrapper(receiver_trampoline(remap_text))
         jit = FakeCinderXJit()
         with mock.patch(
@@ -770,17 +897,13 @@ class ColumnarBatchTest(unittest.TestCase):
                 wrapper.scalar_wrapper,
                 process=_process_identity(),
             )
-        self.assertIsNotNone(executor)
-        self.assertIn(remap_text, jit.force_calls)
-        self.assertEqual(len(jit.force_calls), 2)
-        self.assertIsNone(executor.dictionary_capacity)
-        self.assertEqual(executor.invoke((["α", "β"],)), ["a", "b"])
-        with self.assertRaises(TypeError):
-            pickle.dumps(executor)
+        self.assertIsNone(executor)
+        self.assertEqual(jit.force_calls, [])
+        self.assertEqual(jit.suppressed, set())
 
-    def test_builder_compile_rejection_has_no_executor(self):
-        wrapper = make_batch_wrapper(receiver_trampoline(remap_text))
-        jit = FakeCinderXJit(accept=False)
+    def test_regex_split_plan_is_refused_without_graph_isolation_proof(self):
+        wrapper = make_batch_wrapper(receiver_trampoline(split_strip_join))
+        jit = FakeCinderXJit()
         with mock.patch(
             "python_udf_jit.integration.daft_ray.native_batch."
             "importlib.import_module",
@@ -791,6 +914,24 @@ class ColumnarBatchTest(unittest.TestCase):
                 process=_process_identity(),
             )
         self.assertIsNone(executor)
+        self.assertEqual(jit.force_calls, [])
+
+    def test_builder_compile_rejection_has_no_executor(self):
+        wrapper = make_batch_wrapper(receiver_trampoline(_render_frozen_record))
+        jit = FakeCinderXJit(accept=False)
+        try:
+            with mock.patch(
+                "python_udf_jit.integration.daft_ray.native_batch."
+                "importlib.import_module",
+                side_effect=fake_cinderx_imports(jit),
+            ):
+                executor = build_native_batch_executor(
+                    wrapper.scalar_wrapper,
+                    process=_process_identity(),
+                )
+            self.assertIsNone(executor)
+        finally:
+            vars(_render_frozen_record).pop("__udfjit_value_cache__", None)
 
     def test_value_and_invariant_descriptors_attach_before_exact_compile(self):
         wrapper = make_batch_wrapper(
@@ -836,7 +977,7 @@ class ColumnarBatchTest(unittest.TestCase):
             vars(_index_external_record).pop("__udfjit_value_cache__", None)
 
     def test_live_target_code_drift_falls_back_before_arrow_load(self):
-        wrapper = make_batch_wrapper(receiver_trampoline(remap_text))
+        wrapper = make_batch_wrapper(receiver_trampoline(_render_frozen_record))
         jit = FakeCinderXJit()
         with mock.patch(
             "python_udf_jit.integration.daft_ray.native_batch."
@@ -864,8 +1005,8 @@ class ColumnarBatchTest(unittest.TestCase):
 
         tracking = TrackingExecutor()
         wrapper._native_batch_executor = tracking
-        original_code = remap_text.__code__
-        remap_text.__code__ = replacement_remap_text.__code__
+        original_code = _render_frozen_record.__code__
+        _render_frozen_record.__code__ = replacement_remap_text.__code__
         try:
             array = GuardOrderedArrowArray(["α"], tracking)
             with (
@@ -874,7 +1015,8 @@ class ColumnarBatchTest(unittest.TestCase):
             ):
                 result = wrapper(object(), FakeSeries(array))
         finally:
-            remap_text.__code__ = original_code
+            _render_frozen_record.__code__ = original_code
+            vars(_render_frozen_record).pop("__udfjit_value_cache__", None)
         self.assertEqual(result.to_pylist(), ["α"])
         self.assertEqual(snapshot_columnar_counters()["native_batch_batches"], 0)
         self.assertEqual(

@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import secrets
+import threading
 import time
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
@@ -26,6 +27,20 @@ COLUMNAR_WRAPPER_SERIALIZATION_VERSION = 1
 _PROCESS_PID = 0
 _PROCESS_GENERATION = ""
 _NEXT_BORROW_ID = 0
+_PROCESS_IDENTITY_LOCK = threading.Lock()
+_NATIVE_BATCH_BUILD_LOCK = threading.Lock()
+
+
+def _reset_process_locks_after_fork(_ignored: Any = None) -> None:
+    """Drop inherited lock ownership before any child-process JIT work."""
+
+    global _PROCESS_IDENTITY_LOCK, _NATIVE_BATCH_BUILD_LOCK
+    _PROCESS_IDENTITY_LOCK = threading.Lock()
+    _NATIVE_BATCH_BUILD_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_process_locks_after_fork)
 
 
 @dataclass
@@ -60,6 +75,16 @@ class ColumnarRuntimeCounters:
     precommit_failures: int = 0
     published_batches: int = 0
     postcommit_replays: int = 0
+    native_expression_translation_plans: int = 0
+    native_expression_whitespace_plans: int = 0
+    native_expression_regex_plans: int = 0
+    native_expression_length_plans: int = 0
+    native_expression_guard_checks: int = 0
+    native_expression_guard_misses: int = 0
+    native_expression_fallback_rebuilds: int = 0
+    native_expression_null_guard_batches: int = 0
+    native_expression_null_guard_rows: int = 0
+    native_expression_null_guard_misses: int = 0
 
 
 _COUNTERS = ColumnarRuntimeCounters()
@@ -68,19 +93,14 @@ _COUNTERS = ColumnarRuntimeCounters()
 def columnar_boundary_proven(func: Any, original_callable: Any) -> bool:
     """Name-free proof that a one-string scalar call is safe to batch-lift.
 
-    This is an admission proof for changing the framework execution boundary,
-    not a claim that an actual vector executable exists.  The latter is counted
-    only by ``vector_batches`` and remains zero for scalar-only exact-Unicode
-    plans.
+    Admission requires both safe semantics and an executable batch backend.
+    Typed capture alone is intentionally insufficient: it proves effects and
+    guards, but it does not prove that CinderX can compile the target bytecode
+    safely or profitably.
     """
 
     try:
         from python_udf_jit.compiler.invariant_calls import analyze_value_cache
-        from python_udf_jit.compiler.typed_frontend import (
-            TypedCaptureError,
-            capture_typed_loop,
-        )
-        from python_udf_jit.compiler.typed_ir import EXACT_UNICODE
         from python_udf_jit.integration.daft_ray.schema import (
             canonicalize_logical_type,
         )
@@ -91,19 +111,16 @@ def columnar_boundary_proven(func: Any, original_callable: Any) -> bool:
         if canonicalize_logical_type(func.return_dtype) != "string":
             return False
         resolved = resolve_typed_loop_callable(original_callable)
-        try:
-            capture_typed_loop(
-                resolved.function,
-                input_types=(EXACT_UNICODE,),
-                bound_arguments=resolved.bound_arguments,
-                allow_guarded_region=True,
-            )
+        # Value-cache analysis supplies a guarded exact-value executable
+        # backend. It is generic structural analysis, never a function-name
+        # allowlist.
+        if analyze_value_cache(resolved.function) is not None:
             return True
-        except TypedCaptureError:
-            # Value-cache analysis supplies a guarded exact-value semantics and
-            # exception proof. It is generic structural analysis, never a
-            # function-name allowlist.
-            return analyze_value_cache(resolved.function) is not None
+        # A local elementwise proof is not enough to change Daft's execution
+        # boundary: the batch expression can alter concurrency with downstream
+        # native/model UDFs. Until the framework graph supplies an isolation
+        # proof, only the value-cache backend is admitted in production.
+        return False
     except Exception:
         return False
 
@@ -112,13 +129,17 @@ def _process_identity() -> ProcessIdentity:
     global _PROCESS_PID, _PROCESS_GENERATION, _NEXT_BORROW_ID, _COUNTERS
     pid = os.getpid()
     if pid != _PROCESS_PID:
-        _PROCESS_PID = pid
-        _PROCESS_GENERATION = (
-            os.environ.get("UDFJIT_PROCESS_GENERATION", "").strip()
-            or secrets.token_hex(16)
-        )
-        _NEXT_BORROW_ID = 0
-        _COUNTERS = ColumnarRuntimeCounters()
+        with _PROCESS_IDENTITY_LOCK:
+            if pid != _PROCESS_PID:
+                _PROCESS_GENERATION = (
+                    os.environ.get("UDFJIT_PROCESS_GENERATION", "").strip()
+                    or secrets.token_hex(16)
+                )
+                _NEXT_BORROW_ID = 0
+                _COUNTERS = ColumnarRuntimeCounters()
+                # Publish the PID last so another thread can never observe the
+                # new process paired with the inherited generation/counters.
+                _PROCESS_PID = pid
     return ProcessIdentity(pid, _PROCESS_GENERATION)
 
 
@@ -138,6 +159,53 @@ def reset_columnar_counters_for_testing() -> None:
     global _COUNTERS
     _process_identity()
     _COUNTERS = ColumnarRuntimeCounters()
+
+
+def record_native_expression_lowering(kind: str) -> None:
+    """Record a value-free Driver-side plan lowering for attribution."""
+
+    _process_identity()
+    field = f"native_expression_{kind}_plans"
+    if field not in {
+        "native_expression_translation_plans",
+        "native_expression_whitespace_plans",
+        "native_expression_regex_plans",
+        "native_expression_length_plans",
+    }:
+        raise ValueError("native_expression_kind_unsupported")
+    setattr(_COUNTERS, field, getattr(_COUNTERS, field) + 1)
+    _flush_diagnostic_snapshot()
+
+
+def record_native_expression_guard(
+    *,
+    checks: int,
+    misses: int,
+    rebuilt: bool,
+) -> None:
+    """Record one Driver execution-boundary dependency revalidation."""
+
+    if checks < 0 or misses < 0 or misses > checks:
+        raise ValueError("native_expression_guard_count_invalid")
+    _process_identity()
+    _COUNTERS.native_expression_guard_checks += checks
+    _COUNTERS.native_expression_guard_misses += misses
+    if rebuilt:
+        _COUNTERS.native_expression_fallback_rebuilds += 1
+    _flush_diagnostic_snapshot()
+
+
+def record_native_expression_null_guard(*, rows: int, null_miss: bool) -> None:
+    """Record one Arrow-batch nullability guard before a native expression."""
+
+    if rows < 0:
+        raise ValueError("native_expression_null_guard_rows_invalid")
+    _process_identity()
+    _COUNTERS.native_expression_null_guard_batches += 1
+    _COUNTERS.native_expression_null_guard_rows += rows
+    if null_miss:
+        _COUNTERS.native_expression_null_guard_misses += 1
+    _flush_diagnostic_snapshot()
 
 
 def _flush_diagnostic_snapshot() -> None:
@@ -433,30 +501,48 @@ class ColumnarBatchWrapper:
     def _resolve_native_batch_executor(self) -> tuple[Any | None, ProcessIdentity]:
         process = _process_identity()
         executor = self._native_batch_executor
-        if executor is not None and not executor.matches_process(process):
-            executor = None
-            self._native_batch_executor = None
-            self._native_batch_unavailable_process = None
-        if executor is None:
-            process_key = (process.pid, process.generation)
-            if self._native_batch_unavailable_process == process_key:
+        if executor is not None and executor.matches_process(process):
+            if not executor.guards_match(process):
                 return None, process
-            try:
-                from python_udf_jit.integration.daft_ray.native_batch import (
-                    build_native_batch_executor,
-                )
+            return executor, process
 
-                executor = build_native_batch_executor(
-                    self.scalar_wrapper,
-                    process=process,
-                )
-            except Exception:
+        process_key = (process.pid, process.generation)
+        if (
+            executor is None
+            and self._native_batch_unavailable_process == process_key
+        ):
+            return None, process
+
+        # CinderX initialization and force_compile mutate process-global JIT
+        # state. Daft may invoke distinct batch wrappers concurrently from its
+        # DAFTCPU threads, so a per-wrapper lock is insufficient. Serialize all
+        # lazy native builds process-wide, then double-check this wrapper after
+        # acquiring the lock. Steady-state executor hits never take this lock.
+        with _NATIVE_BATCH_BUILD_LOCK:
+            executor = self._native_batch_executor
+            if executor is not None and not executor.matches_process(process):
                 executor = None
+                self._native_batch_executor = None
+                self._native_batch_unavailable_process = None
             if executor is None:
-                self._native_batch_unavailable_process = process_key
-                return None, process
-            self._native_batch_executor = executor
-            self._native_batch_unavailable_process = None
+                if self._native_batch_unavailable_process == process_key:
+                    return None, process
+                try:
+                    from python_udf_jit.integration.daft_ray.native_batch import (
+                        build_native_batch_executor,
+                    )
+
+                    executor = build_native_batch_executor(
+                        self.scalar_wrapper,
+                        process=process,
+                    )
+                except Exception:
+                    executor = None
+                if executor is None:
+                    self._native_batch_unavailable_process = process_key
+                    return None, process
+                self._native_batch_executor = executor
+                self._native_batch_unavailable_process = None
         if not executor.guards_match(process):
             # A live binding/code/dependency drift is a pre-semantics whole-batch
             # fallback. Do not silently compile a new target in the same process.

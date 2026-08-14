@@ -6,6 +6,7 @@ import gc
 import inspect
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -24,6 +25,8 @@ from python_udf_jit.integration.daft_ray.compatibility import (
 from python_udf_jit.integration.daft_ray.control import (
     HookResult,
     HookStatus,
+    _native_expression_nonnull_guard,
+    _validate_native_expression_nonnull_series,
     install_daft_control_hooks,
     install_default_daft_hooks,
     uninstall_daft_control_hooks,
@@ -62,6 +65,49 @@ def text_identity(_instance: object, value: str) -> str:
     return value
 
 
+_WS_RE = re.compile(r"\s+")
+_HTML_RE = re.compile(r"<[^>]+>")
+_URL_RE = re.compile(r"(?i)https?://\S+|www\.\S+")
+_ANCHORED_RE = re.compile(r"^prefix")
+
+
+def punctuation_text(value: str) -> str:
+    return value.translate(str.maketrans({"“": '"', "—": "-"}))
+
+
+def replacement_punctuation_text(value: str) -> str:
+    return value.translate(str.maketrans({"“": "X", "—": "Y"}))
+
+
+def whitespace_text(value: str) -> str:
+    return _WS_RE.sub(" ", value).strip()
+
+
+def html_text(value: str) -> str:
+    return _HTML_RE.sub(" ", value)
+
+
+def unsafe_url_text(value: str) -> str:
+    return _URL_RE.sub("", value)
+
+
+def unsafe_anchored_text(value: str) -> str:
+    return _ANCHORED_RE.sub("", value)
+
+
+def text_length_filter(value: str, min_len: int = 2, max_len: int = 4) -> bool:
+    length = len(value)
+    return min_len <= length <= max_len
+
+
+def daft_method(function):
+    @functools.wraps(function)
+    def method(_instance, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    return method
+
+
 @functools.wraps(affine)
 def daft_affine_method(_instance: object, value: float) -> float:
     return affine(value)
@@ -96,9 +142,83 @@ class FakePyExpr:
 
 
 class FakeExpression:
-    def __init__(self, worker_callable=None, *, input_name="value"):
+    def __init__(self, worker_callable=None, *, input_name="value", operations=()):
         self.worker_callable = worker_callable
         self._expr = FakePyExpr(input_name)
+        self.operations = tuple(operations)
+
+    def _with(self, name, *values):
+        return FakeExpression(
+            self.worker_callable,
+            input_name=self._expr.input_name,
+            operations=(*self.operations, (name, *values)),
+        )
+
+    def alias(self, name):
+        return self._with("alias", name)
+
+    def replace(self, source, replacement):
+        return self._with("replace", source, replacement)
+
+    def regexp_replace(self, pattern, replacement):
+        return self._with("regexp_replace", pattern, replacement)
+
+    def lstrip(self):
+        return self._with("lstrip")
+
+    def rstrip(self):
+        return self._with("rstrip")
+
+    def length(self):
+        return self._with("length")
+
+    def __ge__(self, value):
+        return self._with("ge", value)
+
+    def __le__(self, value):
+        return self._with("le", value)
+
+    def __gt__(self, value):
+        return self._with("gt", value)
+
+    def __lt__(self, value):
+        return self._with("lt", value)
+
+    def __and__(self, other):
+        return self._with("and", other.operations)
+
+
+class FakeArrowArray:
+    def __init__(self, values):
+        self.values = list(values)
+        self.null_count = self.values.count(None)
+
+    def __len__(self):
+        return len(self.values)
+
+    def to_pylist(self):
+        return list(self.values)
+
+
+class FakeSeries:
+    def __init__(self, array):
+        self.array = array
+
+    def to_arrow(self):
+        return self.array
+
+
+class RecordingBatchFactory:
+    def __init__(self):
+        self.options = []
+
+    def batch(self, **options):
+        self.options.append(options)
+
+        def decorate(function):
+            return ColumnarFakeFunc(daft_method(function), use_process=None)
+
+        return decorate
 
 
 class FakeComposedExpression(FakeExpression):
@@ -128,6 +248,8 @@ class FakeFunc:
             "float": "float64",
             "int": "int64",
             "str": "string",
+            bool: "bool",
+            "bool": "bool",
         }.get(annotation, "int64")
         self.original_call_count = 0
 
@@ -226,20 +348,73 @@ class InvalidSchemaDataFrame(FakeDataFrame):
         return {"value": object()}
 
 
+class LineageFakeDataFrame:
+    def __init__(self, operations=()):
+        self.operations = tuple(operations)
+        self._result = None
+
+    def schema(self):
+        return {"value": "string"}
+
+    def with_column(self, name, expression):
+        return self.with_columns({name: expression})
+
+    def with_columns(self, columns):
+        return type(self)((*self.operations, ("with_columns", columns)))
+
+    def where(self, predicate):
+        return type(self)((*self.operations, ("where", predicate)))
+
+    def select(self, *columns, **projections):
+        return type(self)(
+            (*self.operations, ("select", columns, projections))
+        )
+
+    def distinct(self):
+        return type(self)((*self.operations, ("distinct",)))
+
+    def concat(self, other):
+        return type(self)((*self.operations, ("concat", other.operations)))
+
+    def count_rows(self):
+        return self.operations
+
+    def collect(self):
+        self._result = self.operations
+        return self
+
+    def iter_rows(self):
+        yield from self.operations
+
+
+class LineageIntFakeDataFrame(LineageFakeDataFrame):
+    def schema(self):
+        return {"value": "int64"}
+
+
 class BrokenRegistry(CandidateRegistry):
     def register(self, func, original_callable):
         raise RuntimeError("registry unavailable")
 
 
-def install(*, mode="observe", registry=None, target=None, func_class=FakeFunc):
+def install(
+    *,
+    mode="observe",
+    registry=None,
+    target=None,
+    daft_module=None,
+    func_class=FakeFunc,
+    dataframe_class=FakeDataFrame,
+):
     registry = registry or CandidateRegistry(MANIFEST_SHA256)
+    daft_module = daft_module or SimpleNamespace(__version__="0.7.2")
     target = target or target_for_objects(
-        SimpleNamespace(__version__="0.7.2"), func_class, FakeDataFrame
+        SimpleNamespace(__version__="0.7.2"), func_class, dataframe_class
     )
     result = install_daft_control_hooks(
-        daft_module=SimpleNamespace(__version__="0.7.2"),
+        daft_module=daft_module,
         func_class=func_class,
-        dataframe_class=FakeDataFrame,
+        dataframe_class=dataframe_class,
         expression_class=FakeExpression,
         mode=mode,
         registry=registry,
@@ -254,6 +429,9 @@ class ControlHookTest(unittest.TestCase):
         uninstall_daft_control_hooks(RaisingFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RecursiveFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(ColumnarFakeFunc, FakeDataFrame)
+        uninstall_daft_control_hooks(ColumnarFakeFunc, FakeMixedStringDataFrame)
+        uninstall_daft_control_hooks(ColumnarFakeFunc, LineageFakeDataFrame)
+        uninstall_daft_control_hooks(ColumnarFakeFunc, LineageIntFakeDataFrame)
         clear_events()
 
     def tearDown(self):
@@ -261,6 +439,9 @@ class ControlHookTest(unittest.TestCase):
         uninstall_daft_control_hooks(RaisingFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(RecursiveFakeFunc, FakeDataFrame)
         uninstall_daft_control_hooks(ColumnarFakeFunc, FakeDataFrame)
+        uninstall_daft_control_hooks(ColumnarFakeFunc, FakeMixedStringDataFrame)
+        uninstall_daft_control_hooks(ColumnarFakeFunc, LineageFakeDataFrame)
+        uninstall_daft_control_hooks(ColumnarFakeFunc, LineageIntFakeDataFrame)
         clear_events()
 
     def test_off_mode_leaves_framework_methods_untouched(self):
@@ -526,6 +707,439 @@ class ControlHookTest(unittest.TestCase):
             expression = func(FakeExpression())
         self.assertIsInstance(expression.worker_callable, FallbackOnlyWrapper)
         self.assertEqual((func.is_batch, func.use_process, func._method), before)
+
+    def test_native_expression_mode_lowers_translation_without_udf_boundary(self):
+        _, registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=FakeMixedStringDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(punctuation_text),
+            on_error=None,
+            use_process=None,
+        )
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "native-expr"}):
+            _kind, columns = FakeMixedStringDataFrame().with_columns(
+                {"result": func(FakeExpression())}
+            )
+        expression = columns["result"]
+        self.assertEqual(
+            expression.operations,
+            (("replace", "“", '"'), ("replace", "—", "-")),
+        )
+        self.assertEqual(func.original_call_count, 1)
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_native_expression_null_guard_borrows_nonnull_arrow_without_scalar_call(self):
+        array = FakeArrowArray(["a", "b"])
+        target = mock.Mock(side_effect=AssertionError("scalar target called"))
+
+        result = _validate_native_expression_nonnull_series(
+            FakeSeries(array),
+            target,
+            {},
+        )
+
+        self.assertIs(result, array)
+        target.assert_not_called()
+
+    def test_native_expression_null_guard_preserves_explicit_process_policy(self):
+        factory = RecordingBatchFactory()
+        module = SimpleNamespace(
+            func=factory,
+            DataType=SimpleNamespace(string=lambda: "string"),
+        )
+
+        for policy, expected in ((True, True), (False, False), (None, None)):
+            with self.subTest(policy=policy):
+                factory.options.clear()
+                _native_expression_nonnull_guard(
+                    module,
+                    ColumnarFakeFunc.__call__,
+                    SimpleNamespace(use_process=policy),
+                    FakeExpression(),
+                    punctuation_text,
+                    {},
+                )
+                self.assertEqual(len(factory.options), 1)
+                if expected is None:
+                    self.assertNotIn("use_process", factory.options[0])
+                else:
+                    self.assertIs(factory.options[0]["use_process"], expected)
+
+    def test_native_expression_null_guard_reproduces_original_null_exception(self):
+        array = FakeArrowArray(["a", None, "b"])
+
+        def target(value, *, suffix):
+            return value.translate(str.maketrans({"a": suffix}))
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"daft.exceptions": SimpleNamespace(DaftCoreException=ValueError)},
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "1: DaftError::PyO3Error AttributeError: .*translate",
+            ),
+        ):
+            _validate_native_expression_nonnull_series(
+                FakeSeries(array),
+                target,
+                {"suffix": "x"},
+            )
+
+    def test_native_expression_guard_keeps_native_lineage_when_dependencies_match(self):
+        _, registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(punctuation_text),
+            on_error=None,
+            use_process=None,
+        )
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "native-expr"}):
+            planned = (
+                LineageFakeDataFrame()
+                .with_column("result", func(FakeExpression()))
+                .select("result")
+                .distinct()
+            )
+            operations = planned.count_rows()
+        expression = operations[0][1]["result"]
+        self.assertEqual(
+            expression.operations,
+            (("replace", "“", '"'), ("replace", "—", "-")),
+        )
+        self.assertIsNone(expression.worker_callable)
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_production_columnar_mode_uses_guarded_native_expression(self):
+        _, registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(punctuation_text),
+            on_error=None,
+            use_process=None,
+        )
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}):
+            planned = LineageFakeDataFrame().with_column(
+                "result",
+                func(FakeExpression()),
+            )
+            operations = planned.count_rows()
+        expression = operations[0][1]["result"]
+        self.assertEqual(
+            expression.operations,
+            (("replace", "“", '"'), ("replace", "—", "-")),
+        )
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_native_expression_requires_string_input_schema(self):
+        _, registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageIntFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(punctuation_text),
+            on_error=None,
+            use_process=None,
+        )
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}):
+            planned = LineageIntFakeDataFrame().with_column(
+                "result",
+                func(FakeExpression()),
+            )
+            operations = planned.count_rows()
+        expression = operations[0][1]["result"]
+        self.assertIs(expression.worker_callable, func._method)
+        self.assertEqual(expression.operations, ())
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_materialized_native_plan_keeps_cached_result_after_mutation(self):
+        _, _registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(punctuation_text),
+            on_error=None,
+            use_process=None,
+        )
+        original_code = punctuation_text.__code__
+        try:
+            with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}):
+                planned = LineageFakeDataFrame().with_column(
+                    "result",
+                    func(FakeExpression()),
+                )
+                materialized = planned.collect()
+                punctuation_text.__code__ = replacement_punctuation_text.__code__
+                cached = materialized.collect()
+        finally:
+            punctuation_text.__code__ = original_code
+        self.assertIs(cached, materialized)
+        expression = cached.operations[0][1]["result"]
+        self.assertEqual(
+            expression.operations,
+            (("replace", "“", '"'), ("replace", "—", "-")),
+        )
+
+    def test_native_expression_guard_rebuilds_original_udf_after_code_mutation(self):
+        _, registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(punctuation_text),
+            on_error=None,
+            use_process=None,
+        )
+        original_code = punctuation_text.__code__
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"UDFJIT_COLUMNAR": "native-expr"},
+            ):
+                planned = (
+                    LineageFakeDataFrame()
+                    .with_column("result", func(FakeExpression()))
+                    .select("result")
+                    .distinct()
+                )
+                punctuation_text.__code__ = replacement_punctuation_text.__code__
+                operations = planned.count_rows()
+        finally:
+            punctuation_text.__code__ = original_code
+        expression = operations[0][1]["result"]
+        self.assertIs(expression.worker_callable, func._method)
+        self.assertEqual(expression.operations, ())
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_native_expression_guard_rebuilds_after_global_regex_mutation(self):
+        global _HTML_RE
+
+        _, _registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(html_text),
+            on_error=None,
+            use_process=None,
+        )
+        original_regex = _HTML_RE
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"UDFJIT_COLUMNAR": "native-expr"},
+            ):
+                planned = LineageFakeDataFrame().with_column(
+                    "result",
+                    func(FakeExpression()),
+                )
+                _HTML_RE = re.compile(r"<script[^>]*>")
+                operations = planned.count_rows()
+        finally:
+            _HTML_RE = original_regex
+        expression = operations[0][1]["result"]
+        self.assertIs(expression.worker_callable, func._method)
+
+    def test_native_expression_guard_rebuilds_after_default_mutation(self):
+        _, _registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(text_length_filter),
+            on_error=None,
+            use_process=None,
+        )
+        original_defaults = text_length_filter.__defaults__
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"UDFJIT_COLUMNAR": "native-expr"},
+            ):
+                planned = LineageFakeDataFrame().where(
+                    func(FakeExpression())
+                )
+                text_length_filter.__defaults__ = (3, 8)
+                operations = planned.count_rows()
+        finally:
+            text_length_filter.__defaults__ = original_defaults
+        expression = operations[0][1]
+        self.assertIs(expression.worker_callable, func._method)
+
+    def test_binary_dataframe_operation_falls_back_when_right_side_has_lineage(self):
+        _, _registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(punctuation_text),
+            on_error=None,
+            use_process=None,
+        )
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}):
+            right = LineageFakeDataFrame().with_column(
+                "result",
+                func(FakeExpression()),
+            )
+            combined = LineageFakeDataFrame().concat(right)
+        expression = combined.operations[0][1][0][1]["result"]
+        self.assertIs(expression.worker_callable, func._method)
+        self.assertEqual(expression.operations, ())
+
+    def test_streaming_terminal_uses_live_original_udf_lineage(self):
+        _, _registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=LineageFakeDataFrame,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(punctuation_text),
+            on_error=None,
+            use_process=None,
+        )
+        original_code = punctuation_text.__code__
+        try:
+            with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}):
+                planned = LineageFakeDataFrame().with_column(
+                    "result",
+                    func(FakeExpression()),
+                )
+                rows = planned.iter_rows()
+                punctuation_text.__code__ = replacement_punctuation_text.__code__
+                operation = next(rows)
+        finally:
+            punctuation_text.__code__ = original_code
+        expression = operation[1]["result"]
+        self.assertIs(expression.worker_callable, func._method)
+        self.assertEqual(expression.operations, ())
+
+    def test_native_expression_mode_lowers_whitespace_and_length(self):
+        _, registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=FakeMixedStringDataFrame,
+        )
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "native-expr"}):
+            _kind, columns = FakeMixedStringDataFrame().with_columns(
+                {
+                    "whitespace": ColumnarFakeFunc(
+                        daft_method(whitespace_text),
+                        on_error=None,
+                    )(FakeExpression()),
+                    "length": ColumnarFakeFunc(
+                        daft_method(text_length_filter),
+                        on_error=None,
+                    )(FakeExpression()),
+                }
+            )
+        whitespace = columns["whitespace"]
+        length = columns["length"]
+        self.assertEqual(
+            [operation[0] for operation in whitespace.operations],
+            ["regexp_replace", "lstrip", "rstrip"],
+        )
+        self.assertEqual(
+            [operation[0] for operation in length.operations],
+            ["length", "ge", "and"],
+        )
+        self.assertEqual(registry.registration_count, 0)
+
+    def test_native_expression_lowers_only_cross_engine_safe_regex(self):
+        _, registry = install(
+            func_class=ColumnarFakeFunc,
+            dataframe_class=FakeMixedStringDataFrame,
+        )
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "native-expr"}):
+            _kind, columns = FakeMixedStringDataFrame().with_columns(
+                {
+                    "html": ColumnarFakeFunc(
+                        daft_method(html_text),
+                        on_error=None,
+                    )(FakeExpression()),
+                    "unsafe": ColumnarFakeFunc(
+                        daft_method(unsafe_url_text),
+                        on_error=None,
+                    )(FakeExpression()),
+                    "unsafe_anchor": ColumnarFakeFunc(
+                        daft_method(unsafe_anchored_text),
+                        on_error=None,
+                    )(FakeExpression()),
+                }
+            )
+        html = columns["html"]
+        unsafe = columns["unsafe"]
+        unsafe_anchor = columns["unsafe_anchor"]
+        self.assertEqual(
+            html.operations,
+            (("regexp_replace", "<[^>]+>", " "),),
+        )
+        self.assertIsInstance(unsafe.worker_callable, FallbackOnlyWrapper)
+        self.assertIsInstance(
+            unsafe_anchor.worker_callable,
+            FallbackOnlyWrapper,
+        )
+        self.assertEqual(registry.registration_count, 2)
+
+    def test_unsupported_native_expression_does_not_create_batch_guard(self):
+        factory = RecordingBatchFactory()
+        module = SimpleNamespace(
+            __version__="0.7.2",
+            func=factory,
+            DataType=SimpleNamespace(string=lambda: "string"),
+        )
+        _, registry = install(
+            daft_module=module,
+            func_class=ColumnarFakeFunc,
+        )
+        func = ColumnarFakeFunc(
+            daft_method(unsafe_url_text),
+            on_error=None,
+            use_process=None,
+        )
+
+        with mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "1"}):
+            expression = func(FakeExpression())
+
+        self.assertEqual(factory.options, [])
+        self.assertIsInstance(expression.worker_callable, FallbackOnlyWrapper)
+        self.assertEqual(registry.registration_count, 1)
+
+    def test_native_expression_diagnostics_are_strictly_opt_in(self):
+        _, _registry = install(func_class=ColumnarFakeFunc)
+        func = ColumnarFakeFunc(daft_method(punctuation_text), on_error=None)
+        with (
+            mock.patch.dict(os.environ, {"UDFJIT_COLUMNAR": "native-expr"}),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.control."
+                "_record_native_expression_lowering"
+            ) as record,
+        ):
+            func(FakeExpression())
+        record.assert_called_once_with("translation")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"UDFJIT_COLUMNAR_DIAGNOSTIC_DIR": ""},
+                clear=False,
+            ),
+            mock.patch(
+                "python_udf_jit.integration.daft_ray.columnar."
+                "record_native_expression_lowering"
+            ) as write_diagnostic,
+        ):
+            from python_udf_jit.integration.daft_ray.control import (
+                _record_native_expression_lowering,
+            )
+
+            _record_native_expression_lowering("translation")
+        write_diagnostic.assert_not_called()
 
     def test_with_column_delegation_finalizes_exactly_once(self):
         _, registry = install()

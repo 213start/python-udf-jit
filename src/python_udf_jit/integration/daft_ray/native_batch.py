@@ -242,7 +242,11 @@ def build_native_batch_executor(
         except TypedCaptureError:
             captured = None
         value_plan = analyze_value_cache(resolved.function)
-        if captured is None and value_plan is None:
+        # Typed capture is a semantic/guard proof, not an executable backend
+        # proof.  Admitting it by itself previously sent otherwise valid Python
+        # functions into unsupported CinderX HIR shapes and, after isolating the
+        # call, added a costly compiled trampoline with no target acceleration.
+        if value_plan is None:
             return None
         if value_plan is not None and value_plan.function is not resolved.function:
             return None
@@ -250,7 +254,10 @@ def build_native_batch_executor(
             resolved.function,
             bound_arguments=resolved.bound_arguments,
         )
-        plans = (*invariant_plans, *((value_plan,) if value_plan is not None else ()))
+        plans = (
+            *invariant_plans,
+            *((value_plan,) if value_plan is not None else ()),
+        )
         watcher_snapshots = tuple(
             _WatcherSnapshot.capture(watcher)
             for plan in plans

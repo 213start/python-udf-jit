@@ -212,7 +212,9 @@ def _framework_schema(schema: Any) -> Any:
     return namespace.get("_schema", schema)
 
 
-def _expression_logical_type(value: Any, schema: Any) -> str:
+def resolve_expression_logical_type(value: Any, schema: Any) -> str:
+    """Resolve one expression against the DataFrame schema that will execute it."""
+
     try:
         namespace = object.__getattribute__(value, "__dict__")
     except (AttributeError, TypeError) as error:
@@ -263,7 +265,7 @@ def build_invocation_layout(
     if not values:
         raise InvocationLayoutError("candidate_input_missing")
     input_types = tuple(
-        _expression_logical_type(value, schema) for value in values
+        resolve_expression_logical_type(value, schema) for value in values
     )
     return InvocationLayoutContract.for_types(
         input_types,
