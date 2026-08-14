@@ -124,6 +124,30 @@ class LengthFilterBatchKernel:
         return keep.to_pylist()
 
 
+@dataclass(frozen=True)
+class WhitespaceBatchKernel:
+    r"""Arrow 空白标准化：`\s+` → 单空格 + 首尾 trim（对应 sub+strip 复合形态）。
+
+    对应 `_WS_RE.sub(" ", s).strip()`：先整批 replace_substring_regex(\s+ → " "),
+    再 utf8_trim_whitespace 收尾——两段 Arrow 批计算替代 Python 逐行 sub+strip。
+    """
+
+    pattern: str
+    kind: str = "arrow_whitespace_normalize"
+    fallback_on_error: bool = True
+
+    def invoke(self, values: list[Any]) -> list[Any]:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        column = pc.replace_substring_regex(
+            pa.array(values),
+            self.pattern,
+            " ",
+        )
+        return pc.utf8_trim_whitespace(column).to_pylist()
+
+
 def register_batch_kernel(
     function: Callable[..., Any],
     batch_callable: Callable[[list[Any]], list[Any]],
@@ -310,6 +334,33 @@ def _length_filter_descriptor(
     return (low, high)
 
 
+def _whitespace_descriptor(function: FunctionType) -> str | None:
+    r"""识别空白标准化复合形态：`_WS_RE.sub(" ", s).strip()`。
+
+    字节码特征：单参数、co_names 恰好 (`pattern名`, "sub", "strip")、
+    globals 的 pattern 是 `\s+` 的 re.Pattern、co_consts 恰好 1 个字符串 " "（替换串）。
+    对应 `dj_whitespace_normalization`（连续 \\s+ → 单空格 + 首尾 trim）。
+    """
+    code = function.__code__
+    if code.co_argcount != 1 or code.co_kwonlyargcount != 0:
+        return None
+    if len(code.co_names) != 3 or code.co_names[1:] != ("sub", "strip"):
+        return None
+    pattern = function.__globals__.get(code.co_names[0])
+    if not isinstance(pattern, re.Pattern):
+        return None
+    if pattern.pattern != r"\s+":
+        return None
+    replacements = [
+        value
+        for value in code.co_consts
+        if type(value) is str and value != function.__doc__
+    ]
+    if len(replacements) != 1 or replacements[0] != " ":
+        return None
+    return pattern.pattern
+
+
 def _build_regex_kernel(descriptor: tuple[str, bool, str]) -> BatchKernel:
     pattern, ignore_case, replacement = descriptor
     return RegexSubBatchKernel(pattern, replacement, ignore_case)
@@ -333,6 +384,20 @@ _COST_SPEEDUP_TABLE: dict[str, float] = {
     "regex:(?i)(copyright\\s*\\(?c\\)?|©|\\(c\\)|all rights reserved)[^\\n.]*\\.?:True:": 7.753,  # clean_copyright -> 替换
     "regex:<[^>]+>:False:": 0.223,  # clean_html -> Arrow 更慢，回退
     "normalize:NFKC": 0.385,  # fix_unicode -> Arrow 更慢，回退
+    # punctuation（maketrans+translate）：50k 实测 5.285x（54 微测）-> 替换
+    "translate:"
+    + repr(
+        (
+            ("\u201c", '"'),
+            ("\u201d", '"'),
+            ("\u2018", "'"),
+            ("\u2019", "'"),
+            ("\u2013", "-"),
+            ("\u2014", "-"),
+        )
+    ): 5.285,
+    # whitespace（\s+ → 单空格 + trim 复合）：50k 实测 1.530x（54 微测）-> 替换
+    r"whitespace:\s+": 1.530,
 }
 
 
@@ -346,6 +411,8 @@ def _kernel_fingerprint(kernel: BatchKernel) -> str:
         return f"translate:{kernel.mapping}"
     if isinstance(kernel, LengthFilterBatchKernel):
         return f"length:{kernel.min_length}:{kernel.max_length}"
+    if isinstance(kernel, WhitespaceBatchKernel):
+        return f"whitespace:{kernel.pattern}"
     return f"callable:{kernel.kind}"
 
 
@@ -396,5 +463,9 @@ def build_batch_kernel(
     if bounds is not None:
         low, high = bounds
         kernel = LengthFilterBatchKernel(low, high)
+        return kernel if _cost_gate_passes(kernel, original_callable) else None
+    whitespace = _whitespace_descriptor(leaf)
+    if whitespace is not None:
+        kernel = WhitespaceBatchKernel(whitespace)
         return kernel if _cost_gate_passes(kernel, original_callable) else None
     return None
