@@ -129,46 +129,52 @@ class BatchKernelTest(unittest.TestCase):
         self.assertEqual(restored.batch_kernel.kind, "test_vectorized")
 
     # ---- 形态映射族：按函数字节码形态自动识别 ----
+    # 注：build_batch_kernel = 形态识别 + 成本门禁（静态成本表）。
+    # 形态可识别但 Arrow 更慢/无成本数据的（HTML/NFKC/translate/length）被
+    # 门禁拒绝返回 None（回退行式）；成本表批准的正则（URL/Email/Copyright）命中。
 
-    def test_regex_sub_shape_is_recognized_without_whitelist(self):
+    def test_regex_sub_shape_is_recognized_and_cost_gated(self):
         url_kernel = build_batch_kernel(clean_url)
         html_kernel = build_batch_kernel(clean_html)
 
+        # URL 在成本表（5.863x）→ 命中
         self.assertIsInstance(url_kernel, RegexSubBatchKernel)
         self.assertEqual(url_kernel.kind, "arrow_regex_sub")
-        # 非白名单 pattern（HTML）也按形态自动识别
-        self.assertIsInstance(html_kernel, RegexSubBatchKernel)
-        self.assertEqual(
-            html_kernel.invoke(["<p>hi</p>", "no tags"]),
-            [" hi ", "no tags"],
+        self.assertEqual(url_kernel.invoke(["visit https://x.com now"]), ["visit  now"])
+        # HTML 形态可识别，但成本表 0.223x（Arrow 更慢）→ 门禁拒绝 → 回退行式
+        self.assertIsNone(html_kernel)
+
+    def test_unicode_normalize_shape_is_recognized_and_cost_gated(self):
+        # 形态描述符可识别（NFKC）
+        from python_udf_jit.integration.daft_ray.batch_kernel import (
+            _normalize_descriptor,
         )
 
-    def test_unicode_normalize_shape_is_recognized(self):
-        kernel = build_batch_kernel(fix_unicode)
+        self.assertEqual(_normalize_descriptor(fix_unicode), "NFKC")
+        # 但成本表 NFKC 0.385x（Arrow 更慢）→ 门禁拒绝 → 回退行式
+        self.assertIsNone(build_batch_kernel(fix_unicode))
 
-        self.assertIsInstance(kernel, NormalizeBatchKernel)
-        self.assertEqual(kernel.kind, "arrow_utf8_normalize")
-        self.assertEqual(kernel.form, "NFKC")
-        self.assertEqual(kernel.invoke(["ａｂｃ", "①②"]), ["abc", "12"])
-
-    def test_maketrans_translate_shape_is_recognized(self):
-        kernel = build_batch_kernel(punctuation_normalize)
-
-        self.assertIsInstance(kernel, TranslateBatchKernel)
-        self.assertEqual(kernel.kind, "arrow_replace_all")
-        self.assertEqual(
-            kernel.invoke(["“hello”", "‘x’"]),
-            ['"hello"', "'x'"],
+    def test_maketrans_translate_shape_is_recognized_and_cost_gated(self):
+        # 形态描述符可识别（映射提取）
+        from python_udf_jit.integration.daft_ray.batch_kernel import (
+            _translate_descriptor,
         )
 
-    def test_length_filter_closure_shape_is_recognized(self):
-        kernel = build_batch_kernel(make_length_filter(5, 10))
+        mapping = _translate_descriptor(punctuation_normalize)
+        self.assertIsNotNone(mapping)
+        # 但无成本表数据 → 门禁拒绝 → 回退行式
+        self.assertIsNone(build_batch_kernel(punctuation_normalize))
 
-        self.assertIsInstance(kernel, LengthFilterBatchKernel)
-        self.assertEqual(kernel.kind, "arrow_utf8_length_range")
-        self.assertEqual(kernel.min_length, 5)
-        self.assertEqual(kernel.max_length, 10)
-        self.assertEqual(kernel.invoke(["abc", "12345", "12345678901"]), [False, True, False])
+    def test_length_filter_closure_shape_is_recognized_and_cost_gated(self):
+        # 形态描述符可识别（min/max 边界）
+        from python_udf_jit.integration.daft_ray.batch_kernel import (
+            _length_filter_descriptor,
+        )
+
+        bounds = _length_filter_descriptor(make_length_filter(5, 10))
+        self.assertEqual(bounds, (5, 10))
+        # 但无成本表数据 → 门禁拒绝 → 回退行式
+        self.assertIsNone(build_batch_kernel(make_length_filter(5, 10)))
 
     def test_unmatched_shape_returns_none(self):
         def arithmetic(value: float) -> float:
